@@ -1,0 +1,17 @@
+# Ignore generated audio responses
+static/response_*.mp3
+static/response_*.wav
+static/response_ready_*.txt
+
+# Ignore other temp audio files
+input.wav
+input.mp3
+input_full.wav
+temp.wav
+*.ulaw
+
+# macOS system file
+.DS_Store
+
+# Python virtual environments
+venv/

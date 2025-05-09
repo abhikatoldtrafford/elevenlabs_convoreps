@@ -141,13 +141,13 @@ def voice():
     elif is_file_ready(mp3_path, flag_path):
         print(f"🔊 Playing: {mp3_path}")
         ngrok_domain = os.getenv("NGROK_DOMAIN")
-        public_mp3_url = f"https://{ngrok_domain}/static/response_{call_sid}.mp3"
+        public_mp3_url = f"{request.url_root}static/response_{call_sid}.mp3"
         response.play(public_mp3_url)
     else:
         print("⏳ Response not ready — redirecting to /voice")
         response.pause(length=2)
         ngrok_domain = os.getenv("NGROK_DOMAIN")
-        response.redirect(f"https://{ngrok_domain}/voice")
+        response.redirect(f"{request.url_root}voice")
         return str(response)
 
     response.record(

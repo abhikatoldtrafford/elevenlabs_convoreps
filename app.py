@@ -345,6 +345,11 @@ def transcribe():
             messages=messages
         )
         reply = gpt_reply.choices[0].message.content.strip()
+        reply = reply.replace("*", "")
+        reply = reply.replace("_", "")
+        reply = reply.replace("`", "")
+        reply = reply.replace("#", "")
+        reply = reply.replace("-", " ")
         conversation_history[call_sid].append({"role": "assistant", "content": reply})
 
     print(f"🔣 Generating voice with ID: {voice_id}")

@@ -4,22 +4,56 @@ import random
 import time
 import threading
 import requests
-from flask import Flask, request, Response, url_for
+import logging
+from pathlib import Path
+from urllib.parse import urlparse
+
+from flask import Flask, request, Response, url_for, send_from_directory, redirect, session
 from flask_cors import CORS
 from twilio.twiml.voice_response import VoiceResponse
-from elevenlabs import generate, save, set_api_key
-import openai
 from dotenv import load_dotenv
-from pathlib import Path
-from flask import Flask, request, Response, url_for, send_from_directory
-from flask import redirect, url_for, Response
 from pydub import AudioSegment
-from flask import send_from_directory
-from urllib.parse import urlparse
-from flask import request, redirect, url_for
-import logging
+import openai
+from elevenlabs import generate, save, set_api_key
+
+# Load environment variables ASAP
+load_dotenv()
+
+# Suppress excessive werkzeug logging
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
+
+# Initialize Flask app
+app = Flask(__name__)
+
+# Set the secret key for sessions
+app.secret_key = os.getenv("FLASK_SECRET_KEY")
+
+# Enable CORS (Cross-Origin Resource Sharing)
+CORS(app)
+
+# Env + API keys
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+set_api_key(os.getenv("ELEVENLABS_API_KEY"))
+openai.api_key = os.getenv("OPENAI_API_KEY")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+
+# In-memory state
+turn_count = {}
+mode_lock = {}
+active_call_sid = None
+conversation_history = {}
+personality_memory = {}
+interview_question_index = {}
+
+# Voice profiles
+personality_profiles = {
+    "rude/skeptical": {"voice_id": "1t1EeRixsJrKbiF1zwM6"},
+    "super busy": {"voice_id": "6YQMyaUWlj0VX652cY1C"},
+    "small_talk": {"voice_id": "2BJW5coyhAzSr8STdHbE"}
+}
+
 
 cold_call_personality_pool = {
     "Jerry": {
@@ -45,7 +79,6 @@ cold_call_personality_pool = {
 }
  
 
-
 interview_questions = [
     "Can you walk me through your most recent role and responsibilities?",
     "What would you say are your greatest strengths?",
@@ -58,36 +91,6 @@ interview_questions = [
     "How do you handle feedback and criticism?",
     "Do you have any questions for me about the company or the role?"
 ]
-
-
-# Flask setup
-app = Flask(__name__, static_url_path="/static", static_folder="static")
-CORS(app)
-
-# Env + API keys
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
-set_api_key(os.getenv("ELEVENLABS_API_KEY"))
-openai.api_key = os.getenv("OPENAI_API_KEY")
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-
-# In-memory state
-turn_count = {}
-mode_lock = {}
-active_call_sid = None
-conversation_history = {}
-personality_memory = {}
-interview_question_index = {}
-
-
-
-# Voice profiles
-personality_profiles = {
-    "rude/skeptical": {"voice_id": "1t1EeRixsJrKbiF1zwM6"},
-    "super busy": {"voice_id": "6YQMyaUWlj0VX652cY1C"},
-    "small_talk": {"voice_id": "2BJW5coyhAzSr8STdHbE"}
-}
-
 
 
 @app.route("/static/<path:filename>")
@@ -136,17 +139,26 @@ def voice():
         return True
 
     if turn_count[call_sid] == 0:
-        print("📞 First turn — playing greeting")
-        response.play(f"{request.url_root}static/greeting.mp3?v={time.time()}")
+        print("📞 First turn — playing appropriate greeting")
+
+        if not session.get("has_called_before"):
+            session["has_called_before"] = True
+            greeting_file = "first_time_greeting.mp3"
+            print("👋 New caller detected — playing first-time greeting.")
+        else:
+            greeting_file = "returning_user_greeting.mp3"
+            print("🔁 Returning caller — playing returning greeting.")
+
+        response.play(f"{request.url_root}static/{greeting_file}?v={time.time()}")
+
+
     elif is_file_ready(mp3_path, flag_path):
         print(f"🔊 Playing: {mp3_path}")
-        ngrok_domain = os.getenv("NGROK_DOMAIN")
         public_mp3_url = f"{request.url_root}static/response_{call_sid}.mp3"
         response.play(public_mp3_url)
     else:
         print("⏳ Response not ready — redirecting to /voice")
         response.pause(length=2)
-        ngrok_domain = os.getenv("NGROK_DOMAIN")
         response.redirect(f"{request.url_root}voice")
         return str(response)
 

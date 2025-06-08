@@ -15,3 +15,5 @@ temp.wav
 
 # Python virtual environments
 venv/
+
+.env

@@ -1,15 +1,13 @@
 # ConvoReps — Real-Time AI Phone Training
 
-ConvoReps is a real-time voice simulation system for training sales reps, job seekers, and English learners via phone. It uses Twilio, OpenAI (Whisper + GPT), and ElevenLabs to carry out full conversations over the phone with natural pacing and personality switching.
+ConvoReps is a real-time voice simulation system for training sales representatives, job seekers, and English learners via phone. It uses Twilio, OpenAI (Whisper + GPT), and ElevenLabs to carry out full conversations over the phone with natural pacing and personality switching.
 
 ---
 
 ## 📞 Live Test Number
 
 **Amazon Connect → Twilio Bridge**  
-Call this number to test system behavior and latency:
-
-**+1 (336) 823-6243**
+Call this number to test system behavior and latency: +1 (336) 823-6243
 
 ---
 
@@ -35,11 +33,11 @@ Twilio Account SID and token can be shared securely if needed — or you can tes
 
 ---
 
-## 🎯 Current Behavior
+Current Behavior
 
 - `/voice` – Handles initial Twilio voice webhook, plays greeting
 - `/transcribe` – File-based voice → transcript → GPT → ElevenLabs → MP3 playback
-- Cold call, interview, and small talk modes supported
+- Customer Call, Interview Pep, and Small Talk modes supported
 - Personalized AI voices with memory per session
 - Voice responses currently served as MP3 files
 
@@ -47,7 +45,7 @@ Twilio Account SID and token can be shared securely if needed — or you can tes
 
 ## 🚧 Milestone: Real-Time Audio Pipeline
 
-**Goal:** Replace `/transcribe` with a real-time, low-latency pipeline under 1.5s round-trip.
+**Goal:** Replace `/transcribe` with a real-time, low-latency pipeline under 1.5 seconds round-trip.
 
 Must preserve:
 - Mode-specific logic and voice personalities

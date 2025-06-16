@@ -1,5 +1,6 @@
 import os
 import io
+from io import BytesIO
 import random
 import time
 import threading
@@ -7,14 +8,19 @@ import requests
 import logging
 from pathlib import Path
 from urllib.parse import urlparse
-
+import asyncio
+import re
+from functools import wraps
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, Response, url_for, send_from_directory, redirect, session
 from flask_cors import CORS
 from twilio.twiml.voice_response import VoiceResponse
 from dotenv import load_dotenv
 from pydub import AudioSegment
 import openai
-from elevenlabs import generate, save, set_api_key
+from openai import OpenAI, AsyncOpenAI
+from elevenlabs import VoiceSettings
+from elevenlabs.client import ElevenLabs
 
 # Load environment variables ASAP
 load_dotenv()
@@ -34,8 +40,32 @@ CORS(app)
 
 # Env + API keys
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
-set_api_key(os.getenv("ELEVENLABS_API_KEY"))
-openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Initialize new streaming clients
+sync_openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+async_openai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+elevenlabs_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
+
+# Streaming configuration
+USE_STREAMING = os.getenv("USE_STREAMING", "true").lower() == "true"
+SENTENCE_STREAMING = os.getenv("SENTENCE_STREAMING", "true").lower() == "true"
+
+# Handle STREAMING_TIMEOUT with potential comments
+timeout_env = os.getenv("STREAMING_TIMEOUT", "3.0")
+# ADD:
+# Set defaults if not in environment
+os.environ.setdefault("USE_STREAMING", "true")
+os.environ.setdefault("SENTENCE_STREAMING", "true")
+os.environ.setdefault("STREAMING_TIMEOUT", "3.0")
+# Remove any comments if present
+timeout_value = timeout_env.split('#')[0].strip()
+try:
+    STREAMING_TIMEOUT = float(timeout_value)
+except ValueError:
+    print(f"⚠️ Invalid STREAMING_TIMEOUT value: '{timeout_env}', using default 3.0")
+    STREAMING_TIMEOUT = 3.0
+
+# Twilio credentials
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
@@ -54,30 +84,28 @@ personality_profiles = {
     "small_talk": {"voice_id": "2BJW5coyhAzSr8STdHbE"}
 }
 
-
 cold_call_personality_pool = {
     "Jerry": {
         "voice_id": "1t1EeRixsJrKbiF1zwM6",
-        "system_prompt": "You're Jerry. You're a skeptical small business owner who’s been burned by vendors in the past. You're not rude, but you're direct and hard to win over. Respond naturally based on how the call starts — maybe this is a cold outreach, maybe a follow-up, or even someone calling you with bad news. Stay in character. If the salesperson fumbles, challenge them. If they’re smooth, open up a bit. Speak casually, not like a script."
+        "system_prompt": "You're Jerry. You're a skeptical small business owner who's been burned by vendors in the past. You're not rude, but you're direct and hard to win over. Respond naturally based on how the call starts — maybe this is a cold outreach, maybe a follow-up, or even someone calling you with bad news. Stay in character. If the salesperson fumbles, challenge them. If they're smooth, open up a bit. Speak casually, not like a script."
     },
     "Miranda": {
         "voice_id": "Ax1GP2W4XTyAyNHuch7v",
-        "system_prompt": "You're Miranda. You're a busy office manager who doesn’t have time for fluff. If the caller is clear and respectful, you'll hear them out. Respond naturally depending on how they open — this could be a cold call, a follow-up, or someone delivering news. Keep your tone grounded and real. Interrupt if needed. No robotic replies — talk like a real person at work."
+        "system_prompt": "You're Miranda. You're a busy office manager who doesn't have time for fluff. If the caller is clear and respectful, you'll hear them out. Respond naturally depending on how they open — this could be a cold call, a follow-up, or someone delivering news. Keep your tone grounded and real. Interrupt if needed. No robotic replies — talk like a real person at work."
     },
     "Junior": {
         "voice_id": "Nbttze9nhGhK1czblc6j",
-        "system_prompt": "You're Junior. You run a local shop and have heard it all. You're friendly but not easily impressed. Start skeptical, but if the caller handles things well, loosen up. Whether this is a pitch, a follow-up, or some kind of check-in, reply naturally. Use casual language. If something sounds off, call it out. You don’t owe anyone your time — but you’re not a jerk either."
+        "system_prompt": "You're Junior. You run a local shop and have heard it all. You're friendly but not easily impressed. Start skeptical, but if the caller handles things well, loosen up. Whether this is a pitch, a follow-up, or some kind of check-in, reply naturally. Use casual language. If something sounds off, call it out. You don't owe anyone your time — but you're not a jerk either."
     },
     "Brett": {
         "voice_id": "7eFTSJ6WtWd9VCU4ZlI1",
-        "system_prompt": "You're Brett. You're a contractor who answers his phone mid-job. You’re busy and a little annoyed this person called. If they’re direct and helpful, give them a minute. If they ramble, shut it down. This could be a pitch, a check-in, or someone following up on a proposal. React based on how they start the convo. Talk rough, fast, and casual. No fluff, no formalities."
+        "system_prompt": "You're Brett. You're a contractor who answers his phone mid-job. You're busy and a little annoyed this person called. If they're direct and helpful, give them a minute. If they ramble, shut it down. This could be a pitch, a check-in, or someone following up on a proposal. React based on how they start the convo. Talk rough, fast, and casual. No fluff, no formalities."
     },
     "Kayla": {
         "voice_id": "aTxZrSrp47xsP6Ot4Kgd",
-        "system_prompt": "You're Kayla. You own a business and don’t waste time. You’ve had too many bad sales calls and follow-ups from people who don’t know how to close. Respond based on how they open — if it’s a pitch, hit them with price objections. If it’s a follow-up, challenge their urgency. Keep your tone sharp but fair. You don’t sugarcoat things, and you don’t fake interest."
+        "system_prompt": "You're Kayla. You own a business and don't waste time. You've had too many bad sales calls and follow-ups from people who don't know how to close. Respond based on how they open — if it's a pitch, hit them with price objections. If it's a follow-up, challenge their urgency. Keep your tone sharp but fair. You don't sugarcoat things, and you don't fake interest."
     }
 }
- 
 
 interview_questions = [
     "Can you walk me through your most recent role and responsibilities?",
@@ -92,6 +120,13 @@ interview_questions = [
     "Do you have any questions for me about the company or the role?"
 ]
 
+def async_route(f):
+    """Production-ready async route decorator"""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        # Use asyncio.run() which properly manages the event loop
+        return asyncio.run(f(*args, **kwargs))
+    return wrapper
 
 @app.route("/static/<path:filename>")
 def static_files(filename):
@@ -99,14 +134,13 @@ def static_files(filename):
 
 
 def delayed_cleanup(call_sid):
-    time.sleep(15)  # Let Twilio play it first
+    time.sleep(45)  # Let Twilio play it first
     try:
         os.remove(f"static/response_{call_sid}.mp3")
         os.remove(f"static/response_ready_{call_sid}.txt")
         print(f"🧹 Cleaned up response files for {call_sid}")
     except Exception as e:
         print(f"⚠️ Cleanup error for {call_sid}: {e}")
- 
 
 
 @app.route("/voice", methods=["POST", "GET"])
@@ -151,7 +185,6 @@ def voice():
 
         response.play(f"{request.url_root}static/{greeting_file}?v={time.time()}")
 
-
     elif is_file_ready(mp3_path, flag_path):
         print(f"🔊 Playing: {mp3_path}")
         public_mp3_url = f"{request.url_root}static/response_{call_sid}.mp3"
@@ -172,12 +205,231 @@ def voice():
     )
     return str(response)
 
+async def streaming_transcribe(audio_file_path: str) -> str:
+    """Transcription with streaming control"""
+    try:
+        if USE_STREAMING:
+            # Try streaming transcription
+            with open(audio_file_path, "rb") as audio_file:
+                try:
+                    stream = await async_openai.audio.transcriptions.create(
+                        model="gpt-4o-mini-transcribe",
+                        file=audio_file,
+                        response_format="text",
+                        stream=True
+                    )
+                    
+                    transcript = ""
+                    async for event in stream:
+                        if hasattr(event, 'delta') and hasattr(event.delta, 'text'):
+                            transcript += event.delta.text
+                        elif hasattr(event, 'text') and event.text:
+                            transcript = event.text
+                            
+                    return transcript.strip()
+                    
+                except Exception as e:
+                    print(f"⚠️ Streaming transcription failed: {e}")
+                    # Fall through to non-streaming
+        
+        # Non-streaming (either USE_STREAMING=False or fallback)
+        with open(audio_file_path, "rb") as f:
+            result = sync_openai.audio.transcriptions.create(
+                model="whisper-1",
+                file=f
+            )
+            return result.text.strip()
+                
+    except Exception as e:
+        print(f"💥 Transcription error: {e}")
+        raise
+
+async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -> str:
+    """Stream GPT response and generate TTS concurrently"""
+    try:
+        # Use GPT-4.1-nano-2025-04-14 for streaming (FIXED MODEL NAME)
+        model = "gpt-4.1-nano" if USE_STREAMING else "gpt-3.5-turbo"
+        
+        if USE_STREAMING and SENTENCE_STREAMING:
+            # Streaming with sentence detection
+            stream = await async_openai.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=True,
+                temperature=0.7,
+                max_tokens=500  # Add token limit to prevent too long responses
+            )
+            
+            full_response = ""
+            sentence_buffer = ""
+            audio_chunks = []
+            
+            async for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    text = chunk.choices[0].delta.content
+                    sentence_buffer += text
+                    full_response += text
+                    
+                    # Check for sentence completion
+                    sentences = re.split(r'(?<=[.!?])\s+', sentence_buffer)
+                    
+                    # Process complete sentences
+                    for sentence in sentences[:-1]:
+                        if sentence.strip():
+                            # Start TTS generation for this sentence
+                            audio_task = asyncio.create_task(
+                                generate_tts_streaming(sentence, voice_id)
+                            )
+                            audio_chunks.append(audio_task)
+                    
+                    # Keep incomplete sentence in buffer
+                    sentence_buffer = sentences[-1] if sentences else ""
+            
+            # Process remaining text
+            if sentence_buffer.strip():
+                audio_task = asyncio.create_task(
+                    generate_tts_streaming(sentence_buffer, voice_id)
+                )
+                audio_chunks.append(audio_task)
+            
+            # Wait for all TTS tasks and combine audio
+            if audio_chunks:
+                audio_results = await asyncio.gather(*audio_chunks)
+                
+                # Combine audio chunks properly
+                from pydub import AudioSegment
+                combined = AudioSegment.empty()
+                
+                for audio_data in audio_results:
+                    if audio_data:
+                        try:
+                            # Convert bytes to AudioSegment
+                            audio_segment = AudioSegment.from_mp3(io.BytesIO(audio_data))
+                            combined += audio_segment
+                            # Add 200ms silence between sentences for natural pacing
+                            if len(audio_results) > 1:
+                                silence = AudioSegment.silent(duration=200)
+                                combined += silence
+                        except Exception as e:
+                            print(f"⚠️ Error combining audio chunk: {e}")
+                            continue
+                
+                # Export combined audio
+                output_path = f"static/response_{call_sid}.mp3"
+                combined.export(output_path, format="mp3")
+                    
+                print(f"✅ Streaming audio saved to {output_path}")
+            
+            return full_response.strip()
+            
+        else:
+            # Non-streaming fallback
+            completion = await async_openai.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.7
+            )
+            return completion.choices[0].message.content.strip()
+            
+    except Exception as e:
+        print(f"💥 GPT streaming error: {e}")
+        # Fallback to non-streaming
+        completion = sync_openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=messages
+        )
+        return completion.choices[0].message.content.strip()
+
+
+async def generate_tts_streaming(text: str, voice_id: str) -> bytes:
+    """Generate TTS using streaming ElevenLabs API with retry logic"""
+    max_retries = 3
+    retry_delay = 1.0
+    
+    for attempt in range(max_retries):
+        try:
+            if USE_STREAMING:
+                # Use streaming TTS
+                response = elevenlabs_client.text_to_speech.stream(
+                    voice_id=voice_id,
+                    text=text,
+                    model_id="eleven_turbo_v2_5",
+                    output_format="mp3_22050_32",
+                    voice_settings=VoiceSettings(
+                        stability=0.4,
+                        similarity_boost=0.75
+                    )
+                )
+                
+                # Collect audio chunks
+                audio_data = io.BytesIO()
+                chunk_count = 0
+                for chunk in response:
+                    if chunk:
+                        audio_data.write(chunk)
+                        chunk_count += 1
+                
+                if chunk_count == 0:
+                    raise Exception("No audio chunks received")
+                        
+                audio_data.seek(0)
+                return audio_data.read()
+                
+            else:
+                # Fallback to non-streaming
+                audio_gen = elevenlabs_client.text_to_speech.convert(
+                    voice_id=voice_id,
+                    text=text,
+                    model_id="eleven_monolingual_v1",
+                    output_format="mp3_22050_32"
+                )
+                
+                audio_data = b""
+                for chunk in audio_gen:
+                    if chunk:
+                        audio_data += chunk
+                        
+                return audio_data
+                
+        except Exception as e:
+            print(f"💥 TTS attempt {attempt + 1} failed: {e}")
+            if "10054" in str(e) or "connection" in str(e).lower():
+                # Connection error - wait and retry
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+            
+            # For last attempt or non-connection errors, try fallback
+            if attempt == max_retries - 1:
+                print("🔄 Falling back to non-streaming TTS...")
+                try:
+                    audio_gen = elevenlabs_client.text_to_speech.convert(
+                        voice_id=voice_id,
+                        text=text,
+                        model_id="eleven_monolingual_v1",
+                        output_format="mp3_22050_32"
+                    )
+                    
+                    audio_data = b""
+                    for chunk in audio_gen:
+                        if chunk:
+                            audio_data += chunk
+                            
+                    return audio_data
+                except Exception as e2:
+                    print(f"❌ TTS fallback also failed: {e2}")
+                    raise
+    
+    raise Exception("All TTS attempts failed")
 
 @app.route("/transcribe", methods=["POST"])
-def transcribe():
+@async_route
+async def transcribe():
     global active_call_sid
     print("✅ /transcribe endpoint hit")
-
+    print(f"  USE_STREAMING: {USE_STREAMING}")
+    print(f"  SENTENCE_STREAMING: {SENTENCE_STREAMING}")
     call_sid = request.form.get("CallSid")
     recording_url = request.form.get("RecordingUrl") + ".wav"
     print(f"🎧 Downloading: {recording_url}")
@@ -194,12 +446,22 @@ def transcribe():
         turn_count.clear()
         active_call_sid = call_sid
 
-    for attempt in range(3):
-        response = requests.get(recording_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
-        if response.status_code == 200:
-            break
-        print(f"⏳ Attempt {attempt + 1}: Audio not ready yet...")
-        time.sleep(1.5)
+    # Download audio with timeout and async handling
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            response = requests.get(
+                recording_url, 
+                auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+                timeout=5  # Add timeout
+            )
+            if response.status_code == 200:
+                break
+            print(f"⏳ Attempt {attempt + 1}: Audio not ready yet...")
+            await asyncio.sleep(1.5)  # Use async sleep
+        except requests.exceptions.Timeout:
+            print(f"⏳ Attempt {attempt + 1}: Request timed out")
+            await asyncio.sleep(1.5)
     else:
         return "Recording not available", 500
 
@@ -210,14 +472,20 @@ def transcribe():
         print("⚠️ Skipping transcription — audio file too short.")
         return redirect(url_for("voice", _external=True))
 
+    # Streaming transcription
     try:
-        with open("input.wav", "rb") as f:
-            result = openai.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                language="en"
-            )
-        transcript = result.text.strip()
+        if USE_STREAMING:
+            transcript = await streaming_transcribe("input.wav")
+        else:
+            # Fallback to non-streaming
+            with open("input.wav", "rb") as f:
+                result = sync_openai.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    language="en"
+                )
+                transcript = result.text.strip()
+                
         print("📝 Transcription:", transcript)
     except Exception as e:
         print("💥 Whisper error:", e)
@@ -226,20 +494,9 @@ def transcribe():
     def detect_bad_news(text):
         lowered = text.lower()
         return any(phrase in lowered for phrase in [
-            "bad news", 
-            "unfortunately", 
-            "problem", 
-            "delay", 
-            "issue", 
-            "we can't", 
-            "we won't", 
-            "not going to happen", 
-            "reschedule", 
-            "price increase"
+            "bad news", "unfortunately", "problem", "delay", "issue", 
+            "we can't", "we won't", "not going to happen", "reschedule", "price increase"
         ])
-
-    bad_news_flag = detect_bad_news(transcript)
-
 
     def detect_intent(text):
         lowered = text.lower()
@@ -250,8 +507,6 @@ def transcribe():
         elif any(phrase in lowered for phrase in ["small talk", "chat", "talk casually"]):
             return "small_talk"
         return "unknown"
-
-
 
     if "let's start over" in transcript.lower():
         print("🔁 Reset triggered by user — rolling new persona")
@@ -266,6 +521,7 @@ def transcribe():
         mode_lock[call_sid] = mode
     print("🧐 Detected intent:", mode)
 
+    # Set up personality and voice
     if mode == "cold_call" or mode == "customer_convo":
         if call_sid not in personality_memory:
             persona_name = random.choice(list(cold_call_personality_pool.keys()))
@@ -276,19 +532,18 @@ def transcribe():
         persona = cold_call_personality_pool[persona_name]
         voice_id = persona["voice_id"]
         system_prompt = persona["system_prompt"]
-        intro_line = persona.get("intro_line", "Alright, I’ll be your customer. Start the conversation however you want — this could be a cold call, a follow-up, a check-in, or even a tough conversation. I’ll respond based on my personality. If you ever want to start over, just say 'let’s start over.'")
-
+        intro_line = persona.get("intro_line", "Alright, I'll be your customer. Start the conversation however you want — this could be a cold call, a follow-up, a check-in, or even a tough conversation. I'll respond based on my personality. If you ever want to start over, just say 'let's start over.'")
 
     elif mode == "small_talk":
         voice_id = "2BJW5coyhAzSr8STdHbE"
         system_prompt = "You're a casual, sarcastic friend. Keep it light, keep it fun."
-        intro_line = "Yo yo yo, how’s it goin’?"
+        intro_line = "Yo yo yo, how's it goin'?"
 
     elif mode == "interview":
         interview_voice_pool = [
-            {"voice_id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel"},  # natural, calm
-            {"voice_id": "EXAVITQu4vr4xnSDxMaL", "name": "Clyde"},   # decent, a bit flat
-            {"voice_id": "6YQMyaUWlj0VX652cY1C", "name": "Stephen"}  # real, human, professional
+            {"voice_id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel"},
+            {"voice_id": "EXAVITQu4vr4xnSDxMaL", "name": "Clyde"},
+            {"voice_id": "6YQMyaUWlj0VX652cY1C", "name": "Stephen"}
         ]
 
         voice_choice = random.choice(interview_voice_pool)
@@ -296,11 +551,10 @@ def transcribe():
         system_prompt = (
             f"You are {voice_choice['name']}, a friendly, conversational job interviewer helping candidates practice for real interviews. "
             "Speak casually — like you're talking to someone over coffee, not in a formal evaluation. Ask one interview-style question at a time, and after each response, give supportive, helpful feedback. "
-            "If their answer is weak, say 'Let’s try that again' and re-ask the question. If it's strong, give a quick reason why it's good. "
-            "Briefly refer to the STAR method (Situation, Task, Action, Result) when giving feedback, but don’t lecture. Keep your tone upbeat, natural, and keep the conversation flowing. "
-            "Don’t ask if they’re ready for the next question — just move on with something like, 'Alright, next one,' or 'Cool, here’s another one.'"
+            "If their answer is weak, say 'Let's try that again' and re-ask the question. If it's strong, give a quick reason why it's good. "
+            "Briefly refer to the STAR method (Situation, Task, Action, Result) when giving feedback, but don't lecture. Keep your tone upbeat, natural, and keep the conversation flowing. "
+            "Don't ask if they're ready for the next question — just move on with something like, 'Alright, next one,' or 'Cool, here's another one.'"
         )
-
         intro_line = "Great, let's jump in! Can you walk me through your most recent role and responsibilities?"
 
     else:
@@ -318,9 +572,11 @@ def transcribe():
     else:
         conversation_history[call_sid].append({"role": "user", "content": transcript})
         messages = [{"role": "system", "content": system_prompt}]
+        
+        # Check for bad news
         lowered = transcript.lower()
         is_bad_news = any(x in lowered for x in [
-            "bad news", "unfortunately", "delay", "delayed", "won’t make it", "can't deliver",
+            "bad news", "unfortunately", "delay", "delayed", "won't make it", "can't deliver",
             "got pushed", "rescheduled", "not coming", "issue with the supplier", "problem with your order"
         ])
 
@@ -352,59 +608,107 @@ def transcribe():
 
         messages += conversation_history[call_sid]
 
-        gpt_reply = openai.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=messages
-        )
-        reply = gpt_reply.choices[0].message.content.strip()
-        reply = reply.replace("*", "")
-        reply = reply.replace("_", "")
-        reply = reply.replace("`", "")
-        reply = reply.replace("#", "")
-        reply = reply.replace("-", " ")
+        # Get GPT response (streaming or non-streaming)
+        if USE_STREAMING:
+            reply = await streaming_gpt_response(messages, voice_id, call_sid)
+        else:
+            gpt_reply = sync_openai.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=messages
+            )
+            reply = gpt_reply.choices[0].message.content.strip()
+            
+        # Clean up response
+        reply = reply.replace("*", "").replace("_", "").replace("`", "").replace("#", "").replace("-", " ")
         conversation_history[call_sid].append({"role": "assistant", "content": reply})
 
     print(f"🔣 Generating voice with ID: {voice_id}")
-    try:
-        raw_audio = generate(text=reply, voice=voice_id, model="eleven_monolingual_v1")
-    except Exception as e:
-        print(f"🛑 ElevenLabs generation error:", e)
-        if "429" in str(e):  # Too Many Requests
-            print("🔁 Retrying after brief pause due to rate limit...")
-            time.sleep(2)  # Wait before retry
-            try:
-                raw_audio = generate(text=reply, voice=voice_id, model="eleven_monolingual_v1")
-                print("✅ Retry succeeded")
-            except Exception as e:
-                print(f"❌ Retry failed:", e)
-                fallback_path = "static/fallback.mp3"
-                if os.path.exists(fallback_path):
-                    os.system(f"cp {fallback_path} static/response_{call_sid}.mp3")
-                    with open(f"static/response_ready_{call_sid}.txt", "w") as f:
-                        f.write("ready")
-                    print("⚠️ Fallback MP3 used.")
-                    return redirect(url_for("voice", _external=True))
-                else:
-                    return "ElevenLabs error and no fallback available", 500
+    
+    # If streaming already handled TTS in streaming_gpt_response, we're done
+    if USE_STREAMING and SENTENCE_STREAMING and turn > 0 and os.path.exists(f"static/response_{call_sid}.mp3"):
+    # Audio already generated by streaming_gpt_response
+        print(f"✅ Audio already generated via sentence streaming for {call_sid}")
+    else:
+        # Generate TTS (streaming or non-streaming)
+        try:
+            if USE_STREAMING:
+                raw_audio = await generate_tts_streaming(reply, voice_id)
+            else:
+                # Handle the generator returned by convert()
+                audio_gen = elevenlabs_client.text_to_speech.convert(
+                    voice_id=voice_id,
+                    text=reply,
+                    model_id="eleven_monolingual_v1",
+                    output_format="mp3_22050_32"
+                )
+                raw_audio = b""
+                for chunk in audio_gen:
+                    if chunk:
+                        raw_audio += chunk
+                
+            output_path = f"static/response_{call_sid}.mp3"
+            with open(output_path, "wb") as f:
+                f.write(raw_audio)
+                
+        except Exception as e:
+            print(f"🛑 ElevenLabs generation error:", e)
+            if "429" in str(e):  # Too Many Requests
+                print("🔁 Retrying after brief pause due to rate limit...")
+                await asyncio.sleep(2)  # Use async sleep
+                try:
+                    if USE_STREAMING:
+                        raw_audio = await generate_tts_streaming(reply, voice_id)
+                    else:
+                        audio_gen = elevenlabs_client.text_to_speech.convert(
+                            voice_id=voice_id,
+                            text=reply,
+                            model_id="eleven_monolingual_v1",
+                            output_format="mp3_22050_32"
+                        )
+                        raw_audio = b""
+                        for chunk in audio_gen:
+                            if chunk:
+                                raw_audio += chunk
+                        
+                    output_path = f"static/response_{call_sid}.mp3"
+                    with open(output_path, "wb") as f:
+                        f.write(raw_audio)
+                    print("✅ Retry succeeded")
+                except Exception as e:
+                    print(f"❌ Retry failed:", e)
+                    fallback_path = "static/fallback.mp3"
+                    if os.path.exists(fallback_path):
+                        os.system(f"cp {fallback_path} static/response_{call_sid}.mp3")
+                        with open(f"static/response_ready_{call_sid}.txt", "w") as f:
+                            f.write("ready")
+                        print("⚠️ Fallback MP3 used.")
+                        return redirect(url_for("voice", _external=True))
+                    else:
+                        return "ElevenLabs error and no fallback available", 500
+    
+    # Ensure ready flag is always created
+    if not os.path.exists(f"static/response_ready_{call_sid}.txt"):
+        with open(f"static/response_ready_{call_sid}.txt", "w") as f:
+            f.write("ready")
+        print(f"🚩 Ready flag created for {call_sid}")
+    else:
+        print(f"✅ Ready flag already exists for {call_sid}")
 
-
-    output_path = f"static/response_{call_sid}.mp3"
-    with open(output_path, "wb") as f:
-        f.write(raw_audio)
-
-
-    print(f"✅ Clean MP3 saved via ElevenLabs to {output_path}")
-
-    with open(f"static/response_ready_{call_sid}.txt", "w") as f:
-        f.write("ready")
-    print(f"🚩 Ready flag created for {call_sid}")
+    # Schedule cleanup
+    cleanup_thread = threading.Thread(target=delayed_cleanup, args=(call_sid,))
+    cleanup_thread.start()
 
     return redirect(url_for("voice", _external=True))
 
 
-
-
-
 if __name__ == "__main__":
+    # Ensure static directory exists
+    os.makedirs("static", exist_ok=True)
+    
+    print("\n🚀 ConvoReps Streaming Edition")
+    print(f"   USE_STREAMING: {USE_STREAMING}")
+    print(f"   SENTENCE_STREAMING: {SENTENCE_STREAMING}")
+    print(f"   STREAMING_TIMEOUT: {STREAMING_TIMEOUT}s")
+    print("\n")
+    
     app.run(host="0.0.0.0", port=5050)
-

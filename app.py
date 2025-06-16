@@ -163,7 +163,15 @@ def voice():
     mp3_path = f"static/response_{call_sid}.mp3"
     flag_path = f"static/response_ready_{call_sid}.txt"
     response = VoiceResponse()
-
+    # Use TwiML's built-in digits to create tick sounds
+    response.play(digits="1") # Single beep
+    response.pause(length=0.25)
+    response.play(digits="1") # Second beep
+    response.pause(length=0.25)
+    response.play(digits="1") # Third beep
+    response.pause(length=0.25)
+    
+    response.redirect(url_for("voice", _external=True))
     def is_file_ready(mp3_path, flag_path):
         if not os.path.exists(mp3_path) or not os.path.exists(flag_path):
             return False

@@ -134,7 +134,7 @@ def static_files(filename):
 
 
 def delayed_cleanup(call_sid):
-    time.sleep(45)  # Let Twilio play it first
+    time.sleep(30)  # Let Twilio play it first
     try:
         os.remove(f"static/response_{call_sid}.mp3")
         os.remove(f"static/response_ready_{call_sid}.txt")

@@ -191,6 +191,7 @@ def voice():
         response.play(public_mp3_url)
     else:
         print("⏳ Response not ready — redirecting to /voice")
+        response.play(f"{request.url_root}static/beep.mp3") 
         response.pause(length=2)
         response.redirect(f"{request.url_root}voice")
         return str(response)
@@ -318,6 +319,9 @@ async def process_speech():
     call_sid = request.form.get("CallSid")
     speech_result = request.form.get("SpeechResult", "")
     confidence = request.form.get("Confidence", "0.0")
+    beep_response = VoiceResponse()
+    beep_response.play(f"{request.url_root}static/beep.mp3", loop=3)  # Play beep 3 times
+    beep_response.redirect(f"{request.url_root}voice")
     
     print(f"📝 Final Speech Result: '{speech_result}'")
     print(f"🎯 Confidence: {confidence}")

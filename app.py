@@ -444,7 +444,7 @@ async def transcribe():
         active_call_sid = call_sid
 
     # Download audio with timeout and async handling
-    max_attempts = 3
+    max_attempts = 2
     for attempt in range(max_attempts):
         try:
             response = requests.get(

@@ -293,15 +293,6 @@ def partial_speech():
     conversation_history[call_sid].append(partial_entry)
     
     # Speech length analysis
-    if stable_result:
-        word_count = len(stable_result.split())
-        print(f"\n📊 Speech Analysis:")
-        print(f"   Words (stable): {word_count}")
-        print(f"   Characters: {len(stable_result)}")
-        
-        # Estimate speaking time (average 150 words per minute)
-        estimated_seconds = (word_count / 150) * 60
-        print(f"   Est. speaking time: {estimated_seconds:.1f}s")
     
     # Debug all received parameters
     if os.getenv("DEBUG_PARTIAL", "false").lower() == "true":

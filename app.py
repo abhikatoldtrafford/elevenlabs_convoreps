@@ -251,18 +251,22 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
         model = "gpt-4.1-nano" if USE_STREAMING else "gpt-3.5-turbo"
         
         if USE_STREAMING and SENTENCE_STREAMING:
+            # Create output file immediately
+            output_path = f"static/response_{call_sid}.mp3"
+            temp_path = f"static/response_{call_sid}_temp.mp3"
+            
             # Streaming with sentence detection
             stream = await async_openai.chat.completions.create(
                 model=model,
                 messages=messages,
                 stream=True,
-                temperature=0.7,
-                max_tokens=500  # Add token limit to prevent too long responses
+                temperature=0.7
             )
             
             full_response = ""
             sentence_buffer = ""
-            audio_chunks = []
+            sentence_count = 0
+            first_audio_saved = False
             
             async for chunk in stream:
                 if chunk.choices[0].delta.content:
@@ -273,52 +277,45 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                     # Check for sentence completion
                     sentences = re.split(r'(?<=[.!?])\s+', sentence_buffer)
                     
-                    # Process complete sentences
+                    # Process complete sentences immediately
                     for sentence in sentences[:-1]:
                         if sentence.strip():
-                            # Start TTS generation for this sentence
-                            audio_task = asyncio.create_task(
-                                generate_tts_streaming(sentence, voice_id)
-                            )
-                            audio_chunks.append(audio_task)
+                            sentence_count += 1
+                            print(f"🎯 Processing sentence {sentence_count}: {sentence[:30]}...")
+                            
+                            # Generate TTS for this sentence
+                            try:
+                                audio_data = await generate_tts_streaming(sentence, voice_id)
+                                
+                                # Save first sentence immediately
+                                if not first_audio_saved:
+                                    with open(output_path, "wb") as f:
+                                        f.write(audio_data)
+                                    first_audio_saved = True
+                                    print(f"✅ First audio chunk saved - ready to play!")
+                                else:
+                                    # Append subsequent sentences
+                                    # This is a simplified approach - you might need proper MP3 concatenation
+                                    with open(output_path, "ab") as f:
+                                        f.write(audio_data)
+                                        
+                            except Exception as e:
+                                print(f"⚠️ TTS error for sentence {sentence_count}: {e}")
                     
-                    # Keep incomplete sentence in buffer
                     sentence_buffer = sentences[-1] if sentences else ""
             
-            # Process remaining text
+            # Process final sentence
             if sentence_buffer.strip():
-                audio_task = asyncio.create_task(
-                    generate_tts_streaming(sentence_buffer, voice_id)
-                )
-                audio_chunks.append(audio_task)
-            
-            # Wait for all TTS tasks and combine audio
-            if audio_chunks:
-                audio_results = await asyncio.gather(*audio_chunks)
-                
-                # Combine audio chunks properly
-                from pydub import AudioSegment
-                combined = AudioSegment.empty()
-                
-                for audio_data in audio_results:
-                    if audio_data:
-                        try:
-                            # Convert bytes to AudioSegment
-                            audio_segment = AudioSegment.from_mp3(io.BytesIO(audio_data))
-                            combined += audio_segment
-                            # Add 200ms silence between sentences for natural pacing
-                            if len(audio_results) > 1:
-                                silence = AudioSegment.silent(duration=200)
-                                combined += silence
-                        except Exception as e:
-                            print(f"⚠️ Error combining audio chunk: {e}")
-                            continue
-                
-                # Export combined audio
-                output_path = f"static/response_{call_sid}.mp3"
-                combined.export(output_path, format="mp3")
-                    
-                print(f"✅ Streaming audio saved to {output_path}")
+                try:
+                    audio_data = await generate_tts_streaming(sentence_buffer, voice_id)
+                    if not first_audio_saved:
+                        with open(output_path, "wb") as f:
+                            f.write(audio_data)
+                    else:
+                        with open(output_path, "ab") as f:
+                            f.write(audio_data)
+                except Exception as e:
+                    print(f"⚠️ TTS error for final sentence: {e}")
             
             return full_response.strip()
             
@@ -453,7 +450,7 @@ async def transcribe():
             response = requests.get(
                 recording_url, 
                 auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-                timeout=5  # Add timeout
+                timeout=3  # Add timeout
             )
             if response.status_code == 200:
                 break

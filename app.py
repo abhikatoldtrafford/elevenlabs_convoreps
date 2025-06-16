@@ -275,9 +275,10 @@ def partial_speech():
     # Store partial results in conversation history for debugging
      partial_entry = {
         "type": "partial",
-        "sequence": sequence_number,
-        "unstable": unstable_result,
-        "timestamp": time.time()
+        "sequence": int(sequence_number),  # Convert to int for proper sorting
+        "text": unstable_result,  # Rename to just "text" since there's only unstable
+        "timestamp": time.time(),
+        "word_count": len(unstable_result.split()) if unstable_result else 0
     }
     # Keep only last 10 partial entries to avoid memory issues
     partials = [e for e in conversation_history[call_sid] if e.get("type") == "partial"]

@@ -59,7 +59,7 @@ elevenlabs_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
 # Streaming configuration
 USE_STREAMING = os.getenv("USE_STREAMING", "true").lower() == "true"
 SENTENCE_STREAMING = os.getenv("SENTENCE_STREAMING", "true").lower() == "true"
-USE_MEDIA_STREAMS=true
+USE_MEDIA_STREAMS=True
 # Handle STREAMING_TIMEOUT with potential comments
 timeout_env = os.getenv("STREAMING_TIMEOUT", "3.0")
 # ADD:

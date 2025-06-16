@@ -273,14 +273,12 @@ def partial_speech():
         conversation_history[call_sid] = []
     
     # Store partial results in conversation history for debugging
-    partial_entry = {
+     partial_entry = {
         "type": "partial",
         "sequence": sequence_number,
-        "stable": stable_result,
         "unstable": unstable_result,
         "timestamp": time.time()
     }
-    
     # Keep only last 10 partial entries to avoid memory issues
     partials = [e for e in conversation_history[call_sid] if e.get("type") == "partial"]
     sorted_partials = sorted(partials, key=lambda x: int(x.get("sequence", 0)))

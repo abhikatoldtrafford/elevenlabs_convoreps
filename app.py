@@ -240,7 +240,7 @@ def partial_speech():
         print(f"🔊 Activity: {speech_activity}")
     
     # Calculate total heard so far
-    total_heard = stable_result + (" " + unstable_result if unstable_result else "")
+    total_heard = unstable_result
     if total_heard:
         print(f"💭 Total heard so far: '{total_heard}'")
     

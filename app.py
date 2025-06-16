@@ -273,7 +273,7 @@ def partial_speech():
         conversation_history[call_sid] = []
     
     # Store partial results in conversation history for debugging
-     partial_entry = {
+    partial_entry = {
         "type": "partial",
         "sequence": int(sequence_number),  # Convert to int for proper sorting
         "text": unstable_result,  # Rename to just "text" since there's only unstable

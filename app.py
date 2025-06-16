@@ -535,21 +535,21 @@ async def process_speech():
     else:
         # Generate TTS (streaming or non-streaming)
         try:
-            if USE_STREAMING:
-                raw_audio = await generate_tts_streaming(reply, voice_id)
-            else:
-                # Use legacy generate for backward compatibility
-                raw_audio = elevenlabs_client.text_to_speech.convert(
-                    voice_id=voice_id,
-                    text=reply,
-                    model_id="eleven_monolingual_v1",
-                    output_format="mp3_22050_32"
-                )
-                
+            audio_gen = elevenlabs_client.text_to_speech.convert(
+                voice_id=voice_id,
+                text=reply,
+                model_id="eleven_monolingual_v1",
+                output_format="mp3_22050_32"
+            )
+            raw_audio = b""
+            for chunk in audio_gen:
+                if chunk:
+                    raw_audio += chunk
+            
             output_path = f"static/response_{call_sid}.mp3"
             with open(output_path, "wb") as f:
                 f.write(raw_audio)
-            print(f"✅ Audio saved to {output_path}")
+            print(f"✅ Audio saved to {output_path} ({len(raw_audio)} bytes)")
                 
         except Exception as e:
             print(f"🛑 ElevenLabs generation error: {e}")

@@ -6,6 +6,5 @@ requests==2.32.3
 python-dotenv==1.1.0
 twilio==9.5.2
 pydub==0.25.1
-elevenlabs==0.2.27
+elevenlabs==2.3.0
 gunicorn
-

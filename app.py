@@ -340,7 +340,27 @@ async def process_speech():
         turn_count.clear()
         active_call_sid = call_sid
     
-    # Define helper functions (same as in transcribe)
+    # Helper function to get clean conversation history
+    def get_clean_conversation_history(call_sid):
+        """Get only valid message entries from conversation history"""
+        if call_sid not in conversation_history:
+            return []
+        
+        clean_history = []
+        for entry in conversation_history[call_sid]:
+            # Only include entries with role and content (skip partial entries)
+            if (isinstance(entry, dict) and 
+                "role" in entry and 
+                "content" in entry and
+                entry.get("type") != "partial"):
+                clean_history.append({
+                    "role": entry["role"],
+                    "content": entry["content"]
+                })
+        
+        return clean_history
+    
+    # Define helper functions
     def detect_bad_news(text):
         lowered = text.lower()
         return any(phrase in lowered for phrase in [
@@ -372,6 +392,13 @@ async def process_speech():
         mode = detect_intent(transcript)
         mode_lock[call_sid] = mode
     print("🧐 Detected intent:", mode)
+
+    # Clean conversation history for this call (remove partial entries)
+    if call_sid in conversation_history:
+        conversation_history[call_sid] = [
+            entry for entry in conversation_history[call_sid]
+            if isinstance(entry, dict) and "role" in entry and "content" in entry and entry.get("type") != "partial"
+        ]
 
     # Set up personality and voice based on mode
     if mode == "cold_call" or mode == "customer_convo":
@@ -424,7 +451,10 @@ async def process_speech():
         reply = intro_line
         conversation_history[call_sid].append({"role": "assistant", "content": reply})
     else:
+        # Add user message to history
         conversation_history[call_sid].append({"role": "user", "content": transcript})
+        
+        # Build messages array with validation
         messages = [{"role": "system", "content": system_prompt}]
         
         # Check for bad news
@@ -460,23 +490,39 @@ async def process_speech():
                 "content": escalation_prompt
             })
 
-        messages += conversation_history[call_sid]
+        # Add clean conversation history
+        messages += get_clean_conversation_history(call_sid)
+        
+        # Debug: Print messages structure
+        print(f"📋 Messages array length: {len(messages)}")
+        for i, msg in enumerate(messages):
+            if isinstance(msg, dict) and "role" in msg:
+                content_preview = msg.get('content', '')[:50] + '...' if msg.get('content', '') else 'No content'
+                print(f"   [{i}] {msg['role']}: {content_preview}")
+            else:
+                print(f"   [{i}] INVALID: {msg}")
 
-        # Get GPT response (streaming or non-streaming)
-        if USE_STREAMING:
-            reply = await streaming_gpt_response(messages, voice_id, call_sid)
-        else:
-            gpt_reply = sync_openai.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=messages
-            )
-            reply = gpt_reply.choices[0].message.content.strip()
+        # Get GPT response
+        try:
+            if USE_STREAMING:
+                reply = await streaming_gpt_response(messages, voice_id, call_sid)
+            else:
+                gpt_reply = sync_openai.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=messages
+                )
+                reply = gpt_reply.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"💥 GPT error: {e}")
+            # Fallback response
+            reply = "I'm having a bit of trouble understanding. Could you say that again?"
             
         # Clean up response
         reply = reply.replace("*", "").replace("_", "").replace("`", "").replace("#", "").replace("-", " ")
         conversation_history[call_sid].append({"role": "assistant", "content": reply})
 
     print(f"🔣 Generating voice with ID: {voice_id}")
+    print(f"🗣️ Reply: {reply[:100]}...")
     
     # Generate TTS
     if USE_STREAMING and SENTENCE_STREAMING and turn > 0 and os.path.exists(f"static/response_{call_sid}.mp3"):
@@ -489,31 +535,40 @@ async def process_speech():
                 raw_audio = await generate_tts_streaming(reply, voice_id)
             else:
                 # Use legacy generate for backward compatibility
-                from elevenlabs import generate
-                raw_audio = generate(text=reply, voice=voice_id, model="eleven_monolingual_v1")
+                raw_audio = elevenlabs_client.text_to_speech.convert(
+                    voice_id=voice_id,
+                    text=reply,
+                    model_id="eleven_monolingual_v1",
+                    output_format="mp3_22050_32"
+                )
                 
             output_path = f"static/response_{call_sid}.mp3"
             with open(output_path, "wb") as f:
                 f.write(raw_audio)
+            print(f"✅ Audio saved to {output_path}")
                 
         except Exception as e:
-            print(f"🛑 ElevenLabs generation error:", e)
+            print(f"🛑 ElevenLabs generation error: {e}")
             if "429" in str(e):  # Too Many Requests
                 print("🔁 Retrying after brief pause due to rate limit...")
-                await asyncio.sleep(2)  # Use async sleep
+                await asyncio.sleep(2)
                 try:
                     if USE_STREAMING:
                         raw_audio = await generate_tts_streaming(reply, voice_id)
                     else:
-                        from elevenlabs import generate
-                        raw_audio = generate(text=reply, voice=voice_id, model="eleven_monolingual_v1")
+                        raw_audio = elevenlabs_client.text_to_speech.convert(
+                            voice_id=voice_id,
+                            text=reply,
+                            model_id="eleven_monolingual_v1",
+                            output_format="mp3_22050_32"
+                        )
                         
                     output_path = f"static/response_{call_sid}.mp3"
                     with open(output_path, "wb") as f:
                         f.write(raw_audio)
                     print("✅ Retry succeeded")
-                except Exception as e:
-                    print(f"❌ Retry failed:", e)
+                except Exception as e2:
+                    print(f"❌ Retry failed: {e2}")
                     fallback_path = "static/fallback.mp3"
                     if os.path.exists(fallback_path):
                         os.system(f"cp {fallback_path} static/response_{call_sid}.mp3")

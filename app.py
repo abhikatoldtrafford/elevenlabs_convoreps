@@ -195,16 +195,125 @@ def voice():
         response.redirect(f"{request.url_root}voice")
         return str(response)
 
-    response.record(
-        action="/transcribe",
-        method="POST",
-        max_length=30,
-        timeout=6,
-        play_beep=True,
-        trim="trim-silence"
-    )
+    response.gather(
+        input='speech',  # Enable speech recognition
+        action='/process_speech',  # Where to send results
+        method='POST',
+        speechTimeout='auto',  # String, not keyword!
+        speechModel='experimental_conversations',  # Best for natural conversation
+        enhanced=True,  # Only works with 'phone_call' model
+        actionOnEmptyResult=False,
+        timeout=3,
+        profanityFilter=False,
+        partialResultCallback='/partial_speech',  # Real-time updates!
+        partialResultCallbackMethod='POST',
+        language='en-US'  # Specify language
+        )
     return str(response)
+@app.route("/partial_speech", methods=["POST"])
+def partial_speech():
+    """Handle partial speech results - simple logging version"""
+    
+    # Get all the partial result data from Twilio
+    call_sid = request.form.get("CallSid")
+    sequence_number = request.form.get("SequenceNumber", "0")
+    
+    # UnstableSpeechResult: Low confidence, still being processed
+    unstable_result = request.form.get("UnstableSpeechResult", "")
+    
+    # Speech activity indicators
+    speech_activity = request.form.get("SpeechActivity", "")
+    
+    # Get caller info for logging
+    caller = request.form.get("From", "Unknown")
+    
+    # Log the partial results with emojis for clarity
+    print(f"\n{'='*60}")
+    print(f"🎤 PARTIAL SPEECH #{sequence_number} - CallSid: {call_sid}")
+    print(f"📞 Caller: {caller}")
+    print(f"{'='*60}")
 
+    if unstable_result:
+        print(f"⏳ UNSTABLE: '{unstable_result}'")
+        
+    if speech_activity:
+        print(f"🔊 Activity: {speech_activity}")
+    
+    # Calculate total heard so far
+    total_heard = stable_result + (" " + unstable_result if unstable_result else "")
+    if total_heard:
+        print(f"💭 Total heard so far: '{total_heard}'")
+    
+    # Detect early intent patterns (just logging, no action)
+    detected_intents = []
+    lower_text = total_heard.lower()
+    
+    if any(phrase in lower_text for phrase in ["cold call", "sales call", "customer call"]):
+        detected_intents.append("🎯 COLD CALL PRACTICE")
+    
+    if any(phrase in lower_text for phrase in ["interview", "interview prep"]):
+        detected_intents.append("👔 INTERVIEW PRACTICE")
+        
+    if any(phrase in lower_text for phrase in ["small talk", "chat", "conversation"]):
+        detected_intents.append("💬 SMALL TALK")
+        
+    if any(phrase in lower_text for phrase in ["bad news", "delay", "problem", "issue"]):
+        detected_intents.append("😠 BAD NEWS DETECTED")
+        
+    if any(phrase in lower_text for phrase in ["let's start over", "start over", "reset"]):
+        detected_intents.append("🔄 RESET REQUEST")
+    
+    if detected_intents:
+        print(f"\n🎯 Early Intent Detection:")
+        for intent in detected_intents:
+            print(f"   {intent}")
+    
+    # Track conversation flow
+    if call_sid not in conversation_history:
+        conversation_history[call_sid] = []
+    
+    # Store partial results in conversation history for debugging
+    partial_entry = {
+        "type": "partial",
+        "sequence": sequence_number,
+        "stable": stable_result,
+        "unstable": unstable_result,
+        "timestamp": time.time()
+    }
+    
+    # Keep only last 10 partial entries to avoid memory issues
+    partials = [e for e in conversation_history[call_sid] if e.get("type") == "partial"]
+    sorted_partials = sorted(partials, key=lambda x: int(x.get("sequence", 0)))
+    if len(partials) >= 10:
+        # Remove oldest partial
+        conversation_history[call_sid] = [
+            e for e in conversation_history[call_sid] 
+            if not (e.get("type") == "partial" and e["sequence"] == partials[0]["sequence"])
+        ]
+    
+    conversation_history[call_sid].append(partial_entry)
+    
+    # Speech length analysis
+    if stable_result:
+        word_count = len(stable_result.split())
+        print(f"\n📊 Speech Analysis:")
+        print(f"   Words (stable): {word_count}")
+        print(f"   Characters: {len(stable_result)}")
+        
+        # Estimate speaking time (average 150 words per minute)
+        estimated_seconds = (word_count / 150) * 60
+        print(f"   Est. speaking time: {estimated_seconds:.1f}s")
+    
+    # Debug all received parameters
+    if os.getenv("DEBUG_PARTIAL", "false").lower() == "true":
+        print(f"\n🔍 DEBUG - All Parameters:")
+        for key, value in request.form.items():
+            print(f"   {key}: {value}")
+    
+    print(f"{'='*60}\n")
+    
+    # Return 204 No Content - this doesn't affect the call flow
+    return "", 204
 async def streaming_transcribe(audio_file_path: str) -> str:
     """Transcription with streaming control"""
     try:

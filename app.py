@@ -594,8 +594,8 @@ async def process_speech():
         print(f"✅ Ready flag already exists for {call_sid}")
 
     # Schedule cleanup
-    cleanup_thread = threading.Thread(target=delayed_cleanup, args=(call_sid,))
-    cleanup_thread.start()
+    # cleanup_thread = threading.Thread(target=delayed_cleanup, args=(call_sid,))
+    # cleanup_thread.start()
 
     return redirect(url_for("voice", _external=True))
 async def streaming_transcribe(audio_file_path: str) -> str:

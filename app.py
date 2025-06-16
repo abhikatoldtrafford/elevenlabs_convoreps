@@ -134,7 +134,7 @@ def static_files(filename):
 
 
 def delayed_cleanup(call_sid):
-    time.sleep(30)  # Let Twilio play it first
+    time.sleep(120)  # Let Twilio play it first
     try:
         os.remove(f"static/response_{call_sid}.mp3")
         os.remove(f"static/response_ready_{call_sid}.txt")
@@ -549,6 +549,7 @@ async def process_speech():
             output_path = f"static/response_{call_sid}.mp3"
             with open(output_path, "wb") as f:
                 f.write(raw_audio)
+                f.flush()
             print(f"✅ Audio saved to {output_path} ({len(raw_audio)} bytes)")
                 
         except Exception as e:
@@ -576,6 +577,7 @@ async def process_speech():
                     fallback_path = "static/fallback.mp3"
                     if os.path.exists(fallback_path):
                         os.system(f"cp {fallback_path} static/response_{call_sid}.mp3")
+                        
                         with open(f"static/response_ready_{call_sid}.txt", "w") as f:
                             f.write("ready")
                         print("⚠️ Fallback MP3 used.")
@@ -1073,7 +1075,7 @@ async def transcribe():
                         return redirect(url_for("voice", _external=True))
                     else:
                         return "ElevenLabs error and no fallback available", 500
-    
+    time.sleep(2)
     # Ensure ready flag is always created
     if not os.path.exists(f"static/response_ready_{call_sid}.txt"):
         with open(f"static/response_ready_{call_sid}.txt", "w") as f:

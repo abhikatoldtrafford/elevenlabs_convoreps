@@ -146,6 +146,12 @@ def delayed_cleanup(call_sid):
 @app.route("/voice", methods=["POST", "GET"])
 def voice():
     call_sid = request.values.get("CallSid")
+    if turn_count.get(call_sid, 0) == 0:  # First turn of new call
+    for f in os.listdir("static"):
+        if f.startswith("response_") and "CAb" not in f:  # Don't delete current call
+            if time.time() - os.path.getmtime(f"static/{f}") > 600:  # 10+ minutes old
+                try: os.remove(f"static/{f}")
+                except: pass
     recording_url = request.values.get("RecordingUrl")
 
     print(f"==> /voice hit. CallSid: {call_sid}")

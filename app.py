@@ -216,7 +216,7 @@ async def streaming_transcribe(audio_file_path: str) -> str:
                         model="gpt-4o-mini-transcribe",
                         file=audio_file,
                         response_format="text",
-                        stream=True
+                        stream=True, language='en'
                     )
                     
                     transcript = ""

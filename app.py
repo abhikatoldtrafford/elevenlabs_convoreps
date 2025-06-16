@@ -21,27 +21,17 @@ import openai
 from openai import OpenAI, AsyncOpenAI
 from elevenlabs import VoiceSettings
 from elevenlabs.client import ElevenLabs
-from flask_sock import Sock
-import websocket
-import json
-import base64
-import struct
-from twilio.twiml.voice_response import Connect, Stream
+
 # Load environment variables ASAP
 load_dotenv()
 
-
-# Media Stream configuration
-USE_MEDIA_STREAMS = os.getenv("USE_MEDIA_STREAMS", "false").lower() == "true"
-MEDIA_STREAM_CHUNK_SIZE = 8000  # 8kHz for Twilio
-media_stream_connections = {}  # Track active streams
 # Suppress excessive werkzeug logging
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
 # Initialize Flask app
 app = Flask(__name__)
-sock = Sock(app)
+
 # Set the secret key for sessions
 app.secret_key = os.getenv("FLASK_SECRET_KEY")
 
@@ -78,9 +68,7 @@ except ValueError:
 # Twilio credentials
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-# Media stream state
-media_streams = {}  # Track active media streams
-stream_queues = {}  # Audio queues for each stream
+
 # In-memory state
 turn_count = {}
 mode_lock = {}
@@ -146,7 +134,7 @@ def static_files(filename):
 
 
 def delayed_cleanup(call_sid):
-    time.sleep(15)  # Let Twilio play it first
+    time.sleep(45)  # Let Twilio play it first
     try:
         os.remove(f"static/response_{call_sid}.mp3")
         os.remove(f"static/response_ready_{call_sid}.txt")
@@ -172,12 +160,21 @@ def voice():
 
     print(f"🧪 Current turn: {turn_count[call_sid]}")
 
+    mp3_path = f"static/response_{call_sid}.mp3"
+    flag_path = f"static/response_ready_{call_sid}.txt"
     response = VoiceResponse()
 
-    # First turn - play greeting
+    def is_file_ready(mp3_path, flag_path):
+        if not os.path.exists(mp3_path) or not os.path.exists(flag_path):
+            return False
+        if os.path.getsize(mp3_path) < 1500:
+            print("⚠️ MP3 file exists but is too small, not ready yet.")
+            return False
+        return True
+
     if turn_count[call_sid] == 0:
         print("📞 First turn — playing appropriate greeting")
-        
+
         if not session.get("has_called_before"):
             session["has_called_before"] = True
             greeting_file = "first_time_greeting.mp3"
@@ -185,332 +182,29 @@ def voice():
         else:
             greeting_file = "returning_user_greeting.mp3"
             print("🔁 Returning caller — playing returning greeting.")
-        
+
         response.play(f"{request.url_root}static/{greeting_file}?v={time.time()}")
-        
-        # After greeting, decide streaming vs file-based
-        if USE_MEDIA_STREAMS:
-            print("🚀 Using Media Streams for real-time audio")
-            # Start bidirectional stream
-            connect = Connect()
-            connect.stream(
-                url=f'wss://{request.host}/media-stream/{call_sid}',
-                track='both_tracks'
-            )
-            response.append(connect)
-        else:
-            # Fall back to traditional record
-            response.record(
-                action="/transcribe",
-                method="POST",
-                max_length=30,
-                timeout=6,
-                play_beep=True,
-                trim="trim-silence"
-            )
-    
+
+    elif is_file_ready(mp3_path, flag_path):
+        print(f"🔊 Playing: {mp3_path}")
+        public_mp3_url = f"{request.url_root}static/response_{call_sid}.mp3"
+        response.play(public_mp3_url)
     else:
-        # Subsequent turns
-        if USE_MEDIA_STREAMS:
-            # For streaming, we handle everything in WebSocket
-            # Just maintain the connection
-            connect = Connect()
-            connect.stream(
-                url=f'wss://{request.host}/media-stream/{call_sid}',
-                track='both_tracks'
-            )
-            response.append(connect)
-        else:
-            # Original file-based approach
-            mp3_path = f"static/response_{call_sid}.mp3"
-            flag_path = f"static/response_ready_{call_sid}.txt"
-            
-            def is_file_ready(mp3_path, flag_path):
-                if not os.path.exists(mp3_path) or not os.path.exists(flag_path):
-                    return False
-                if os.path.getsize(mp3_path) < 1500:
-                    print("⚠️ MP3 file exists but is too small, not ready yet.")
-                    return False
-                return True
-            
-            if is_file_ready(mp3_path, flag_path):
-                print(f"🔊 Playing: {mp3_path}")
-                public_mp3_url = f"{request.url_root}static/response_{call_sid}.mp3"
-                response.play(public_mp3_url)
-            else:
-                print("⏳ Response not ready — redirecting to /voice")
-                response.pause(length=2)
-                response.redirect(f"{request.url_root}voice")
-                return str(response)
-            
-            response.record(
-                action="/transcribe",
-                method="POST",
-                max_length=30,
-                timeout=6,
-                play_beep=True,
-                trim="trim-silence"
-            )
-    
-    return str(response)
-@sock.route('/media-stream/<call_sid>')
-def media_stream(ws, call_sid):
-    """Handle real-time media streaming"""
-    print(f"🎙️ Media stream connected for {call_sid}")
-    
-    # Initialize stream state
-    stream_sid = None
-    audio_buffer = bytearray()
-    is_speaking = False
-    silence_duration = 0
-    media_stream_connections[call_sid] = {
-        'ws': ws,
-        'stream_sid': None,
-        'audio_queue': asyncio.Queue() if USE_STREAMING else None
-    }
-    
-    try:
-        while True:
-            message = ws.receive()
-            if message is None:
-                break
-                
-            data = json.loads(message)
-            
-            if data['event'] == 'start':
-                stream_sid = data['start']['streamSid']
-                media_stream_connections[call_sid]['stream_sid'] = stream_sid
-                print(f"📡 Stream started: {stream_sid}")
-                
-                # Send initial greeting if first turn
-                if turn_count.get(call_sid, 0) == 0:
-                    asyncio.run(stream_greeting(ws, call_sid))
-                    
-            elif data['event'] == 'media':
-                # Decode incoming audio
-                payload = data['media']['payload']
-                audio_chunk = base64.b64decode(payload)
-                audio_buffer.extend(audio_chunk)
-                
-                # Simple voice activity detection (VAD)
-                # Check if user is speaking based on audio levels
-                audio_level = sum(abs(b - 128) for b in audio_chunk) / len(audio_chunk)
-                
-                if audio_level > 10:  # Threshold for speech
-                    if not is_speaking:
-                        is_speaking = True
-                        print("🗣️ User started speaking")
-                    silence_duration = 0
-                else:
-                    if is_speaking:
-                        silence_duration += len(audio_chunk) / 8000  # 8kHz sample rate
-                        
-                        if silence_duration > 1.5:  # 1.5 seconds of silence
-                            is_speaking = False
-                            print("🤫 User stopped speaking")
-                            
-                            # Process the audio buffer
-                            if len(audio_buffer) > 8000:  # At least 1 second
-                                asyncio.run(process_streaming_audio(
-                                    audio_buffer, call_sid, ws
-                                ))
-                                audio_buffer = bytearray()
-                                
-            elif data['event'] == 'stop':
-                print(f"⏹️ Stream stopped for {call_sid}")
-                break
-                
-    except Exception as e:
-        print(f"❌ Media stream error: {e}")
-    finally:
-        if call_sid in media_stream_connections:
-            del media_stream_connections[call_sid]
-        print(f"👋 Media stream disconnected for {call_sid}")
-async def process_streaming_audio(audio_buffer, call_sid, ws):
-    """Process audio buffer and stream response"""
-    try:
-        # Convert mulaw to WAV for transcription
-        wav_data = convert_mulaw_to_wav(audio_buffer)
-        
-        # Save temporarily for transcription
-        temp_file = f"temp_{call_sid}.wav"
-        with open(temp_file, 'wb') as f:
-            f.write(wav_data)
-        
-        # Transcribe
-        transcript = await streaming_transcribe(temp_file)
-        print(f"📝 Streaming transcription: {transcript}")
-        
-        # Clean up temp file
-        os.remove(temp_file)
-        
-        # Get conversation context and generate response
-        # (reuse your existing logic from transcribe())
-        mode = mode_lock.get(call_sid, "unknown")
-        messages = build_messages_for_call(call_sid, transcript, mode)
-        
-        # Stream the response
-        if USE_STREAMING and SENTENCE_STREAMING:
-            # Generate and stream sentence by sentence
-            await stream_gpt_tts_response(messages, call_sid, ws)
-        else:
-            # Generate full response then stream
-            reply = await streaming_gpt_response(messages, voice_id, call_sid)
-            await stream_audio_file(f"static/response_{call_sid}.mp3", ws)
-            
-    except Exception as e:
-        print(f"❌ Streaming audio processing error: {e}")
-def convert_mulaw_to_wav(mulaw_data):
-    """Convert mulaw audio to WAV format"""
-    # Twilio sends 8-bit mulaw at 8kHz
-    import audioop
-    
-    # Convert mulaw to linear PCM
-    linear_data = audioop.ulaw2lin(bytes(mulaw_data), 2)
-    
-    # Create WAV header
-    channels = 1
-    sample_width = 2
-    framerate = 8000
-    num_frames = len(linear_data) // sample_width
-    
-    wav_header = struct.pack(
-        '<4sI4s4sIHHIIHH4sI',
-        b'RIFF',
-        36 + len(linear_data),
-        b'WAVE',
-        b'fmt ',
-        16,  # fmt chunk size
-        1,   # PCM format
-        channels,
-        framerate,
-        framerate * channels * sample_width,
-        channels * sample_width,
-        sample_width * 8,
-        b'data',
-        len(linear_data)
+        print("⏳ Response not ready — redirecting to /voice")
+        response.pause(length=2)
+        response.redirect(f"{request.url_root}voice")
+        return str(response)
+
+    response.record(
+        action="/transcribe",
+        method="POST",
+        max_length=30,
+        timeout=6,
+        play_beep=True,
+        trim="trim-silence"
     )
-    
-    return wav_header + linear_data
+    return str(response)
 
-async def stream_gpt_tts_response(messages, call_sid, ws):
-    """Generate and stream GPT response with TTS in real-time"""
-    try:
-        # Get voice for this call
-        voice_id = get_voice_for_call(call_sid)
-        
-        # Stream GPT response
-        model = "gpt-4.1-nano-2025-04-14" if USE_STREAMING else "gpt-3.5-turbo"
-        stream = await async_openai.chat.completions.create(
-            model=model,
-            messages=messages,
-            stream=True,
-            temperature=0.7
-        )
-        
-        sentence_buffer = ""
-        
-        async for chunk in stream:
-            if chunk.choices[0].delta.content:
-                text = chunk.choices[0].delta.content
-                sentence_buffer += text
-                
-                # Check for sentence completion
-                sentences = re.split(r'(?<=[.!?])\s+', sentence_buffer)
-                
-                # Stream complete sentences
-                for sentence in sentences[:-1]:
-                    if sentence.strip():
-                        # Generate TTS and stream immediately
-                        await stream_tts_sentence(sentence, voice_id, ws)
-                
-                sentence_buffer = sentences[-1] if sentences else ""
-        
-        # Handle remaining text
-        if sentence_buffer.strip():
-            await stream_tts_sentence(sentence_buffer, voice_id, ws)
-            
-    except Exception as e:
-        print(f"❌ GPT/TTS streaming error: {e}")
-
-async def stream_tts_sentence(text, voice_id, ws):
-    """Generate TTS and stream to WebSocket"""
-    try:
-        # Generate TTS
-        response = elevenlabs_client.text_to_speech.stream(
-            voice_id=voice_id,
-            text=text,
-            model_id="eleven_turbo_v2_5",
-            output_format="ulaw_8000",  # Twilio's format
-            voice_settings=VoiceSettings(
-                stability=0.4,
-                similarity_boost=0.75
-            )
-        )
-        
-        # Stream chunks directly to Twilio
-        for chunk in response:
-            if chunk:
-                # Encode and send via WebSocket
-                encoded_chunk = base64.b64encode(chunk).decode('utf-8')
-                media_message = {
-                    "event": "media",
-                    "streamSid": media_stream_connections[call_sid]['stream_sid'],
-                    "media": {
-                        "payload": encoded_chunk
-                    }
-                }
-                ws.send(json.dumps(media_message))
-                
-    except Exception as e:
-        print(f"❌ TTS streaming error: {e}")
-
-async def stream_greeting(ws, call_sid):
-    """Stream greeting audio file"""
-    greeting_file = "static/first_time_greeting.mp3"
-    if os.path.exists(greeting_file):
-        # Convert MP3 to mulaw and stream
-        from pydub import AudioSegment
-        audio = AudioSegment.from_mp3(greeting_file)
-        audio = audio.set_frame_rate(8000).set_channels(1)
-        
-        # Convert to mulaw
-        mulaw_data = audioop.lin2ulaw(audio.raw_data, 2)
-        
-        # Send in chunks
-        chunk_size = 320  # 20ms at 8kHz
-        for i in range(0, len(mulaw_data), chunk_size):
-            chunk = mulaw_data[i:i+chunk_size]
-            encoded_chunk = base64.b64encode(chunk).decode('utf-8')
-            
-            media_message = {
-                "event": "media",
-                "streamSid": media_stream_connections[call_sid]['stream_sid'],
-                "media": {
-                    "payload": encoded_chunk
-                }
-            }
-            ws.send(json.dumps(media_message))
-            await asyncio.sleep(0.02)  # 20ms chunks
-
-def get_voice_for_call(call_sid):
-    """Get voice ID for current call context"""
-    # Reuse your existing voice selection logic
-    mode = mode_lock.get(call_sid, "unknown")
-    if mode == "cold_call":
-        persona_name = personality_memory.get(call_sid)
-        if persona_name:
-            return cold_call_personality_pool[persona_name]["voice_id"]
-    elif mode == "small_talk":
-        return "2BJW5coyhAzSr8STdHbE"
-    # ... etc
-    return "1t1EeRixsJrKbiF1zwM6"  # default
-
-def build_messages_for_call(call_sid, transcript, mode):
-    """Build message context for GPT (reuse existing logic)"""
-    # Extract this logic from your current transcribe() function
-    # Return the messages array for GPT
-    pass
 async def streaming_transcribe(audio_file_path: str) -> str:
     """Transcription with streaming control"""
     try:
@@ -522,8 +216,7 @@ async def streaming_transcribe(audio_file_path: str) -> str:
                         model="gpt-4o-mini-transcribe",
                         file=audio_file,
                         response_format="text",
-                        stream=True,
-                        language="en"
+                        stream=True
                     )
                     
                     transcript = ""

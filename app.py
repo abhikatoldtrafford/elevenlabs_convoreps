@@ -29,7 +29,7 @@ import struct
 from twilio.twiml.voice_response import Connect, Stream
 # Load environment variables ASAP
 load_dotenv()
-sock = Sock(app)
+
 
 # Media Stream configuration
 USE_MEDIA_STREAMS = os.getenv("USE_MEDIA_STREAMS", "false").lower() == "true"
@@ -41,7 +41,7 @@ log.setLevel(logging.ERROR)
 
 # Initialize Flask app
 app = Flask(__name__)
-
+sock = Sock(app)
 # Set the secret key for sessions
 app.secret_key = os.getenv("FLASK_SECRET_KEY")
 

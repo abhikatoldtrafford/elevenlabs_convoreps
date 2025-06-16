@@ -304,6 +304,239 @@ def partial_speech():
     
     # Return 204 No Content - this doesn't affect the call flow
     return "", 204
+@app.route("/process_speech", methods=["POST"])
+@async_route
+async def process_speech():
+    """Handle final speech recognition results from Gather"""
+    global active_call_sid
+    
+    print("✅ /process_speech endpoint hit")
+    print(f"  USE_STREAMING: {USE_STREAMING}")
+    print(f"  SENTENCE_STREAMING: {SENTENCE_STREAMING}")
+    
+    # Get the speech recognition results
+    call_sid = request.form.get("CallSid")
+    speech_result = request.form.get("SpeechResult", "")
+    confidence = request.form.get("Confidence", "0.0")
+    
+    print(f"📝 Final Speech Result: '{speech_result}'")
+    print(f"🎯 Confidence: {confidence}")
+    print(f"🛍️ ACTIVE CALL SID at start of /process_speech: {active_call_sid}")
+    
+    # Check if we got any speech
+    if not speech_result:
+        print("⚠️ No speech detected, redirecting back to voice")
+        return redirect(url_for("voice", _external=True))
+    
+    # Use the speech result as the transcript
+    transcript = speech_result.strip()
+    
+    # Reset memory for new calls
+    if call_sid != active_call_sid:
+        print(f"💨 Resetting memory for new call_sid: {call_sid}")
+        conversation_history.clear()
+        mode_lock.clear()
+        personality_memory.clear()
+        turn_count.clear()
+        active_call_sid = call_sid
+    
+    # Define helper functions (same as in transcribe)
+    def detect_bad_news(text):
+        lowered = text.lower()
+        return any(phrase in lowered for phrase in [
+            "bad news", "unfortunately", "problem", "delay", "issue", 
+            "we can't", "we won't", "not going to happen", "reschedule", "price increase"
+        ])
+
+    def detect_intent(text):
+        lowered = text.lower()
+        if any(phrase in lowered for phrase in ["cold call", "customer call", "sales call", "business call"]):
+            return "cold_call"
+        elif any(phrase in lowered for phrase in ["interview", "interview prep"]):
+            return "interview"
+        elif any(phrase in lowered for phrase in ["small talk", "chat", "talk casually"]):
+            return "small_talk"
+        return "unknown"
+
+    # Check for reset command
+    if "let's start over" in transcript.lower():
+        print("🔁 Reset triggered by user — rolling new persona")
+        conversation_history.pop(call_sid, None)
+        personality_memory.pop(call_sid, None)
+        turn_count[call_sid] = 0
+        transcript = "cold call practice"
+
+    # Determine mode
+    mode = mode_lock.get(call_sid)
+    if not mode:
+        mode = detect_intent(transcript)
+        mode_lock[call_sid] = mode
+    print("🧐 Detected intent:", mode)
+
+    # Set up personality and voice based on mode
+    if mode == "cold_call" or mode == "customer_convo":
+        if call_sid not in personality_memory:
+            persona_name = random.choice(list(cold_call_personality_pool.keys()))
+            personality_memory[call_sid] = persona_name
+        else:
+            persona_name = personality_memory[call_sid]
+
+        persona = cold_call_personality_pool[persona_name]
+        voice_id = persona["voice_id"]
+        system_prompt = persona["system_prompt"]
+        intro_line = persona.get("intro_line", "Alright, I'll be your customer. Start the conversation however you want — this could be a cold call, a follow-up, a check-in, or even a tough conversation. I'll respond based on my personality. If you ever want to start over, just say 'let's start over.'")
+
+    elif mode == "small_talk":
+        voice_id = "2BJW5coyhAzSr8STdHbE"
+        system_prompt = "You're a casual, sarcastic friend. Keep it light, keep it fun."
+        intro_line = "Yo yo yo, how's it goin'?"
+
+    elif mode == "interview":
+        interview_voice_pool = [
+            {"voice_id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel"},
+            {"voice_id": "EXAVITQu4vr4xnSDxMaL", "name": "Clyde"},
+            {"voice_id": "6YQMyaUWlj0VX652cY1C", "name": "Stephen"}
+        ]
+
+        voice_choice = random.choice(interview_voice_pool)
+        voice_id = voice_choice["voice_id"]
+        system_prompt = (
+            f"You are {voice_choice['name']}, a friendly, conversational job interviewer helping candidates practice for real interviews. "
+            "Speak casually — like you're talking to someone over coffee, not in a formal evaluation. Ask one interview-style question at a time, and after each response, give supportive, helpful feedback. "
+            "If their answer is weak, say 'Let's try that again' and re-ask the question. If it's strong, give a quick reason why it's good. "
+            "Briefly refer to the STAR method (Situation, Task, Action, Result) when giving feedback, but don't lecture. Keep your tone upbeat, natural, and keep the conversation flowing. "
+            "Don't ask if they're ready for the next question — just move on with something like, 'Alright, next one,' or 'Cool, here's another one.'"
+        )
+        intro_line = "Great, let's jump in! Can you walk me through your most recent role and responsibilities?"
+
+    else:
+        voice_id = "1t1EeRixsJrKbiF1zwM6"
+        system_prompt = "You're a helpful assistant."
+        intro_line = "How can I help you today?"
+
+    # Manage turn count and conversation history
+    turn = turn_count.get(call_sid, 0)
+    turn_count[call_sid] = turn + 1
+    conversation_history.setdefault(call_sid, [])
+
+    # Generate response
+    if turn == 0:
+        reply = intro_line
+        conversation_history[call_sid].append({"role": "assistant", "content": reply})
+    else:
+        conversation_history[call_sid].append({"role": "user", "content": transcript})
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # Check for bad news
+        lowered = transcript.lower()
+        is_bad_news = any(x in lowered for x in [
+            "bad news", "unfortunately", "delay", "delayed", "won't make it", "can't deliver",
+            "got pushed", "rescheduled", "not coming", "issue with the supplier", "problem with your order"
+        ])
+
+        is_user_defensive = any(x in lowered for x in [
+            "calm down", "relax", "it's not my fault", "what do you want me to do", "stop yelling", "chill out"
+        ])
+
+        if is_bad_news:
+            print("⚠️ Bad news detected — AI will respond angrily.")
+            escalation_prompt = (
+                "The user just delivered bad news to the customer. Respond as the customer based on your personality, "
+                "but crank up the emotion. If it fits your persona, act furious — like you're raising your voice. "
+                "You can use strong language (not profane), interruptions, and frustration. You might say things like "
+                "'Are you SERIOUS right now?!' or 'Unbelievable. This is NOT okay.' Show that this ruined your day. "
+                "If the user tries to calm you down, don't immediately cool off. Push back again with more anger. "
+                "Only start to de-escalate if they take responsibility and handle it well. Stay human, not robotic."
+            )
+
+            if is_user_defensive:
+                print("😡 User snapped back — escalate the attitude.")
+                escalation_prompt += (
+                    " The user got defensive, so now you're even more upset. Push back harder. Say something like, 'Don't tell me to calm down — this is your screw-up.'"
+                )
+
+            messages.insert(0, {
+                "role": "system",
+                "content": escalation_prompt
+            })
+
+        messages += conversation_history[call_sid]
+
+        # Get GPT response (streaming or non-streaming)
+        if USE_STREAMING:
+            reply = await streaming_gpt_response(messages, voice_id, call_sid)
+        else:
+            gpt_reply = sync_openai.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=messages
+            )
+            reply = gpt_reply.choices[0].message.content.strip()
+            
+        # Clean up response
+        reply = reply.replace("*", "").replace("_", "").replace("`", "").replace("#", "").replace("-", " ")
+        conversation_history[call_sid].append({"role": "assistant", "content": reply})
+
+    print(f"🔣 Generating voice with ID: {voice_id}")
+    
+    # Generate TTS
+    if USE_STREAMING and SENTENCE_STREAMING and turn > 0 and os.path.exists(f"static/response_{call_sid}.mp3"):
+        # Audio already generated by streaming_gpt_response
+        print(f"✅ Audio already generated via sentence streaming for {call_sid}")
+    else:
+        # Generate TTS (streaming or non-streaming)
+        try:
+            if USE_STREAMING:
+                raw_audio = await generate_tts_streaming(reply, voice_id)
+            else:
+                # Use legacy generate for backward compatibility
+                from elevenlabs import generate
+                raw_audio = generate(text=reply, voice=voice_id, model="eleven_monolingual_v1")
+                
+            output_path = f"static/response_{call_sid}.mp3"
+            with open(output_path, "wb") as f:
+                f.write(raw_audio)
+                
+        except Exception as e:
+            print(f"🛑 ElevenLabs generation error:", e)
+            if "429" in str(e):  # Too Many Requests
+                print("🔁 Retrying after brief pause due to rate limit...")
+                await asyncio.sleep(2)  # Use async sleep
+                try:
+                    if USE_STREAMING:
+                        raw_audio = await generate_tts_streaming(reply, voice_id)
+                    else:
+                        from elevenlabs import generate
+                        raw_audio = generate(text=reply, voice=voice_id, model="eleven_monolingual_v1")
+                        
+                    output_path = f"static/response_{call_sid}.mp3"
+                    with open(output_path, "wb") as f:
+                        f.write(raw_audio)
+                    print("✅ Retry succeeded")
+                except Exception as e:
+                    print(f"❌ Retry failed:", e)
+                    fallback_path = "static/fallback.mp3"
+                    if os.path.exists(fallback_path):
+                        os.system(f"cp {fallback_path} static/response_{call_sid}.mp3")
+                        with open(f"static/response_ready_{call_sid}.txt", "w") as f:
+                            f.write("ready")
+                        print("⚠️ Fallback MP3 used.")
+                        return redirect(url_for("voice", _external=True))
+                    else:
+                        return "ElevenLabs error and no fallback available", 500
+    
+    # Ensure ready flag is always created
+    if not os.path.exists(f"static/response_ready_{call_sid}.txt"):
+        with open(f"static/response_ready_{call_sid}.txt", "w") as f:
+            f.write("ready")
+        print(f"🚩 Ready flag created for {call_sid}")
+    else:
+        print(f"✅ Ready flag already exists for {call_sid}")
+
+    # Schedule cleanup
+    cleanup_thread = threading.Thread(target=delayed_cleanup, args=(call_sid,))
+    cleanup_thread.start()
+
+    return redirect(url_for("voice", _external=True))
 async def streaming_transcribe(audio_file_path: str) -> str:
     """Transcription with streaming control"""
     try:

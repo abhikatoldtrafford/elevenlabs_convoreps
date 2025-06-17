@@ -28,6 +28,7 @@ import time
 import threading
 import asyncio
 import re
+import gc
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -69,8 +70,8 @@ sync_openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 async_openai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 elevenlabs_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
 
-# Thread pool for async operations
-executor = ThreadPoolExecutor(max_workers=10)
+# Thread pool for async operations - reduced for memory
+executor = ThreadPoolExecutor(max_workers=3)
 
 # Global state management
 active_streams = {}  # Active WebSocket connections
@@ -90,23 +91,15 @@ personality_profiles = {
 cold_call_personality_pool = {
     "Jerry": {
         "voice_id": "1t1EeRixsJrKbiF1zwM6",
-        "system_prompt": "You're Jerry. You're a skeptical small business owner who's been burned by vendors in the past. You're not rude, but you're direct and hard to win over. Respond naturally based on how the call starts — maybe this is a cold outreach, maybe a follow-up, or even someone calling you with bad news. Stay in character. If the salesperson fumbles, challenge them. If they're smooth, open up a bit. Speak casually, not like a script. Keep responses SHORT - 1-2 sentences max unless truly needed."
+        "system_prompt": "You're Jerry, a skeptical small business owner. Be direct but not rude. Stay in character. Keep responses SHORT - 1-2 sentences max."
     },
     "Miranda": {
         "voice_id": "Ax1GP2W4XTyAyNHuch7v",
-        "system_prompt": "You're Miranda. You're a busy office manager who doesn't have time for fluff. If the caller is clear and respectful, you'll hear them out. Respond naturally depending on how they open — this could be a cold call, a follow-up, or someone delivering news. Keep your tone grounded and real. Interrupt if needed. No robotic replies — talk like a real person at work. Keep responses SHORT - 1-2 sentences max."
-    },
-    "Junior": {
-        "voice_id": "Nbttze9nhGhK1czblc6j",
-        "system_prompt": "You're Junior. You run a local shop and have heard it all. You're friendly but not easily impressed. Start skeptical, but if the caller handles things well, loosen up. Whether this is a pitch, a follow-up, or some kind of check-in, reply naturally. Use casual language. If something sounds off, call it out. You don't owe anyone your time — but you're not a jerk either. Keep responses SHORT - 1-2 sentences."
+        "system_prompt": "You're Miranda, a busy office manager. No time for fluff. Be grounded and real. Keep responses SHORT - 1-2 sentences max."
     },
     "Brett": {
         "voice_id": "7eFTSJ6WtWd9VCU4ZlI1",
-        "system_prompt": "You're Brett. You're a contractor who answers his phone mid-job. You're busy and a little annoyed this person called. If they're direct and helpful, give them a minute. If they ramble, shut it down. This could be a pitch, a check-in, or someone following up on a proposal. React based on how they start the convo. Talk rough, fast, and casual. No fluff, no formalities. Keep responses SHORT."
-    },
-    "Kayla": {
-        "voice_id": "aTxZrSrp47xsP6Ot4Kgd",
-        "system_prompt": "You're Kayla. You own a business and don't waste time. You've had too many bad sales calls and follow-ups from people who don't know how to close. Respond based on how they open — if it's a pitch, hit them with price objections. If it's a follow-up, challenge their urgency. Keep your tone sharp but fair. You don't sugarcoat things, and you don't fake interest. Keep responses VERY SHORT - 1-2 sentences only."
+        "system_prompt": "You're Brett, a contractor answering mid-job. Busy and a bit annoyed. Talk rough, fast, casual. Keep responses SHORT."
     }
 }
 
@@ -128,14 +121,23 @@ class StreamingSpeechProcessor:
     def __init__(self, call_sid):
         self.call_sid = call_sid
         self.audio_buffer = b''
-        self.silence_threshold = 1.5  # Increased from 0.8 seconds
+        self.silence_threshold = 1.2  # Reduced from 1.5 seconds
         self.last_speech_time = time.time()
-        self.min_speech_length = 0.3  # Decreased from 0.5 seconds
+        self.min_speech_length = 0.3  # minimum speech length
         self.silence_start_time = None
         self.speech_detected = False
+        self.max_buffer_size = 40000  # 5 seconds max buffer
         
     def add_audio(self, audio_chunk):
         """Add audio chunk to buffer"""
+        # Limit buffer size to prevent memory issues
+        if len(self.audio_buffer) > self.max_buffer_size:
+            # Force process if buffer is too large
+            complete_audio = self.audio_buffer
+            self.audio_buffer = b''
+            self.clear_state()
+            return complete_audio
+            
         self.audio_buffer += audio_chunk
         
         # Check if we have enough audio for processing
@@ -144,30 +146,39 @@ class StreamingSpeechProcessor:
             if self.detect_speech_end():
                 complete_audio = self.audio_buffer
                 self.audio_buffer = b''
-                self.silence_start_time = None
-                self.speech_detected = False
+                self.clear_state()
                 return complete_audio
         return None
+    
+    def clear_state(self):
+        """Clear internal state to free memory"""
+        self.silence_start_time = None
+        self.speech_detected = False
+        gc.collect()  # Force garbage collection
         
     def detect_speech_end(self):
         """Improved silence detection"""
         if len(self.audio_buffer) < 2400:  # Less than 300ms (min speech length)
             return False
             
-        # Check last 800ms for silence
-        check_size = min(6400, len(self.audio_buffer))
+        # Check last 400ms for silence (reduced from 800ms)
+        check_size = min(3200, len(self.audio_buffer))
         last_chunk = self.audio_buffer[-check_size:]
         
         # Calculate RMS (root mean square) for silence detection
-        if audioop:
-            rms = audioop.rms(last_chunk, 1)
-        else:
-            # Manual RMS calculation
-            audio_array = np.frombuffer(last_chunk, dtype=np.uint8)
-            rms = np.sqrt(np.mean(audio_array**2))
+        try:
+            if audioop:
+                rms = audioop.rms(last_chunk, 1)
+            else:
+                # Manual RMS calculation
+                audio_array = np.frombuffer(last_chunk, dtype=np.uint8)
+                rms = np.sqrt(np.mean(audio_array**2))
+        except:
+            # If error, process what we have
+            return True
         
         # Speech detection
-        if rms > 800:  # Increased threshold for speech detection
+        if rms > 800:  # Speech detected
             self.speech_detected = True
             self.silence_start_time = None
             self.last_speech_time = time.time()
@@ -178,8 +189,8 @@ class StreamingSpeechProcessor:
                 # Enough silence detected after speech
                 return True
         
-        # Timeout protection - if buffer is too large, process it
-        if len(self.audio_buffer) > 80000:  # 10 seconds of audio
+        # Timeout protection - if buffer is getting large, process it
+        if len(self.audio_buffer) > 24000:  # 3 seconds of audio
             return True
             
         return False
@@ -357,11 +368,21 @@ def media_stream(ws):
         import traceback
         traceback.print_exc()
     finally:
-        # Cleanup
-        if call_sid in active_streams:
-            del active_streams[call_sid]
-        if call_sid in turn_count:
-            turn_count[call_sid] = 0
+        # Cleanup with aggressive memory freeing
+        if call_sid:
+            if call_sid in active_streams:
+                del active_streams[call_sid]
+            if call_sid in turn_count:
+                del turn_count[call_sid]
+            if call_sid in conversation_history:
+                del conversation_history[call_sid]
+            if call_sid in personality_memory:
+                del personality_memory[call_sid]
+            if call_sid in mode_lock:
+                del mode_lock[call_sid]
+        
+        # Force garbage collection
+        gc.collect()
 
 # Helper function to run async tasks
 def run_async_task(coro):
@@ -389,8 +410,16 @@ async def process_complete_utterance(call_sid, stream_sid, audio_data):
         # Convert mulaw to PCM for transcription
         audio_pcm = convert_mulaw_to_pcm(audio_data)
         
+        # Clear original audio data
+        del audio_data
+        gc.collect()
+        
         # Transcribe
         transcript = await transcribe_audio(audio_pcm)
+        
+        # Clear PCM data
+        del audio_pcm
+        gc.collect()
         
         if transcript and len(transcript.strip()) > 1:  # Ignore single character transcripts
             print(f"📝 Transcript: {transcript}")
@@ -423,6 +452,7 @@ async def process_complete_utterance(call_sid, stream_sid, audio_data):
         if call_sid in active_streams:
             active_streams[call_sid]['processing'] = False
             # Will be set to False when marks are received
+        gc.collect()  # Clean up after processing
 
 async def handle_reset(call_sid, stream_sid):
     """Handle reset command"""
@@ -462,9 +492,9 @@ async def generate_response(call_sid, transcript):
         "content": transcript
     })
     
-    # Limit conversation history to last 10 messages to prevent context overflow
-    if len(conversation_history[call_sid]) > 10:
-        conversation_history[call_sid] = conversation_history[call_sid][-10:]
+    # Limit conversation history to last 5 messages to prevent memory overflow
+    if len(conversation_history[call_sid]) > 5:
+        conversation_history[call_sid] = conversation_history[call_sid][-5:]
     
     # Get personality and prompt
     voice_id, system_prompt, intro_line = get_personality_for_mode(call_sid, mode)
@@ -486,7 +516,7 @@ async def generate_response(call_sid, transcript):
             model="gpt-4.1-nano",
             messages=messages,
             temperature=0.7,
-            max_tokens=60,  # Reduced from 150 to keep responses shorter
+            max_tokens=40,  # Reduced from 60 to keep responses shorter and save memory
             stream=True
         )
         
@@ -616,7 +646,7 @@ async def stream_tts_response(call_sid, stream_sid, text):
     sentences = re.split(r'(?<=[.!?])\s+', text)
     
     # Limit sentences to prevent over-talking
-    sentences = sentences[:3]  # Max 3 sentences per response
+    sentences = sentences[:2]  # Max 2 sentences per response (reduced from 3)
     
     total_sentences = len([s for s in sentences if s.strip()])
     
@@ -640,24 +670,35 @@ async def stream_tts_response(call_sid, stream_sid, text):
                     optimize_streaming_latency=3  # Max optimization for low latency
                 )
                 
-                # Process the audio stream
+                # Process the audio stream without accumulating large buffers
                 chunk_count = 0
-                audio_buffer = b''
                 
                 # Iterate through the stream
                 for audio_chunk in audio_stream:
                     if isinstance(audio_chunk, bytes) and audio_chunk:
-                        audio_buffer += audio_chunk
-                        
-                        # Send chunks of ~160 bytes (20ms at 8kHz mulaw)
-                        while len(audio_buffer) >= 160:
-                            chunk_to_send = audio_buffer[:160]
-                            audio_buffer = audio_buffer[160:]
-                            
-                            # Base64 encode the chunk
-                            payload = base64.b64encode(chunk_to_send).decode('utf-8')
-                            
-                            # Send media message
+                        # Send immediately without buffering
+                        if len(audio_chunk) >= 160:
+                            # Send in 160-byte chunks
+                            for j in range(0, len(audio_chunk), 160):
+                                chunk_to_send = audio_chunk[j:j+160]
+                                if chunk_to_send:
+                                    payload = base64.b64encode(chunk_to_send).decode('utf-8')
+                                    media_message = {
+                                        "event": "media",
+                                        "streamSid": stream_sid,
+                                        "media": {
+                                            "payload": payload
+                                        }
+                                    }
+                                    ws.send(json.dumps(media_message))
+                                    chunk_count += 1
+                                    
+                                    # Small delay every 5 chunks to prevent overwhelming
+                                    if chunk_count % 5 == 0:
+                                        await asyncio.sleep(0.001)
+                        else:
+                            # Send small chunks directly
+                            payload = base64.b64encode(audio_chunk).decode('utf-8')
                             media_message = {
                                 "event": "media",
                                 "streamSid": stream_sid,
@@ -666,23 +707,6 @@ async def stream_tts_response(call_sid, stream_sid, text):
                                 }
                             }
                             ws.send(json.dumps(media_message))
-                            chunk_count += 1
-                            
-                            # Small delay every 10 chunks to prevent overwhelming
-                            if chunk_count % 10 == 0:
-                                await asyncio.sleep(0.01)
-                
-                # Send any remaining audio
-                if audio_buffer:
-                    payload = base64.b64encode(audio_buffer).decode('utf-8')
-                    media_message = {
-                        "event": "media",
-                        "streamSid": stream_sid,
-                        "media": {
-                            "payload": payload
-                        }
-                    }
-                    ws.send(json.dumps(media_message))
                 
                 # Send mark message to track completion
                 mark_message = {
@@ -708,6 +732,10 @@ async def stream_tts_response(call_sid, stream_sid, text):
                 
                 print(f"✅ Sent {chunk_count} audio chunks for sentence {i}")
                 
+                # Clean up after each sentence
+                del audio_stream
+                gc.collect()
+                
             except Exception as e:
                 print(f"💥 TTS streaming error: {e}")
                 print(f"   Error type: {type(e).__name__}")
@@ -719,25 +747,35 @@ async def transcribe_audio(audio_pcm):
     try:
         # Create temporary file for transcription
         with io.BytesIO() as audio_file:
-            # Convert PCM to WAV format
-            audio = AudioSegment(
-                data=audio_pcm,
-                sample_width=2,
-                frame_rate=16000,
-                channels=1
-            )
-            audio.export(audio_file, format="wav")
-            audio_file.seek(0)
-            audio_file.name = "temp.wav"  # OpenAI needs a filename
-            
-            # Transcribe
-            result = await async_openai.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                language="en"
-            )
-            
-            return result.text.strip()
+            # Convert PCM to WAV format with minimal memory usage
+            try:
+                audio = AudioSegment(
+                    data=audio_pcm,
+                    sample_width=2,
+                    frame_rate=16000,
+                    channels=1
+                )
+                audio.export(audio_file, format="wav")
+                audio_file.seek(0)
+                audio_file.name = "temp.wav"  # OpenAI needs a filename
+                
+                # Clear the original audio data
+                del audio
+                del audio_pcm
+                gc.collect()
+                
+                # Transcribe
+                result = await async_openai.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    language="en"
+                )
+                
+                return result.text.strip()
+                
+            except Exception as e:
+                print(f"💥 Audio processing error: {e}")
+                return ""
             
     except Exception as e:
         print(f"💥 Transcription error: {e}")
@@ -757,6 +795,9 @@ def convert_mulaw_to_pcm(mulaw_data):
                 frame_rate=8000,
                 channels=1
             )
+            
+            # Clear intermediate data
+            del pcm_data
         else:
             # Use pydub's built-in conversion
             audio = AudioSegment.from_file(
@@ -771,8 +812,13 @@ def convert_mulaw_to_pcm(mulaw_data):
         
         # Resample to 16kHz
         audio = audio.set_frame_rate(16000)
+        result = audio.raw_data
         
-        return audio.raw_data
+        # Clean up
+        del audio
+        gc.collect()
+        
+        return result
     except Exception as e:
         print(f"💥 Audio conversion error: {e}")
         return b''
@@ -847,12 +893,16 @@ if __name__ == "__main__":
     # Ensure static directory exists
     os.makedirs("static", exist_ok=True)
     
-    print("\n🚀 ConvoReps WebSocket Streaming Edition")
+    # Force initial garbage collection
+    gc.collect()
+    
+    print("\n🚀 ConvoReps WebSocket Streaming Edition (Memory Optimized)")
     print("   ✓ Bidirectional Media Streams enabled")
     print("   ✓ Real-time speech processing")
     print("   ✓ Ultra-low latency streaming")
     print("   ✓ GPT-4.1-nano for conversations")
+    print("   ✓ Memory optimized for 512MB limit")
     print("\n")
     
     # Run with Flask's built-in server (flask-sock handles WebSocket upgrade)
-    app.run(host="0.0.0.0", port=5050, debug=False)
+    app.run(host="0.0.0.0", port=5050, debug=False, threaded=True)

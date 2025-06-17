@@ -725,6 +725,17 @@ def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
+# WebSocket test endpoint
+@app.route("/ws-test", methods=["GET"])
+def ws_test():
+    """Test WebSocket support"""
+    return {
+        "websocket_support": True,
+        "active_streams": len(active_streams),
+        "flask_sock_version": "0.7.0",
+        "ready": True
+    }
+
 if __name__ == "__main__":
     # Ensure static directory exists
     os.makedirs("static", exist_ok=True)

@@ -220,7 +220,7 @@ def voice():
         speechModel='experimental_conversations',
         enhanced=True,
         actionOnEmptyResult=False,
-        timeout=30,  # Increase from 3 to 30 seconds to prevent 499 errors
+        timeout=10,  # Increase from 3 to 30 seconds to prevent 499 errors
         profanityFilter=False,
         partialResultCallback='/partial_speech',
         partialResultCallbackMethod='POST',
@@ -606,7 +606,7 @@ async def process_speech():
                 audio_gen = elevenlabs_client.text_to_speech.convert(
                     voice_id=voice_id,
                     text=reply,
-                    model_id="eleven_turbo_v2_5" if USE_STREAMING else "eleven_monolingual_v1",
+                    model_id="eleven_turbo_v2_5" if USE_STREAMING else "eleven_turbo_v2_5",
                     output_format="mp3_22050_32"
                 )
                 raw_audio = b""
@@ -631,7 +631,7 @@ async def process_speech():
                             audio_gen = elevenlabs_client.text_to_speech.convert(
                                 voice_id=voice_id,
                                 text=reply,
-                                model_id="eleven_monolingual_v1",
+                                model_id="eleven_turbo_v2_5",
                                 output_format="mp3_22050_32"
                             )
                             raw_audio = b""
@@ -834,7 +834,7 @@ async def generate_tts_streaming(text: str, voice_id: str) -> bytes:
                 audio_gen = elevenlabs_client.text_to_speech.convert(
                     voice_id=voice_id,
                     text=text,
-                    model_id="eleven_monolingual_v1",
+                    model_id="eleven_turbo_v2_5",
                     output_format="mp3_22050_32"
                 )
                 
@@ -861,7 +861,7 @@ async def generate_tts_streaming(text: str, voice_id: str) -> bytes:
                     audio_gen = elevenlabs_client.text_to_speech.convert(
                         voice_id=voice_id,
                         text=text,
-                        model_id="eleven_monolingual_v1",
+                        model_id="eleven_turbo_v2_5",
                         output_format="mp3_22050_32"
                     )
                     

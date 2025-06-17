@@ -21,6 +21,15 @@ import openai
 from openai import OpenAI, AsyncOpenAI
 from elevenlabs import VoiceSettings
 from elevenlabs.client import ElevenLabs
+import websockets
+import json
+import base64
+import asyncio
+from pydub import AudioSegment
+import io
+
+# Global WebSocket connections storage
+ws_connections = {}
 
 # Load environment variables ASAP
 load_dotenv()
@@ -119,6 +128,405 @@ interview_questions = [
     "How do you handle feedback and criticism?",
     "Do you have any questions for me about the company or the role?"
 ]
+from flask_sock import Sock
+
+# After creating Flask app
+sock = Sock(app)
+@sock.route("/media-stream")
+@async_route
+async def media_stream():
+    """Handle bidirectional WebSocket for Media Streams"""
+    ws = websockets.WebSocketServerProtocol()
+    stream_sid = None
+    call_sid = None
+    
+    try:
+        # Accept WebSocket connection
+        await ws.accept()
+        print("🔌 WebSocket connected")
+        
+        # Audio buffer for incoming speech
+        audio_buffer = []
+        processing = False
+        
+        async for message in ws:
+            data = json.loads(message)
+            
+            if data['event'] == 'connected':
+                print("✅ Twilio connected")
+                
+            elif data['event'] == 'start':
+                stream_sid = data['start']['streamSid']
+                call_sid = data['start']['callSid']
+                ws_connections[call_sid] = ws
+                print(f"🎙️ Stream started: {stream_sid}")
+                
+                # Initialize conversation for new call
+                if call_sid not in turn_count:
+                    turn_count[call_sid] = 0
+                else:
+                    turn_count[call_sid] += 1
+                
+            elif data['event'] == 'media':
+                # Collect audio chunks
+                if not processing:
+                    payload = data['media']['payload']
+                    audio_buffer.append(base64.b64decode(payload))
+                
+            elif data['event'] == 'stop':
+                print("🛑 Stream stopped")
+                break
+                
+        # Process any remaining audio
+        if audio_buffer and not processing:
+            processing = True
+            await process_audio_stream(call_sid, audio_buffer, ws)
+            
+    except Exception as e:
+        print(f"💥 WebSocket error: {e}")
+    finally:
+        if call_sid in ws_connections:
+            del ws_connections[call_sid]
+        await ws.close()
+def detect_intent(text):
+    """Detect conversation intent from transcript"""
+    lowered = text.lower()
+    if any(phrase in lowered for phrase in ["cold call", "customer call", "sales call", "business call"]):
+        return "cold_call"
+    elif any(phrase in lowered for phrase in ["interview", "interview prep"]):
+        return "interview"
+    elif any(phrase in lowered for phrase in ["small talk", "chat", "talk casually"]):
+        return "small_talk"
+    return "unknown"
+
+def detect_bad_news(text):
+    """Check if message contains bad news"""
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in [
+        "bad news", "unfortunately", "problem", "delay", "issue", 
+        "we can't", "we won't", "not going to happen", "reschedule", "price increase"
+    ])
+async def process_audio_stream(call_sid, audio_buffer, ws):
+    """Process incoming audio and generate response"""
+    global active_call_sid
+    
+    try:
+        # Convert mulaw chunks to wav for transcription
+        raw_mulaw = b''.join(audio_buffer)
+        
+        # Convert mulaw to wav using pydub
+        audio = AudioSegment(
+            data=raw_mulaw,
+            sample_width=1,  # 8-bit
+            frame_rate=8000,
+            channels=1
+        )
+        audio = audio.set_sample_width(2)  # Convert to 16-bit for Whisper
+        
+        # Save to memory buffer
+        wav_buffer = io.BytesIO()
+        audio.export(wav_buffer, format="wav")
+        wav_buffer.seek(0)
+        
+        # Transcribe using Whisper
+        transcript = await transcribe_audio_buffer(wav_buffer)
+        
+        if not transcript:
+            await send_tts_to_stream(ws, "I didn't catch that. Could you repeat?")
+            return
+            
+        print(f"📝 Transcript: {transcript}")
+        
+        # Reset for new calls
+        if call_sid != active_call_sid:
+            conversation_history.clear()
+            mode_lock.clear()
+            personality_memory.clear()
+            active_call_sid = call_sid
+        
+        # Process with existing logic
+        mode = mode_lock.get(call_sid)
+        if not mode:
+            mode = detect_intent(transcript)
+            mode_lock[call_sid] = mode
+            
+        # Get personality and system prompt (reuse existing logic)
+        voice_id, system_prompt, reply = await get_ai_response(
+            call_sid, transcript, mode
+        )
+        
+        # Stream TTS response back
+        await send_tts_to_stream(ws, reply, voice_id)
+        
+    except Exception as e:
+        print(f"💥 Audio processing error: {e}")
+        await send_tts_to_stream(ws, "Sorry, I encountered an error.")
+async def transcribe_audio_buffer(wav_buffer):
+    """Transcribe audio buffer using Whisper"""
+    try:
+        wav_buffer.name = "audio.wav"  # Whisper needs a filename
+        result = await async_openai.audio.transcriptions.create(
+            model="whisper-1",
+            file=wav_buffer
+        )
+        return result.text.strip()
+    except Exception as e:
+        print(f"💥 Transcription error: {e}")
+        return None
+async def send_tts_to_stream(ws, text, voice_id="EXAVITQu4vr4xnSDxMaL"):
+    """Generate TTS and stream to Twilio via WebSocket with sentence streaming"""
+    try:
+        if SENTENCE_STREAMING and USE_STREAMING:
+            # Split into sentences for streaming
+            sentences = re.split(r'(?<=[.!?])\s+', text)
+            
+            for i, sentence in enumerate(sentences):
+                if sentence.strip():
+                    print(f"🎯 Streaming sentence {i+1}: {sentence[:30]}...")
+                    await stream_single_sentence(ws, sentence, voice_id)
+                    # Small pause between sentences
+                    await asyncio.sleep(0.1)
+        else:
+            # Stream entire text at once
+            await stream_single_sentence(ws, text, voice_id)
+            
+    except Exception as e:
+        print(f"💥 TTS streaming error: {e}")
+
+async def stream_single_sentence(ws, text, voice_id):
+    """Stream a single sentence to Twilio"""
+    try:
+        # Generate TTS with ElevenLabs
+        audio_stream = elevenlabs_client.text_to_speech.convert(
+            voice_id=voice_id,
+            text=text,
+            model_id="eleven_turbo_v2_5",
+            output_format="mp3_22050_32",
+            voice_settings=VoiceSettings(
+                stability=0.4,
+                similarity_boost=0.75
+            )
+        )
+        
+        # Collect audio data
+        audio_data = b""
+        for chunk in audio_stream:
+            if chunk:
+                audio_data += chunk
+        
+        # Convert MP3 to mulaw
+        audio = AudioSegment.from_mp3(io.BytesIO(audio_data))
+        audio = audio.set_frame_rate(8000).set_channels(1)
+        
+        # Export as mulaw WAV
+        wav_buffer = io.BytesIO()
+        audio.export(wav_buffer, format="wav", codec="mulaw")
+        wav_buffer.seek(0)
+        
+        # Read WAV data and strip header
+        mulaw_data = wav_buffer.read()
+        # Try 44 bytes first, adjust to 58 if needed
+        header_size = 44
+        raw_mulaw = mulaw_data[header_size:]
+        
+        # Send in chunks
+        chunk_size = 640  # 20ms chunks
+        for i in range(0, len(raw_mulaw), chunk_size):
+            chunk = raw_mulaw[i:i + chunk_size]
+            encoded_chunk = base64.b64encode(chunk).decode('utf-8')
+            
+            media_message = {
+                "event": "media",
+                "streamSid": getattr(ws, 'stream_sid', ''),
+                "media": {
+                    "payload": encoded_chunk
+                }
+            }
+            
+            await ws.send(json.dumps(media_message))
+            await asyncio.sleep(0.001)
+        
+        # Send mark message
+        mark_message = {
+            "event": "mark",
+            "streamSid": getattr(ws, 'stream_sid', ''),
+            "mark": {
+                "name": f"sentence_{int(time.time() * 1000)}"
+            }
+        }
+        await ws.send(json.dumps(mark_message))
+        
+    except Exception as e:
+        print(f"💥 Sentence streaming error: {e}")
+async def get_ai_response(call_sid, transcript, mode):
+    """Get AI response based on mode and transcript - with streaming support"""
+    
+    # Initialize turn count
+    turn = turn_count.get(call_sid, 0)
+    
+    # Detect intent if not locked
+    if not mode:
+        mode = detect_intent(transcript)
+        mode_lock[call_sid] = mode
+    
+    # Initialize conversation history for call
+    conversation_history.setdefault(call_sid, [])
+    
+    # COLD CALL / CUSTOMER CONVERSATION MODE
+    if mode == "cold_call" or mode == "customer_convo":
+        if call_sid not in personality_memory:
+            persona_name = random.choice(list(cold_call_personality_pool.keys()))
+            personality_memory[call_sid] = persona_name
+        else:
+            persona_name = personality_memory[call_sid]
+
+        persona = cold_call_personality_pool[persona_name]
+        voice_id = persona["voice_id"]
+        system_prompt = persona["system_prompt"]
+        
+        if turn == 0:
+            intro_line = persona.get("intro_line", "Alright, I'll be your customer. Start the conversation however you want — this could be a cold call, a follow-up, a check-in, or even a tough conversation. I'll respond based on my personality. If you ever want to start over, just say 'let's start over.'")
+        else:
+            intro_line = None
+
+    # SMALL TALK MODE
+    elif mode == "small_talk":
+        voice_id = "2BJW5coyhAzSr8STdHbE"
+        system_prompt = "You're a casual, sarcastic friend. Keep it light, keep it fun."
+        intro_line = "Yo yo yo, how's it goin'?" if turn == 0 else None
+
+    # INTERVIEW MODE
+    elif mode == "interview":
+        interview_voice_pool = [
+            {"voice_id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel"},
+            {"voice_id": "EXAVITQu4vr4xnSDxMaL", "name": "Clyde"},
+            {"voice_id": "6YQMyaUWlj0VX652cY1C", "name": "Stephen"}
+        ]
+
+        if call_sid not in personality_memory:
+            voice_choice = random.choice(interview_voice_pool)
+            personality_memory[call_sid] = voice_choice
+        else:
+            voice_choice = personality_memory[call_sid]
+        
+        voice_id = voice_choice["voice_id"]
+        system_prompt = (
+            f"You are {voice_choice['name']}, a friendly, conversational job interviewer helping candidates practice for real interviews. "
+            "Speak casually — like you're talking to someone over coffee, not in a formal evaluation. Ask one interview-style question at a time, and after each response, give supportive, helpful feedback. "
+            "If their answer is weak, say 'Let's try that again' and re-ask the question. If it's strong, give a quick reason why it's good. "
+            "Briefly refer to the STAR method (Situation, Task, Action, Result) when giving feedback, but don't lecture. Keep your tone upbeat, natural, and keep the conversation flowing. "
+            "Don't ask if they're ready for the next question — just move on with something like, 'Alright, next one,' or 'Cool, here's another one.'"
+        )
+        intro_line = "Great, let's jump in! Can you walk me through your most recent role and responsibilities?" if turn == 0 else None
+
+    # DEFAULT MODE
+    else:
+        voice_id = "1t1EeRixsJrKbiF1zwM6"
+        system_prompt = "You're a helpful assistant."
+        intro_line = "How can I help you today?" if turn == 0 else None
+
+    # Handle first turn
+    if turn == 0 and intro_line:
+        conversation_history[call_sid].append({"role": "assistant", "content": intro_line})
+        return voice_id, system_prompt, intro_line
+
+    # Add user message to history
+    conversation_history[call_sid].append({"role": "user", "content": transcript})
+    
+    # Build messages array
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    # Check for bad news and defensive responses
+    lowered = transcript.lower()
+    is_bad_news = any(x in lowered for x in [
+        "bad news", "unfortunately", "delay", "delayed", "won't make it", "can't deliver",
+        "got pushed", "rescheduled", "not coming", "issue with the supplier", "problem with your order"
+    ])
+
+    is_user_defensive = any(x in lowered for x in [
+        "calm down", "relax", "it's not my fault", "what do you want me to do", "stop yelling", "chill out"
+    ])
+
+    if is_bad_news:
+        print("⚠️ Bad news detected — AI will respond angrily.")
+        escalation_prompt = (
+            "The user just delivered bad news to the customer. Respond as the customer based on your personality, "
+            "but crank up the emotion. If it fits your persona, act furious — like you're raising your voice. "
+            "You can use strong language (not profane), interruptions, and frustration. You might say things like "
+            "'Are you SERIOUS right now?!' or 'Unbelievable. This is NOT okay.' Show that this ruined your day. "
+            "If the user tries to calm you down, don't immediately cool off. Push back again with more anger. "
+            "Only start to de-escalate if they take responsibility and handle it well. Stay human, not robotic."
+        )
+
+        if is_user_defensive:
+            print("😡 User snapped back — escalate the attitude.")
+            escalation_prompt += (
+                " The user got defensive, so now you're even more upset. Push back harder. Say something like, 'Don't tell me to calm down — this is your screw-up.'"
+            )
+
+        messages.insert(0, {"role": "system", "content": escalation_prompt})
+
+    # Add conversation history (limit to last 20 messages)
+    clean_history = []
+    for entry in conversation_history[call_sid]:
+        if isinstance(entry, dict) and "role" in entry and "content" in entry:
+            clean_history.append({"role": entry["role"], "content": entry["content"]})
+    
+    # Keep only last 20 messages
+    if len(clean_history) > 20:
+        clean_history = clean_history[-20:]
+    
+    messages.extend(clean_history)
+
+    # Stream response with GPT-4.1-nano
+    if USE_STREAMING:
+        full_response = ""
+        try:
+            stream = await async_openai.chat.completions.create(
+                model="gpt-4.1-nano",
+                messages=messages,
+                stream=True,
+                temperature=0.7,
+                max_tokens=150
+            )
+            
+            # Collect full response for history
+            async for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    full_response += chunk.choices[0].delta.content
+            
+            reply = full_response.strip()
+            
+        except Exception as e:
+            print(f"💥 GPT streaming error: {e}")
+            # Fallback to non-streaming
+            completion = await async_openai.chat.completions.create(
+                model="gpt-4.1-nano",
+                messages=messages,
+                temperature=0.7,
+                max_tokens=150
+            )
+            reply = completion.choices[0].message.content.strip()
+    else:
+        # Non-streaming fallback
+        completion = await async_openai.chat.completions.create(
+            model="gpt-4.1-nano",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=150
+        )
+        reply = completion.choices[0].message.content.strip()
+
+    # Clean up response
+    reply = reply.replace("*", "").replace("_", "").replace("`", "").replace("#", "").replace("-", " ")
+    
+    # Update conversation history
+    conversation_history[call_sid].append({"role": "assistant", "content": reply})
+    
+    # Increment turn count
+    turn_count[call_sid] = turn + 1
+    
+    return voice_id, system_prompt, reply
 def error_handler(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -157,75 +565,24 @@ def delayed_cleanup(call_sid):
 @app.route("/voice", methods=["POST", "GET"])
 @error_handler
 def voice():
+    """Initial voice webhook - immediately connect to WebSocket"""
     call_sid = request.values.get("CallSid")
-    if turn_count.get(call_sid, 0) == 0:  # First turn of new call
-        for f in os.listdir("static"):
-            if f.startswith("response_") and "CAb" not in f:  # Don't delete current call
-                if time.time() - os.path.getmtime(f"static/{f}") > 600:  # 10+ minutes old
-                    try: os.remove(f"static/{f}")
-                    except: pass
-    recording_url = request.values.get("RecordingUrl")
-
     print(f"==> /voice hit. CallSid: {call_sid}")
-    if recording_url:
-        filename = recording_url.split("/")[-1]
-        print(f"🎧 Incoming Recording SID: {filename}")
-
-    if call_sid not in turn_count:
-        turn_count[call_sid] = 0
-    else:
-        turn_count[call_sid] += 1
-
-    print(f"🧪 Current turn: {turn_count[call_sid]}")
-
-    mp3_path = f"static/response_{call_sid}.mp3"
-    flag_path = f"static/response_ready_{call_sid}.txt"
+    
     response = VoiceResponse()
-
-    def is_file_ready(mp3_path, flag_path):
-        if not os.path.exists(mp3_path) or not os.path.exists(flag_path):
-            return False
-        if os.path.getsize(mp3_path) < 1500:
-            print("⚠️ MP3 file exists but is too small, not ready yet.")
-            return False
-        return True
-
-    if turn_count[call_sid] == 0:
-        print("📞 First turn — playing appropriate greeting")
+    
+    # For first-time callers, play greeting
+    if turn_count.get(call_sid, 0) == 0:
         if not session.get("has_called_before"):
             session["has_called_before"] = True
-            greeting_file = "first_time_greeting.mp3"
-            print("👋 New caller detected — playing first-time greeting.")
+            response.play(f"{request.url_root}static/first_time_greeting.mp3")
         else:
-            greeting_file = "returning_user_greeting.mp3"
-            print("🔁 Returning caller — playing returning greeting.")
-        response.play(f"{request.url_root}static/{greeting_file}?v={time.time()}")
-        response.play(f"{request.url_root}static/beep.mp3")  # ADD BEEP HERE
-        response.pause(length=1)  # Brief pause after beep
-
-    elif is_file_ready(mp3_path, flag_path):
-        print(f"🔊 Playing: {mp3_path}")
-        public_mp3_url = f"{request.url_root}static/response_{call_sid}.mp3"
-        response.play(public_mp3_url)
-    else:
-        print("⏳ Response not ready — waiting briefly")
-        response.play(f"{request.url_root}static/beep.mp3") 
-        response.pause(length=2)
-
-    response.gather(
-        input='speech',
-        action='/process_speech',
-        method='POST',
-        speechTimeout='2',  # Change from 'auto' to fixed 2 seconds
-        speechModel='experimental_conversations',
-        enhanced=True,
-        actionOnEmptyResult=False,
-        timeout=10,  # Increase from 3 to 30 seconds to prevent 499 errors
-        profanityFilter=False,
-        partialResultCallback='/partial_speech',
-        partialResultCallbackMethod='POST',
-        language='en-US'
-    )
+            response.play(f"{request.url_root}static/returning_user_greeting.mp3")
+    
+    # Connect to bidirectional stream immediately
+    connect = response.connect()
+    connect.stream(url=f"wss://{request.host}/media-stream")
+    
     return str(response)
 @app.route("/partial_speech", methods=["POST"])
 def partial_speech():

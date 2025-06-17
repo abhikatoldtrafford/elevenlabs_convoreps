@@ -760,11 +760,7 @@ async def process_speech():
         else:
             # Normal TTS generation
             try:
-                # Choose model based on mode and length
-                if len(reply) < 50:
-                    model_id = "eleven_turbo_v2_5"  # Fastest for short
-                else:
-                    model_id = "eleven_monolingual_v1"  # Better quality for longer
+                model_id = "eleven_turbo_v2_5"  # Fastest for short
                 
                 audio_gen = elevenlabs_client.text_to_speech.convert(
                     voice_id=voice_id,
@@ -805,7 +801,7 @@ async def process_speech():
                     audio_gen = elevenlabs_client.text_to_speech.convert(
                         voice_id=voice_id,
                         text=reply,
-                        model_id="eleven_multilingual_v2",
+                        model_id="eleven_turbo_v2_5",
                         output_format="mp3_22050_32"
                     )
                     raw_audio = b"".join(chunk for chunk in audio_gen if chunk)
@@ -1019,7 +1015,7 @@ async def generate_tts_streaming(text: str, voice_id: str) -> bytes:
                 audio_gen = elevenlabs_client.text_to_speech.convert(
                     voice_id=voice_id,
                     text=text,
-                    model_id="eleven_monolingual_v1",
+                    model_id="eleven_turbo_v2_5",
                     output_format="mp3_22050_32"
                 )
                 
@@ -1046,7 +1042,7 @@ async def generate_tts_streaming(text: str, voice_id: str) -> bytes:
                     audio_gen = elevenlabs_client.text_to_speech.convert(
                         voice_id=voice_id,
                         text=text,
-                        model_id="eleven_monolingual_v1",
+                        model_id="eleven_turbo_v2_5",
                         output_format="mp3_22050_32"
                     )
                     

@@ -51,12 +51,12 @@ USE_STREAMING = os.getenv("USE_STREAMING", "true").lower() == "true"
 SENTENCE_STREAMING = True
 
 # Handle STREAMING_TIMEOUT with potential comments
-timeout_env = os.getenv("STREAMING_TIMEOUT", "1.0")
+timeout_env = os.getenv("STREAMING_TIMEOUT", "2.0")
 # ADD:
 # Set defaults if not in environment
 os.environ.setdefault("USE_STREAMING", "true")
 os.environ.setdefault("SENTENCE_STREAMING", "true")
-os.environ.setdefault("STREAMING_TIMEOUT", "3.0")
+os.environ.setdefault("STREAMING_TIMEOUT", "2.0")
 # Remove any comments if present
 timeout_value = timeout_env.split('#')[0].strip()
 try:
@@ -153,47 +153,45 @@ def delayed_cleanup(call_sid):
     except Exception as e:
         print(f"⚠️ Cleanup error for {call_sid}: {e}")
 
+
 @app.route("/voice", methods=["POST", "GET"])
-@app.route("/voice", methods=["POST", "GET"])
+@error_handler
 def voice():
-    """Handle incoming voice calls with optimized gather settings"""
     call_sid = request.values.get("CallSid")
-    
-    # Cleanup old files on first turn (keep this logic)
-    if turn_count.get(call_sid, 0) == 0:
+    if turn_count.get(call_sid, 0) == 0:  # First turn of new call
         for f in os.listdir("static"):
-            if f.startswith("response_") and "CAb" not in f and call_sid not in f:
-                try:
-                    file_path = f"static/{f}"
-                    if time.time() - os.path.getmtime(file_path) > 600:
-                        os.remove(file_path)
-                except:
-                    pass
-    
-    # Initialize or increment turn count
+            if f.startswith("response_") and "CAb" not in f:  # Don't delete current call
+                if time.time() - os.path.getmtime(f"static/{f}") > 600:  # 10+ minutes old
+                    try: os.remove(f"static/{f}")
+                    except: pass
+    recording_url = request.values.get("RecordingUrl")
+
+    print(f"==> /voice hit. CallSid: {call_sid}")
+    if recording_url:
+        filename = recording_url.split("/")[-1]
+        print(f"🎧 Incoming Recording SID: {filename}")
+
     if call_sid not in turn_count:
         turn_count[call_sid] = 0
     else:
         turn_count[call_sid] += 1
-    
-    print(f"==> /voice hit. CallSid: {call_sid}, Turn: {turn_count[call_sid]}")
-    
+
+    print(f"🧪 Current turn: {turn_count[call_sid]}")
+
     mp3_path = f"static/response_{call_sid}.mp3"
     flag_path = f"static/response_ready_{call_sid}.txt"
     response = VoiceResponse()
-    
+
     def is_file_ready(mp3_path, flag_path):
-        """Check if audio file is ready to play"""
         if not os.path.exists(mp3_path) or not os.path.exists(flag_path):
             return False
         if os.path.getsize(mp3_path) < 1500:
+            print("⚠️ MP3 file exists but is too small, not ready yet.")
             return False
         return True
-    
-    # Handle first turn with greeting (no beep, no pause)
+
     if turn_count[call_sid] == 0:
         print("📞 First turn — playing appropriate greeting")
-        
         if not session.get("has_called_before"):
             session["has_called_before"] = True
             greeting_file = "first_time_greeting.mp3"
@@ -201,269 +199,137 @@ def voice():
         else:
             greeting_file = "returning_user_greeting.mp3"
             print("🔁 Returning caller — playing returning greeting.")
-        
-        # Play greeting WITHOUT beep or pause
         response.play(f"{request.url_root}static/{greeting_file}?v={time.time()}")
-        
+        response.play(f"{request.url_root}static/beep.mp3")  # ADD BEEP HERE
+        response.pause(length=1)  # Brief pause after beep
+
     elif is_file_ready(mp3_path, flag_path):
         print(f"🔊 Playing: {mp3_path}")
-        public_mp3_url = f"{request.url_root}static/response_{call_sid}.mp3?v={time.time()}"
+        public_mp3_url = f"{request.url_root}static/response_{call_sid}.mp3"
         response.play(public_mp3_url)
-        
-        # Clean up the ready flag after playing
-        try:
-            os.remove(flag_path)
-        except:
-            pass
     else:
-        # Don't pause - go straight to gather
-        print("⏳ Response not ready — proceeding to gather immediately")
-    
-    # Optimized gather parameters based on context
-    current_turn = turn_count.get(call_sid, 0)
-    mode = mode_lock.get(call_sid, "unknown")
-    
-    # Base gather parameters - optimized for low latency
-    gather_params = {
-        "input": "speech",
-        "action": "/process_speech",
-        "method": "POST",
-        "speechTimeout": "auto",  # Let Twilio handle VAD
-        "enhanced": True,
-        "profanityFilter": False,
-        "partialResultCallback": "/partial_speech",
-        "partialResultCallbackMethod": "POST",
-        "language": "en-US",
-        "actionOnEmptyResult": True,  # Process even on silence
-        "timeout": 10  # Reduced from 30-60
-    }
-    
-    # Configure based on turn and mode
-    if current_turn == 0:
-        # First turn: expect short command
-        gather_params.update({
-            "speechModel": "experimental_utterances",  # Best for short phrases
-            "hints": "cold call, sales, interview, chat, customer",
-            "speechTimeout": "2",  # Faster detection for commands
-            "timeout": 15
-        })
-        
-    elif mode == "interview":
-        # Interview mode: expect longer answers
-        gather_params.update({
-            "speechModel": "experimental_conversations",
-            "speechTimeout": "auto",  # Let VAD handle natural pauses
-            "timeout": 20,  # Give more time for thoughtful answers
-            "bargeIn": True,  # Allow interruption
-            "hints": "$OPERAND"  # For longer responses
-        })
-        
-    elif mode == "cold_call":
-        # Cold call: natural conversation
-        gather_params.update({
-            "speechModel": "experimental_conversations",
-            "speechTimeout": "auto",
-            "timeout": 15,
-            "bargeIn": True,
-            "hints": "yes, no, interested, maybe, pricing, demo, $OOV_CLASS_FULLPHONENUM"
-        })
-        
-    elif mode == "small_talk":
-        # Casual conversation
-        gather_params.update({
-            "speechModel": "experimental_conversations",
-            "speechTimeout": "auto",
-            "timeout": 12,
-            "bargeIn": True
-        })
-        
-    else:
-        # Unknown/default mode
-        gather_params.update({
-            "speechModel": "experimental_conversations",
-            "speechTimeout": "auto",
-            "timeout": 12
-        })
-    
-    # Log configuration
-    print(f"📊 Gather config: model={gather_params.get('speechModel')}, "
-          f"speechTimeout={gather_params.get('speechTimeout')}, "
-          f"timeout={gather_params.get('timeout')}")
-    
-    # Execute gather
-    try:
-        response.gather(**gather_params)
-    except Exception as e:
-        print(f"💥 Gather error: {e}")
-        # Minimal fallback
-        response.gather(
-            input="speech",
-            action="/process_speech",
-            method="POST",
-            timeout=10,
-            speechTimeout="auto"
-        )
-    
-    # Fallback if gather completely times out
-    response.say("I didn't catch that. Please try again.")
-    response.redirect(f"{request.url_root}voice")
-    
+        print("⏳ Response not ready — waiting briefly")
+        response.play(f"{request.url_root}static/beep.mp3") 
+        response.pause(length=2)
+
+    response.gather(
+        input='speech',
+        action='/process_speech',
+        method='POST',
+        speechTimeout='2',  # Change from 'auto' to fixed 2 seconds
+        speechModel='experimental_conversations',
+        enhanced=True,
+        actionOnEmptyResult=False,
+        timeout=30,  # Increase from 3 to 30 seconds to prevent 499 errors
+        profanityFilter=False,
+        partialResultCallback='/partial_speech',
+        partialResultCallbackMethod='POST',
+        language='en-US'
+    )
     return str(response)
 @app.route("/partial_speech", methods=["POST"])
 def partial_speech():
-    """Handle partial speech results with enhanced processing"""
+    """Handle partial speech results - simple logging version"""
     
-    try:
-        # Get all the partial result data from Twilio
-        call_sid = request.form.get("CallSid")
-        sequence_number = request.form.get("SequenceNumber", "0")
-        unstable_result = request.form.get("UnstableSpeechResult", "")
-        speech_activity = request.form.get("SpeechActivity", "")
-        caller = request.form.get("From", "Unknown")
+    # Get all the partial result data from Twilio
+    call_sid = request.form.get("CallSid")
+    sequence_number = request.form.get("SequenceNumber", "0")
+    
+    # UnstableSpeechResult: Low confidence, still being processed
+    unstable_result = request.form.get("UnstableSpeechResult", "")
+    
+    # Speech activity indicators
+    speech_activity = request.form.get("SpeechActivity", "")
+    
+    # Get caller info for logging
+    caller = request.form.get("From", "Unknown")
+    
+    # Log the partial results with emojis for clarity
+    print(f"\n{'='*60}")
+    print(f"🎤 PARTIAL SPEECH #{sequence_number} - CallSid: {call_sid}")
+    print(f"📞 Caller: {caller}")
+    print(f"{'='*60}")
+
+    if unstable_result:
+        print(f"⏳ UNSTABLE: '{unstable_result}'")
         
-        # Performance optimization: Skip very similar partials
-        last_partial_key = f"{call_sid}_last_partial"
-        last_partial_text = session.get(last_partial_key, "")
+    if speech_activity:
+        print(f"🔊 Activity: {speech_activity}")
+    
+    # Calculate total heard so far
+    total_heard = unstable_result
+    if total_heard:
+        print(f"💭 Total heard so far: '{total_heard}'")
+    
+    # Detect early intent patterns (just logging, no action)
+    detected_intents = []
+    lower_text = total_heard.lower()
+    
+    if any(phrase in lower_text for phrase in ["cold call", "sales call", "customer call"]):
+        detected_intents.append("🎯 COLD CALL PRACTICE")
+    
+    if any(phrase in lower_text for phrase in ["interview", "interview prep"]):
+        detected_intents.append("👔 INTERVIEW PRACTICE")
         
-        if unstable_result and last_partial_text:
-            # Calculate word-level similarity
-            current_words = set(unstable_result.lower().split())
-            last_words = set(last_partial_text.lower().split())
-            
-            if current_words and last_words:
-                similarity = len(current_words & last_words) / len(current_words | last_words)
-                if similarity > 0.85 and len(unstable_result) - len(last_partial_text) < 5:
-                    return "", 204  # Skip logging similar partial
+    if any(phrase in lower_text for phrase in ["small talk", "chat", "conversation"]):
+        detected_intents.append("💬 SMALL TALK")
         
-        session[last_partial_key] = unstable_result
+    if any(phrase in lower_text for phrase in ["bad news", "delay", "problem", "issue"]):
+        detected_intents.append("😠 BAD NEWS DETECTED")
         
-        # Initialize conversation history if needed
-        if call_sid not in conversation_history:
-            conversation_history[call_sid] = []
-        
-        # Initialize partial storage structures - CHECK SPECIFICALLY FOR THESE KEYS
-        if f"{call_sid}_partials" not in conversation_history:
-            conversation_history[f"{call_sid}_partials"] = {}
-            
-        if f"{call_sid}_partial_stats" not in conversation_history:
-            conversation_history[f"{call_sid}_partial_stats"] = {
-                "start_time": time.time(),
-                "word_count": 0,
-                "last_activity": time.time()
-            }
-        
-        # Store partial by sequence number for ordering
-        seq_num = int(sequence_number) if sequence_number else 0
-        conversation_history[f"{call_sid}_partials"][seq_num] = {
-            "text": unstable_result,
-            "timestamp": time.time(),
-            "activity": speech_activity
-        }
-        
-        # Get ordered text from all partials
-        ordered_partials = sorted(conversation_history[f"{call_sid}_partials"].items())
-        if ordered_partials:
-            latest_text = ordered_partials[-1][1]["text"]
-        else:
-            latest_text = unstable_result
-        
-        # Log with clear formatting
-        print(f"\n{'='*60}")
-        print(f"🎤 PARTIAL SPEECH #{sequence_number} - CallSid: {call_sid}")
-        print(f"📞 Caller: {caller}")
-        print(f"{'='*60}")
-        
-        if unstable_result:
-            print(f"⏳ UNSTABLE: '{unstable_result}'")
-            
-        if speech_activity:
-            print(f"🔊 Activity: {speech_activity}")
-        
-        # Track conversation statistics
-        stats = conversation_history[f"{call_sid}_partial_stats"]
-        current_word_count = len(unstable_result.split()) if unstable_result else 0
-        stats["word_count"] = max(stats["word_count"], current_word_count)
-        stats["last_activity"] = time.time()
-        
-        # Detect completion patterns
-        completion_indicators = []
-        lower_text = unstable_result.lower() if unstable_result else ""
-        
-        # Check for incomplete endings
-        incomplete_endings = ["like", "so", "and", "but", "or", "with", "for", "to", "the", "a"]
-        words = unstable_result.strip().split() if unstable_result else []
-        
-        if words and words[-1].lower().rstrip('.,!?') in incomplete_endings:
-            completion_indicators.append("⚠️ INCOMPLETE ENDING")
-        
-        # Check for complete sentences
-        if unstable_result and any(unstable_result.rstrip().endswith(p) for p in ['.', '!', '?']):
-            completion_indicators.append("✅ COMPLETE SENTENCE")
-        
-        # Detect early intent patterns (only on early turns)
-        detected_intents = []
-        
-        # Only detect intent if we don't already have a mode locked
-        if call_sid not in mode_lock or mode_lock.get(call_sid) == "unknown":
-            if any(phrase in lower_text for phrase in ["cold call", "sales call", "customer call"]):
-                detected_intents.append("🎯 COLD CALL PRACTICE")
-            
-            if any(phrase in lower_text for phrase in ["interview", "interview prep"]):
-                detected_intents.append("👔 INTERVIEW PRACTICE")
-                
-            if any(phrase in lower_text for phrase in ["small talk", "chat", "conversation"]):
-                detected_intents.append("💬 SMALL TALK")
-                
-            if any(phrase in lower_text for phrase in ["bad news", "delay", "problem", "issue"]):
-                detected_intents.append("😠 BAD NEWS DETECTED")
-                
-            if any(phrase in lower_text for phrase in ["let's start over", "start over", "reset"]):
-                detected_intents.append("🔄 RESET REQUEST")
-        
-        if detected_intents:
-            print(f"\n🎯 Early Intent Detection:")
-            for intent in detected_intents:
-                print(f"   {intent}")
-        
-        if completion_indicators:
-            print(f"\n📊 Speech Completion Status:")
-            for indicator in completion_indicators:
-                print(f"   {indicator}")
-        
-        # Long speech detection
-        elapsed_time = time.time() - stats["start_time"]
-        if elapsed_time > 30 and seq_num > 50:
-            print(f"\n⏰ LONG SPEECH DETECTED: {elapsed_time:.1f}s, {stats['word_count']} words")
-        
-        # Clean up old partials to prevent memory issues
-        if len(conversation_history[f"{call_sid}_partials"]) > 100:
-            # Keep only the last 50 partials
-            sorted_keys = sorted(conversation_history[f"{call_sid}_partials"].keys())
-            for key in sorted_keys[:-50]:
-                del conversation_history[f"{call_sid}_partials"][key]
-        
-        print(f"💭 Latest ordered text: '{latest_text}'")
-        print(f"📈 Stats: {current_word_count} words, {elapsed_time:.1f}s elapsed")
-        print(f"{'='*60}\n")
-        
-        # Return 204 No Content
-        return "", 204
-        
-    except Exception as e:
-        print(f"💥 Error in partial_speech: {e}")
-        import traceback
-        traceback.print_exc()
-        return "", 204  # Return 204 even on error to prevent Twilio retries
+    if any(phrase in lower_text for phrase in ["let's start over", "start over", "reset"]):
+        detected_intents.append("🔄 RESET REQUEST")
+    
+    if detected_intents:
+        print(f"\n🎯 Early Intent Detection:")
+        for intent in detected_intents:
+            print(f"   {intent}")
+    
+    # Track conversation flow
+    if call_sid not in conversation_history:
+        conversation_history[call_sid] = []
+    
+    # Store partial results in conversation history for debugging
+    partial_entry = {
+        "type": "partial",
+        "sequence": int(sequence_number),  # Convert to int for proper sorting
+        "text": unstable_result,  # Rename to just "text" since there's only unstable
+        "timestamp": time.time(),
+        "word_count": len(unstable_result.split()) if unstable_result else 0
+    }
+    # Keep only last 10 partial entries to avoid memory issues
+    partials = [e for e in conversation_history[call_sid] if e.get("type") == "partial"]
+    sorted_partials = sorted(partials, key=lambda x: int(x.get("sequence", 0)))
+    if len(partials) >= 10:
+        # Remove oldest partial
+        conversation_history[call_sid] = [
+            e for e in conversation_history[call_sid] 
+            if not (e.get("type") == "partial" and e["sequence"] == partials[0]["sequence"])
+        ]
+    
+    conversation_history[call_sid].append(partial_entry)
+    
+    # Speech length analysis
+    
+    # Debug all received parameters
+    if os.getenv("DEBUG_PARTIAL", "false").lower() == "true":
+        print(f"\n🔍 DEBUG - All Parameters:")
+        for key, value in request.form.items():
+            print(f"   {key}: {value}")
+    
+    print(f"{'='*60}\n")
+    
+    # Return 204 No Content - this doesn't affect the call flow
+    return "", 204
 @app.route("/process_speech", methods=["POST"])
 @async_route
 async def process_speech():
-    """Handle final speech recognition results with full optimizations"""
+    """Handle final speech recognition results from Gather"""
     global active_call_sid
     
-    # Performance tracking
+    # Set a maximum processing time to avoid 499 errors
     start_time = time.time()
     MAX_PROCESSING_TIME = 12  # seconds
-    timing = {"start": start_time}
     
     print("✅ /process_speech endpoint hit")
     print(f"  USE_STREAMING: {USE_STREAMING}")
@@ -474,13 +340,8 @@ async def process_speech():
     speech_result = request.form.get("SpeechResult", "")
     confidence = request.form.get("Confidence", "0.0")
     
-    # Also capture additional Twilio speech data
-    stability = request.form.get("Stability", "")
-    speech_model = request.form.get("SpeechModel", "")
-    
     print(f"📝 Final Speech Result: '{speech_result}'")
     print(f"🎯 Confidence: {confidence}")
-    print(f"🎙️ Model: {speech_model}")
     print(f"🛍️ ACTIVE CALL SID at start of /process_speech: {active_call_sid}")
     
     # Check if we got any speech
@@ -494,15 +355,7 @@ async def process_speech():
     # Use the speech result as the transcript
     transcript = speech_result.strip()
     
-    # Fix incomplete sentences
-    incomplete_endings = ["like", "so", "and", "but", "or", "with", "for", "to", "the", "a", "um", "uh"]
-    words = transcript.split()
-    
-    if words and words[-1].lower().rstrip('.,!?') in incomplete_endings:
-        print("⚠️ Detected incomplete sentence, adding ellipsis")
-        transcript = transcript.rstrip('.,!?') + "..."
-    
-    # Early timeout check
+    # If we're taking too long already, send an early response to prevent timeout
     if time.time() - start_time > 10:
         print("⚠️ Processing taking too long, sending early response")
         response = VoiceResponse()
@@ -517,10 +370,9 @@ async def process_speech():
         mode_lock.clear()
         personality_memory.clear()
         turn_count.clear()
-        interview_question_index.clear()
         active_call_sid = call_sid
     
-    # Helper functions
+    # Helper function to get clean conversation history
     def get_clean_conversation_history(call_sid):
         """Get only valid message entries from conversation history"""
         if call_sid not in conversation_history:
@@ -528,6 +380,7 @@ async def process_speech():
         
         clean_history = []
         for entry in conversation_history[call_sid]:
+            # Only include entries with role and content (skip partial entries)
             if (isinstance(entry, dict) and 
                 "role" in entry and 
                 "content" in entry and
@@ -539,56 +392,44 @@ async def process_speech():
         
         return clean_history
     
+    # Define helper functions
     def detect_bad_news(text):
         lowered = text.lower()
         return any(phrase in lowered for phrase in [
             "bad news", "unfortunately", "problem", "delay", "issue", 
-            "we can't", "we won't", "not going to happen", "reschedule", 
-            "price increase", "pushed back", "cancelled", "postponed"
+            "we can't", "we won't", "not going to happen", "reschedule", "price increase"
         ])
 
     def detect_intent(text):
         lowered = text.lower()
         if any(phrase in lowered for phrase in ["cold call", "customer call", "sales call", "business call"]):
             return "cold_call"
-        elif any(phrase in lowered for phrase in ["interview", "interview prep", "job interview"]):
+        elif any(phrase in lowered for phrase in ["interview", "interview prep"]):
             return "interview"
-        elif any(phrase in lowered for phrase in ["small talk", "chat", "casual conversation"]):
+        elif any(phrase in lowered for phrase in ["small talk", "chat", "talk casually"]):
             return "small_talk"
         return "unknown"
 
     # Check for reset command
-    if any(phrase in transcript.lower() for phrase in ["let's start over", "start over", "reset", "begin again"]):
+    if "let's start over" in transcript.lower():
         print("🔁 Reset triggered by user — rolling new persona")
         conversation_history.pop(call_sid, None)
         personality_memory.pop(call_sid, None)
-        interview_question_index.pop(call_sid, None)
         turn_count[call_sid] = 0
-        transcript = "cold call practice"  # Default reset mode
+        transcript = "cold call practice"
 
-    # Determine mode with safety check
-    turn = turn_count.get(call_sid, 0)
+    # Determine mode
     mode = mode_lock.get(call_sid)
-    
     if not mode:
-        if turn == 0:
-            mode = detect_intent(transcript)
-            mode_lock[call_sid] = mode
-            print("🧐 Intent detected and locked:", mode)
-        else:
-            # Safety: Don't allow mode detection after turn 0
-            print("⚠️ Late mode detection prevented, defaulting to unknown")
-            mode = "unknown"
-            mode_lock[call_sid] = mode
-    else:
-        print("📌 Using existing mode:", mode)
+        mode = detect_intent(transcript)
+        mode_lock[call_sid] = mode
+    print("🧐 Detected intent:", mode)
 
-    # Clean conversation history
+    # Clean conversation history for this call (remove partial entries)
     if call_sid in conversation_history:
         conversation_history[call_sid] = [
             entry for entry in conversation_history[call_sid]
-            if isinstance(entry, dict) and "role" in entry and 
-            "content" in entry and entry.get("type") != "partial"
+            if isinstance(entry, dict) and "role" in entry and "content" in entry and entry.get("type") != "partial"
         ]
 
     # Set up personality and voice based on mode
@@ -602,50 +443,46 @@ async def process_speech():
         persona = cold_call_personality_pool[persona_name]
         voice_id = persona["voice_id"]
         system_prompt = persona["system_prompt"]
-        intro_line = persona.get("intro_line", "Alright, I'll be your customer. Start the conversation.")
+        intro_line = persona.get("intro_line", "Alright, I'll be your customer. Start the conversation however you want — this could be a cold call, a follow-up, a check-in, or even a tough conversation. I'll respond based on my personality. If you ever want to start over, just say 'let's start over.'")
 
     elif mode == "small_talk":
-        voice_id = personality_profiles["small_talk"]["voice_id"]
-        system_prompt = "You're a casual, friendly conversationalist. Keep it light and natural."
-        intro_line = "Hey there! What's on your mind?"
+        voice_id = "2BJW5coyhAzSr8STdHbE"
+        system_prompt = "You're a casual, sarcastic friend. Keep it light, keep it fun."
+        intro_line = "Yo yo yo, how's it goin'?"
 
     elif mode == "interview":
-        # Consistent voice throughout interview
+        interview_voice_pool = [
+            {"voice_id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel"},
+            {"voice_id": "EXAVITQu4vr4xnSDxMaL", "name": "Clyde"},
+            {"voice_id": "6YQMyaUWlj0VX652cY1C", "name": "Stephen"}
+        ]
+
+        # Check if we already have a voice assigned for consistency
         if call_sid not in personality_memory:
-            voice_choice = random.choice([
-                {"voice_id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel"},
-                {"voice_id": "EXAVITQu4vr4xnSDxMaL", "name": "Clyde"},
-                {"voice_id": "6YQMyaUWlj0VX652cY1C", "name": "Stephen"}
-            ])
+            voice_choice = random.choice(interview_voice_pool)
             personality_memory[call_sid] = voice_choice
         else:
             voice_choice = personality_memory[call_sid]
         
         voice_id = voice_choice["voice_id"]
-        
-        # Track interview question progression
-        if call_sid not in interview_question_index:
-            interview_question_index[call_sid] = 0
-        
         system_prompt = (
-            f"You are {voice_choice['name']}, a friendly job interviewer. "
-            "Give brief, encouraging feedback after each answer. "
-            "Keep responses under 50 words. "
-            "Move to the next question smoothly."
+            f"You are {voice_choice['name']}, a friendly, conversational job interviewer helping candidates practice for real interviews. "
+            "Speak casually — like you're talking to someone over coffee, not in a formal evaluation. Ask one interview-style question at a time, and after each response, give supportive, helpful feedback. "
+            "If their answer is weak, say 'Let's try that again' and re-ask the question. If it's strong, give a quick reason why it's good. "
+            "Briefly refer to the STAR method (Situation, Task, Action, Result) when giving feedback, but don't lecture. Keep your tone upbeat, natural, and keep the conversation flowing. "
+            "Don't ask if they're ready for the next question — just move on with something like, 'Alright, next one,' or 'Cool, here's another one.'"
         )
-        intro_line = "Great! Let's start. Can you walk me through your most recent role?"
+        intro_line = "Great, let's jump in! Can you walk me through your most recent role and responsibilities?"
 
     else:
         voice_id = "1t1EeRixsJrKbiF1zwM6"
-        system_prompt = "You're a helpful assistant. Be concise and friendly."
+        system_prompt = "You're a helpful assistant."
         intro_line = "How can I help you today?"
 
-    # Update turn count
+    # Manage turn count and conversation history
+    turn = turn_count.get(call_sid, 0)
     turn_count[call_sid] = turn + 1
     conversation_history.setdefault(call_sid, [])
-
-    timing["mode_setup"] = time.time()
-    print(f"⏱️ Mode setup took: {timing['mode_setup'] - timing['start']:.2f}s")
 
     # Generate response
     if turn == 0:
@@ -655,105 +492,123 @@ async def process_speech():
         # Add user message to history
         conversation_history[call_sid].append({"role": "user", "content": transcript})
         
-        # Build messages array
+        # Build messages array with validation
         messages = [{"role": "system", "content": system_prompt}]
         
-        # Check for bad news and add appropriate prompt
-        if detect_bad_news(transcript):
-            print("⚠️ Bad news detected — AI will respond accordingly")
-            escalation_prompt = (
-                "The user just delivered bad news. Respond emotionally based on your personality. "
-                "Express frustration appropriately. Stay in character."
-            )
-            messages.append({"role": "system", "content": escalation_prompt})
+        # Check for bad news
+        lowered = transcript.lower()
+        is_bad_news = any(x in lowered for x in [
+            "bad news", "unfortunately", "delay", "delayed", "won't make it", "can't deliver",
+            "got pushed", "rescheduled", "not coming", "issue with the supplier", "problem with your order"
+        ])
 
-        # Add conversation history (limit to last 10 exchanges for performance)
-        history = get_clean_conversation_history(call_sid)
-        messages.extend(history[-20:])  # Last 10 back-and-forth exchanges
+        is_user_defensive = any(x in lowered for x in [
+            "calm down", "relax", "it's not my fault", "what do you want me to do", "stop yelling", "chill out"
+        ])
+
+        if is_bad_news:
+            print("⚠️ Bad news detected — AI will respond angrily.")
+            escalation_prompt = (
+                "The user just delivered bad news to the customer. Respond as the customer based on your personality, "
+                "but crank up the emotion. If it fits your persona, act furious — like you're raising your voice. "
+                "You can use strong language (not profane), interruptions, and frustration. You might say things like "
+                "'Are you SERIOUS right now?!' or 'Unbelievable. This is NOT okay.' Show that this ruined your day. "
+                "If the user tries to calm you down, don't immediately cool off. Push back again with more anger. "
+                "Only start to de-escalate if they take responsibility and handle it well. Stay human, not robotic."
+            )
+
+            if is_user_defensive:
+                print("😡 User snapped back — escalate the attitude.")
+                escalation_prompt += (
+                    " The user got defensive, so now you're even more upset. Push back harder. Say something like, 'Don't tell me to calm down — this is your screw-up.'"
+                )
+
+            messages.insert(0, {
+                "role": "system",
+                "content": escalation_prompt
+            })
+
+        # Add clean conversation history
+        messages += get_clean_conversation_history(call_sid)
         
-        # Check timeout before GPT call
+        # Debug: Print messages structure
+        print(f"📋 Messages array length: {len(messages)}")
+        for i, msg in enumerate(messages):
+            if isinstance(msg, dict) and "role" in msg:
+                content_preview = msg.get('content', '')[:50] + '...' if msg.get('content', '') else 'No content'
+                print(f"   [{i}] {msg['role']}: {content_preview}")
+            else:
+                print(f"   [{i}] INVALID: {msg}")
+
+        # Check if we're close to timeout before GPT call
         if time.time() - start_time > MAX_PROCESSING_TIME - 3:
             print("⚠️ Near timeout, using quick response")
-            reply = "I understand. Let me process that."
+            reply = "Let me think about that for a moment."
         else:
-            # Get GPT response with optimized settings
+            # Get GPT response
             try:
                 if USE_STREAMING:
                     reply = await streaming_gpt_response(messages, voice_id, call_sid)
                 else:
-                    model = "gpt-3.5-turbo" if mode != "interview" else "gpt-4"
                     gpt_reply = sync_openai.chat.completions.create(
-                        model=model,
+                        model="gpt-3.5-turbo",
                         messages=messages,
                         temperature=0.7,
-                        max_tokens=100,  # Keep responses concise
-                        presence_penalty=0.3,  # Reduce repetition
-                        frequency_penalty=0.3
+                        max_tokens=150  # Limit response length for speed
                     )
                     reply = gpt_reply.choices[0].message.content.strip()
-                    
-                timing["gpt_done"] = time.time()
-                print(f"⏱️ GPT took: {timing['gpt_done'] - timing.get('mode_setup', start_time):.2f}s")
-                    
             except Exception as e:
                 print(f"💥 GPT error: {e}")
-                reply = "I understand. Could you repeat that?"
-        
+                # Fallback response
+                reply = "I'm having a bit of trouble understanding. Could you say that again?"
+                
         # Clean up response
-        reply = reply.replace("*", "").replace("_", "").replace("`", "").replace("#", "")
+        reply = reply.replace("*", "").replace("_", "").replace("`", "").replace("#", "").replace("-", " ")
         conversation_history[call_sid].append({"role": "assistant", "content": reply})
 
     print(f"🔣 Generating voice with ID: {voice_id}")
     print(f"🗣️ Reply: {reply[:100]}...")
     
-    # TTS Generation with caching and optimization
+    # Generate TTS with timeout protection
     output_path = f"static/response_{call_sid}.mp3"
     
-    # Check cache for common short responses
-    cache_key = f"{voice_id}_{reply[:50].lower().replace(' ', '_')}"
-    cache_path = f"static/cache/{cache_key}.mp3"
-    
-    if len(reply) < 50 and os.path.exists(cache_path):
-        print(f"📦 Using cached audio for common response")
-        os.system(f"cp {cache_path} {output_path}")
-    else:
-        # Check timeout before TTS
-        if time.time() - start_time > MAX_PROCESSING_TIME - 2:
-            print("⚠️ Near timeout, using ultra-fast TTS")
-            # Use fastest possible TTS
+    # Check if we're close to timeout
+    if time.time() - start_time > MAX_PROCESSING_TIME - 2:
+        print("⚠️ Near timeout, using fallback audio")
+        fallback_path = "static/fallback.mp3"
+        if os.path.exists(fallback_path):
+            os.system(f"cp {fallback_path} {output_path}")
+        else:
+            # Create a very quick TTS response
             try:
-                audio_gen = elevenlabs_client.text_to_speech.convert(
+                quick_gen = elevenlabs_client.text_to_speech.convert(
                     voice_id=voice_id,
                     text="Just a moment.",
                     model_id="eleven_turbo_v2_5",
                     output_format="mp3_22050_32"
                 )
-                raw_audio = b"".join(chunk for chunk in audio_gen if chunk)
+                raw_audio = b""
+                for chunk in quick_gen:
+                    if chunk:
+                        raw_audio += chunk
                 with open(output_path, "wb") as f:
                     f.write(raw_audio)
             except:
-                # Ultimate fallback
-                fallback_path = "static/fallback.mp3"
-                if os.path.exists(fallback_path):
-                    os.system(f"cp {fallback_path} {output_path}")
+                pass
+    else:
+        # Normal TTS generation
+        if USE_STREAMING and SENTENCE_STREAMING and turn > 0 and os.path.exists(output_path):
+            # Audio already generated by streaming_gpt_response
+            print(f"✅ Audio already generated via sentence streaming for {call_sid}")
         else:
-            # Normal TTS generation
+            # Generate TTS (streaming or non-streaming)
             try:
-                model_id = "eleven_turbo_v2_5"  # Fastest for short
-                
                 audio_gen = elevenlabs_client.text_to_speech.convert(
                     voice_id=voice_id,
                     text=reply,
-                    model_id=model_id,
-                    output_format="mp3_22050_32",
-                    voice_settings=VoiceSettings(
-                        stability=0.5,
-                        similarity_boost=0.75,
-                        style=0.0,
-                        use_speaker_boost=True
-                    )
+                    model_id="eleven_turbo_v2_5" if USE_STREAMING else "eleven_monolingual_v1",
+                    output_format="mp3_22050_32"
                 )
-                
                 raw_audio = b""
                 for chunk in audio_gen:
                     if chunk:
@@ -762,62 +617,47 @@ async def process_speech():
                 with open(output_path, "wb") as f:
                     f.write(raw_audio)
                     f.flush()
-                    
                 print(f"✅ Audio saved to {output_path} ({len(raw_audio)} bytes)")
-                
-                timing["tts_done"] = time.time()
-                print(f"⏱️ TTS took: {timing['tts_done'] - timing.get('gpt_done', start_time):.2f}s")
-                
-                # Cache short common responses
-                if len(reply) < 50 and not os.path.exists(cache_path):
-                    os.makedirs("static/cache", exist_ok=True)
-                    os.system(f"cp {output_path} {cache_path}")
                     
             except Exception as e:
-                print(f"🛑 ElevenLabs error: {e}")
-                # Retry with different model
-                try:
-                    audio_gen = elevenlabs_client.text_to_speech.convert(
-                        voice_id=voice_id,
-                        text=reply,
-                        model_id="eleven_turbo_v2_5",
-                        output_format="mp3_22050_32"
-                    )
-                    raw_audio = b"".join(chunk for chunk in audio_gen if chunk)
-                    with open(output_path, "wb") as f:
-                        f.write(raw_audio)
-                    print("✅ Retry with multilingual model succeeded")
-                except:
-                    # Final fallback
-                    fallback_path = "static/fallback.mp3"
-                    if os.path.exists(fallback_path):
-                        os.system(f"cp {fallback_path} {output_path}")
+                print(f"🛑 ElevenLabs generation error: {e}")
+                if "429" in str(e):  # Too Many Requests
+                    print("🔁 Retrying after brief pause due to rate limit...")
+                    await asyncio.sleep(2)
+                    try:
+                        if USE_STREAMING:
+                            raw_audio = await generate_tts_streaming(reply, voice_id)
+                        else:
+                            audio_gen = elevenlabs_client.text_to_speech.convert(
+                                voice_id=voice_id,
+                                text=reply,
+                                model_id="eleven_monolingual_v1",
+                                output_format="mp3_22050_32"
+                            )
+                            raw_audio = b""
+                            for chunk in audio_gen:
+                                if chunk:
+                                    raw_audio += chunk
+                            
+                        with open(output_path, "wb") as f:
+                            f.write(raw_audio)
+                        print("✅ Retry succeeded")
+                    except Exception as e2:
+                        print(f"❌ Retry failed: {e2}")
+                        fallback_path = "static/fallback.mp3"
+                        if os.path.exists(fallback_path):
+                            os.system(f"cp {fallback_path} {output_path}")
     
-    # Always create ready flag
+    # Always create ready flag after audio is saved
     with open(f"static/response_ready_{call_sid}.txt", "w") as f:
         f.write("ready")
     print(f"🚩 Ready flag created for {call_sid}")
-    
-    # Clear partial data (don't delete the keys entirely)
-    if f"{call_sid}_partials" in conversation_history:
-        conversation_history[f"{call_sid}_partials"].clear()
-    if f"{call_sid}_partial_stats" in conversation_history:
-        conversation_history[f"{call_sid}_partial_stats"]["last_activity"] = time.time()
-    
+
     # Schedule cleanup
     cleanup_thread = threading.Thread(target=delayed_cleanup, args=(call_sid,))
-    cleanup_thread.daemon = True
     cleanup_thread.start()
-    
-    # Log total time
-    total_time = time.time() - start_time
-    print(f"⏱️ Total processing time: {total_time:.2f}s")
-    
-    # Performance warning
-    if total_time > 8:
-        print(f"⚠️ SLOW RESPONSE: {total_time:.2f}s - investigate!")
-    
-    # Play beep and redirect
+
+    # Play a beep before the AI response
     response = VoiceResponse()
     response.play(f"{request.url_root}static/beep.mp3")
     response.redirect(url_for("voice", _external=True))
@@ -994,7 +834,7 @@ async def generate_tts_streaming(text: str, voice_id: str) -> bytes:
                 audio_gen = elevenlabs_client.text_to_speech.convert(
                     voice_id=voice_id,
                     text=text,
-                    model_id="eleven_turbo_v2_5",
+                    model_id="eleven_monolingual_v1",
                     output_format="mp3_22050_32"
                 )
                 
@@ -1021,7 +861,7 @@ async def generate_tts_streaming(text: str, voice_id: str) -> bytes:
                     audio_gen = elevenlabs_client.text_to_speech.convert(
                         voice_id=voice_id,
                         text=text,
-                        model_id="eleven_turbo_v2_5",
+                        model_id="eleven_monolingual_v1",
                         output_format="mp3_22050_32"
                     )
                     

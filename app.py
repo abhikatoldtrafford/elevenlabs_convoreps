@@ -334,133 +334,147 @@ def voice():
 def partial_speech():
     """Handle partial speech results with enhanced processing"""
     
-    # Get all the partial result data from Twilio
-    call_sid = request.form.get("CallSid")
-    sequence_number = request.form.get("SequenceNumber", "0")
-    unstable_result = request.form.get("UnstableSpeechResult", "")
-    speech_activity = request.form.get("SpeechActivity", "")
-    caller = request.form.get("From", "Unknown")
-    
-    # Performance optimization: Skip very similar partials
-    last_partial_key = f"{call_sid}_last_partial"
-    last_partial_text = session.get(last_partial_key, "")
-    
-    if unstable_result and last_partial_text:
-        # Calculate word-level similarity
-        current_words = set(unstable_result.lower().split())
-        last_words = set(last_partial_text.lower().split())
+    try:
+        # Get all the partial result data from Twilio
+        call_sid = request.form.get("CallSid")
+        sequence_number = request.form.get("SequenceNumber", "0")
+        unstable_result = request.form.get("UnstableSpeechResult", "")
+        speech_activity = request.form.get("SpeechActivity", "")
+        caller = request.form.get("From", "Unknown")
         
-        if current_words and last_words:
-            similarity = len(current_words & last_words) / len(current_words | last_words)
-            if similarity > 0.85 and len(unstable_result) - len(last_partial_text) < 5:
-                return "", 204  # Skip logging similar partial
-    
-    session[last_partial_key] = unstable_result
-    
-    # Initialize conversation history with ordered partials storage
-    if call_sid not in conversation_history:
-        conversation_history[call_sid] = []
-        conversation_history[f"{call_sid}_partials"] = {}
-        conversation_history[f"{call_sid}_partial_stats"] = {
-            "start_time": time.time(),
-            "word_count": 0,
-            "last_activity": time.time()
+        # Performance optimization: Skip very similar partials
+        last_partial_key = f"{call_sid}_last_partial"
+        last_partial_text = session.get(last_partial_key, "")
+        
+        if unstable_result and last_partial_text:
+            # Calculate word-level similarity
+            current_words = set(unstable_result.lower().split())
+            last_words = set(last_partial_text.lower().split())
+            
+            if current_words and last_words:
+                similarity = len(current_words & last_words) / len(current_words | last_words)
+                if similarity > 0.85 and len(unstable_result) - len(last_partial_text) < 5:
+                    return "", 204  # Skip logging similar partial
+        
+        session[last_partial_key] = unstable_result
+        
+        # Initialize conversation history if needed
+        if call_sid not in conversation_history:
+            conversation_history[call_sid] = []
+        
+        # Initialize partial storage structures - CHECK SPECIFICALLY FOR THESE KEYS
+        if f"{call_sid}_partials" not in conversation_history:
+            conversation_history[f"{call_sid}_partials"] = {}
+            
+        if f"{call_sid}_partial_stats" not in conversation_history:
+            conversation_history[f"{call_sid}_partial_stats"] = {
+                "start_time": time.time(),
+                "word_count": 0,
+                "last_activity": time.time()
+            }
+        
+        # Store partial by sequence number for ordering
+        seq_num = int(sequence_number) if sequence_number else 0
+        conversation_history[f"{call_sid}_partials"][seq_num] = {
+            "text": unstable_result,
+            "timestamp": time.time(),
+            "activity": speech_activity
         }
-    
-    # Store partial by sequence number for ordering
-    seq_num = int(sequence_number) if sequence_number else 0
-    conversation_history[f"{call_sid}_partials"][seq_num] = {
-        "text": unstable_result,
-        "timestamp": time.time(),
-        "activity": speech_activity
-    }
-    
-    # Get ordered text from all partials
-    ordered_partials = sorted(conversation_history[f"{call_sid}_partials"].items())
-    if ordered_partials:
-        latest_text = ordered_partials[-1][1]["text"]
-    else:
-        latest_text = unstable_result
-    
-    # Log with clear formatting
-    print(f"\n{'='*60}")
-    print(f"🎤 PARTIAL SPEECH #{sequence_number} - CallSid: {call_sid}")
-    print(f"📞 Caller: {caller}")
-    print(f"{'='*60}")
-    
-    if unstable_result:
-        print(f"⏳ UNSTABLE: '{unstable_result}'")
         
-    if speech_activity:
-        print(f"🔊 Activity: {speech_activity}")
-    
-    # Track conversation statistics
-    stats = conversation_history[f"{call_sid}_partial_stats"]
-    current_word_count = len(unstable_result.split()) if unstable_result else 0
-    stats["word_count"] = max(stats["word_count"], current_word_count)
-    stats["last_activity"] = time.time()
-    
-    # Detect completion patterns
-    completion_indicators = []
-    lower_text = unstable_result.lower() if unstable_result else ""
-    
-    # Check for incomplete endings
-    incomplete_endings = ["like", "so", "and", "but", "or", "with", "for", "to", "the", "a"]
-    words = unstable_result.strip().split() if unstable_result else []
-    
-    if words and words[-1].lower().rstrip('.,!?') in incomplete_endings:
-        completion_indicators.append("⚠️ INCOMPLETE ENDING")
-    
-    # Check for complete sentences
-    if unstable_result and any(unstable_result.rstrip().endswith(p) for p in ['.', '!', '?']):
-        completion_indicators.append("✅ COMPLETE SENTENCE")
-    
-    # Detect early intent patterns
-    detected_intents = []
-    
-    if any(phrase in lower_text for phrase in ["cold call", "sales call", "customer call"]):
-        detected_intents.append("🎯 COLD CALL PRACTICE")
-    
-    if any(phrase in lower_text for phrase in ["interview", "interview prep"]):
-        detected_intents.append("👔 INTERVIEW PRACTICE")
+        # Get ordered text from all partials
+        ordered_partials = sorted(conversation_history[f"{call_sid}_partials"].items())
+        if ordered_partials:
+            latest_text = ordered_partials[-1][1]["text"]
+        else:
+            latest_text = unstable_result
         
-    if any(phrase in lower_text for phrase in ["small talk", "chat", "conversation"]):
-        detected_intents.append("💬 SMALL TALK")
+        # Log with clear formatting
+        print(f"\n{'='*60}")
+        print(f"🎤 PARTIAL SPEECH #{sequence_number} - CallSid: {call_sid}")
+        print(f"📞 Caller: {caller}")
+        print(f"{'='*60}")
         
-    if any(phrase in lower_text for phrase in ["bad news", "delay", "problem", "issue"]):
-        detected_intents.append("😠 BAD NEWS DETECTED")
+        if unstable_result:
+            print(f"⏳ UNSTABLE: '{unstable_result}'")
+            
+        if speech_activity:
+            print(f"🔊 Activity: {speech_activity}")
         
-    if any(phrase in lower_text for phrase in ["let's start over", "start over", "reset"]):
-        detected_intents.append("🔄 RESET REQUEST")
-    
-    if detected_intents:
-        print(f"\n🎯 Early Intent Detection:")
-        for intent in detected_intents:
-            print(f"   {intent}")
-    
-    if completion_indicators:
-        print(f"\n📊 Speech Completion Status:")
-        for indicator in completion_indicators:
-            print(f"   {indicator}")
-    
-    # Long speech detection
-    elapsed_time = time.time() - stats["start_time"]
-    if elapsed_time > 30 and seq_num > 50:
-        print(f"\n⏰ LONG SPEECH DETECTED: {elapsed_time:.1f}s, {stats['word_count']} words")
-    
-    # Clean up old partials to prevent memory issues
-    if len(conversation_history[f"{call_sid}_partials"]) > 100:
-        # Keep only the last 50 partials
-        sorted_keys = sorted(conversation_history[f"{call_sid}_partials"].keys())
-        for key in sorted_keys[:-50]:
-            del conversation_history[f"{call_sid}_partials"][key]
-    
-    print(f"💭 Latest ordered text: '{latest_text}'")
-    print(f"📈 Stats: {current_word_count} words, {elapsed_time:.1f}s elapsed")
-    print(f"{'='*60}\n")
-    
-    # Return 204 No Content
-    return "", 204
+        # Track conversation statistics
+        stats = conversation_history[f"{call_sid}_partial_stats"]
+        current_word_count = len(unstable_result.split()) if unstable_result else 0
+        stats["word_count"] = max(stats["word_count"], current_word_count)
+        stats["last_activity"] = time.time()
+        
+        # Detect completion patterns
+        completion_indicators = []
+        lower_text = unstable_result.lower() if unstable_result else ""
+        
+        # Check for incomplete endings
+        incomplete_endings = ["like", "so", "and", "but", "or", "with", "for", "to", "the", "a"]
+        words = unstable_result.strip().split() if unstable_result else []
+        
+        if words and words[-1].lower().rstrip('.,!?') in incomplete_endings:
+            completion_indicators.append("⚠️ INCOMPLETE ENDING")
+        
+        # Check for complete sentences
+        if unstable_result and any(unstable_result.rstrip().endswith(p) for p in ['.', '!', '?']):
+            completion_indicators.append("✅ COMPLETE SENTENCE")
+        
+        # Detect early intent patterns (only on early turns)
+        detected_intents = []
+        
+        # Only detect intent if we don't already have a mode locked
+        if call_sid not in mode_lock or mode_lock.get(call_sid) == "unknown":
+            if any(phrase in lower_text for phrase in ["cold call", "sales call", "customer call"]):
+                detected_intents.append("🎯 COLD CALL PRACTICE")
+            
+            if any(phrase in lower_text for phrase in ["interview", "interview prep"]):
+                detected_intents.append("👔 INTERVIEW PRACTICE")
+                
+            if any(phrase in lower_text for phrase in ["small talk", "chat", "conversation"]):
+                detected_intents.append("💬 SMALL TALK")
+                
+            if any(phrase in lower_text for phrase in ["bad news", "delay", "problem", "issue"]):
+                detected_intents.append("😠 BAD NEWS DETECTED")
+                
+            if any(phrase in lower_text for phrase in ["let's start over", "start over", "reset"]):
+                detected_intents.append("🔄 RESET REQUEST")
+        
+        if detected_intents:
+            print(f"\n🎯 Early Intent Detection:")
+            for intent in detected_intents:
+                print(f"   {intent}")
+        
+        if completion_indicators:
+            print(f"\n📊 Speech Completion Status:")
+            for indicator in completion_indicators:
+                print(f"   {indicator}")
+        
+        # Long speech detection
+        elapsed_time = time.time() - stats["start_time"]
+        if elapsed_time > 30 and seq_num > 50:
+            print(f"\n⏰ LONG SPEECH DETECTED: {elapsed_time:.1f}s, {stats['word_count']} words")
+        
+        # Clean up old partials to prevent memory issues
+        if len(conversation_history[f"{call_sid}_partials"]) > 100:
+            # Keep only the last 50 partials
+            sorted_keys = sorted(conversation_history[f"{call_sid}_partials"].keys())
+            for key in sorted_keys[:-50]:
+                del conversation_history[f"{call_sid}_partials"][key]
+        
+        print(f"💭 Latest ordered text: '{latest_text}'")
+        print(f"📈 Stats: {current_word_count} words, {elapsed_time:.1f}s elapsed")
+        print(f"{'='*60}\n")
+        
+        # Return 204 No Content
+        return "", 204
+        
+    except Exception as e:
+        print(f"💥 Error in partial_speech: {e}")
+        import traceback
+        traceback.print_exc()
+        return "", 204  # Return 204 even on error to prevent Twilio retries
 @app.route("/process_speech", methods=["POST"])
 @async_route
 async def process_speech():
@@ -809,11 +823,11 @@ async def process_speech():
         f.write("ready")
     print(f"🚩 Ready flag created for {call_sid}")
     
-    # Clean up partial data
+    # Clear partial data (don't delete the keys entirely)
     if f"{call_sid}_partials" in conversation_history:
-        del conversation_history[f"{call_sid}_partials"]
+        conversation_history[f"{call_sid}_partials"].clear()
     if f"{call_sid}_partial_stats" in conversation_history:
-        del conversation_history[f"{call_sid}_partial_stats"]
+        conversation_history[f"{call_sid}_partial_stats"]["last_activity"] = time.time()
     
     # Schedule cleanup
     cleanup_thread = threading.Thread(target=delayed_cleanup, args=(call_sid,))

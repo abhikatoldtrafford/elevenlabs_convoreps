@@ -575,30 +575,39 @@ async def stream_tts_response(call_sid, stream_sid, text):
     for i, sentence in enumerate(sentences):
         if sentence.strip():
             try:
-                # Generate TTS for sentence
-                audio_stream = elevenlabs_client.text_to_speech.convert_as_stream(
-                    voice_id=voice_id,
+                print(f"🔊 Generating TTS for: {sentence[:50]}...")
+                
+                # Use the correct ElevenLabs streaming method
+                audio_stream = elevenlabs_client.text_to_speech.stream(
                     text=sentence,
+                    voice_id=voice_id,
                     model_id="eleven_turbo_v2_5",
                     voice_settings=VoiceSettings(
                         stability=0.4,
-                        similarity_boost=0.75
-                    )
+                        similarity_boost=0.75,
+                        style=0.0,
+                        use_speaker_boost=True
+                    ),
+                    output_format="ulaw_8000",  # Direct mulaw format for Twilio
+                    optimize_streaming_latency=3  # Max optimization for low latency
                 )
                 
-                # Stream audio chunks
+                # Process the audio stream
                 chunk_count = 0
                 audio_buffer = b''
                 
-                for chunk in audio_stream:
-                    if chunk:
-                        audio_buffer += chunk
+                # Iterate through the stream
+                for audio_chunk in audio_stream:
+                    if isinstance(audio_chunk, bytes) and audio_chunk:
+                        audio_buffer += audio_chunk
                         
-                        # Send chunks of ~20ms (160 bytes at 8kHz)
-                        if len(audio_buffer) >= 640:
-                            # Convert to mulaw
-                            mulaw_chunk = convert_to_mulaw(audio_buffer[:640])
-                            payload = base64.b64encode(mulaw_chunk).decode('utf-8')
+                        # Send chunks of ~160 bytes (20ms at 8kHz mulaw)
+                        while len(audio_buffer) >= 160:
+                            chunk_to_send = audio_buffer[:160]
+                            audio_buffer = audio_buffer[160:]
+                            
+                            # Base64 encode the chunk
+                            payload = base64.b64encode(chunk_to_send).decode('utf-8')
                             
                             # Send media message
                             media_message = {
@@ -609,19 +618,15 @@ async def stream_tts_response(call_sid, stream_sid, text):
                                 }
                             }
                             ws.send(json.dumps(media_message))
-                            
-                            audio_buffer = audio_buffer[640:]
                             chunk_count += 1
                             
-                            # Small delay to prevent overwhelming
+                            # Small delay every 10 chunks to prevent overwhelming
                             if chunk_count % 10 == 0:
                                 await asyncio.sleep(0.01)
                 
-                # Send remaining audio
+                # Send any remaining audio
                 if audio_buffer:
-                    mulaw_chunk = convert_to_mulaw(audio_buffer)
-                    payload = base64.b64encode(mulaw_chunk).decode('utf-8')
-                    
+                    payload = base64.b64encode(audio_buffer).decode('utf-8')
                     media_message = {
                         "event": "media",
                         "streamSid": stream_sid,
@@ -631,7 +636,7 @@ async def stream_tts_response(call_sid, stream_sid, text):
                     }
                     ws.send(json.dumps(media_message))
                 
-                # Send mark message
+                # Send mark message to track completion
                 mark_message = {
                     "event": "mark",
                     "streamSid": stream_sid,
@@ -641,8 +646,13 @@ async def stream_tts_response(call_sid, stream_sid, text):
                 }
                 ws.send(json.dumps(mark_message))
                 
+                print(f"✅ Sent {chunk_count} audio chunks for sentence {i}")
+                
             except Exception as e:
                 print(f"💥 TTS streaming error: {e}")
+                print(f"   Error type: {type(e).__name__}")
+                import traceback
+                traceback.print_exc()
 
 async def transcribe_audio(audio_pcm):
     """Transcribe audio using Whisper"""

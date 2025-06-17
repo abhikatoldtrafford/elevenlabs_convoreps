@@ -128,6 +128,17 @@ interview_questions = [
     "How do you handle feedback and criticism?",
     "Do you have any questions for me about the company or the role?"
 ]
+def async_route(f):
+    """Decorator to run async functions in Flask"""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(f(*args, **kwargs))
+        finally:
+            loop.close()
+    return wrapper
 from flask_sock import Sock
 
 # After creating Flask app
@@ -539,17 +550,7 @@ def error_handler(f):
             response.hangup()
             return str(response)
     return wrapper
-def async_route(f):
-    """Decorator to run async functions in Flask"""
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(f(*args, **kwargs))
-        finally:
-            loop.close()
-    return wrapper
+
 @app.route("/static/<path:filename>")
 def static_files(filename):
     return send_from_directory("static", filename)

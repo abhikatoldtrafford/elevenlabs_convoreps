@@ -48,10 +48,10 @@ elevenlabs_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
 
 # Streaming configuration
 USE_STREAMING = os.getenv("USE_STREAMING", "true").lower() == "true"
-SENTENCE_STREAMING = False
+SENTENCE_STREAMING = True
 
 # Handle STREAMING_TIMEOUT with potential comments
-timeout_env = os.getenv("STREAMING_TIMEOUT", "3.0")
+timeout_env = os.getenv("STREAMING_TIMEOUT", "1.0")
 # ADD:
 # Set defaults if not in environment
 os.environ.setdefault("USE_STREAMING", "true")
@@ -154,27 +154,21 @@ def delayed_cleanup(call_sid):
         print(f"⚠️ Cleanup error for {call_sid}: {e}")
 
 @app.route("/voice", methods=["POST", "GET"])
+@app.route("/voice", methods=["POST", "GET"])
 def voice():
     """Handle incoming voice calls with optimized gather settings"""
     call_sid = request.values.get("CallSid")
     
-    # Cleanup old files on first turn
+    # Cleanup old files on first turn (keep this logic)
     if turn_count.get(call_sid, 0) == 0:
         for f in os.listdir("static"):
             if f.startswith("response_") and "CAb" not in f and call_sid not in f:
                 try:
                     file_path = f"static/{f}"
-                    if time.time() - os.path.getmtime(file_path) > 600:  # 10+ minutes old
+                    if time.time() - os.path.getmtime(file_path) > 600:
                         os.remove(file_path)
                 except:
                     pass
-    
-    recording_url = request.values.get("RecordingUrl")
-    
-    print(f"==> /voice hit. CallSid: {call_sid}")
-    if recording_url:
-        filename = recording_url.split("/")[-1]
-        print(f"🎧 Incoming Recording SID: {filename}")
     
     # Initialize or increment turn count
     if call_sid not in turn_count:
@@ -182,7 +176,7 @@ def voice():
     else:
         turn_count[call_sid] += 1
     
-    print(f"🧪 Current turn: {turn_count[call_sid]}")
+    print(f"==> /voice hit. CallSid: {call_sid}, Turn: {turn_count[call_sid]}")
     
     mp3_path = f"static/response_{call_sid}.mp3"
     flag_path = f"static/response_ready_{call_sid}.txt"
@@ -193,11 +187,10 @@ def voice():
         if not os.path.exists(mp3_path) or not os.path.exists(flag_path):
             return False
         if os.path.getsize(mp3_path) < 1500:
-            print("⚠️ MP3 file exists but is too small, not ready yet.")
             return False
         return True
     
-    # Handle first turn with greeting + beep
+    # Handle first turn with greeting (no beep, no pause)
     if turn_count[call_sid] == 0:
         print("📞 First turn — playing appropriate greeting")
         
@@ -209,12 +202,8 @@ def voice():
             greeting_file = "returning_user_greeting.mp3"
             print("🔁 Returning caller — playing returning greeting.")
         
-        # Play greeting
+        # Play greeting WITHOUT beep or pause
         response.play(f"{request.url_root}static/{greeting_file}?v={time.time()}")
-        # Play beep after greeting
-        response.play(f"{request.url_root}static/beep.mp3")
-        # Brief pause after beep
-        response.pause(length=1)
         
     elif is_file_ready(mp3_path, flag_path):
         print(f"🔊 Playing: {mp3_path}")
@@ -226,106 +215,96 @@ def voice():
             os.remove(flag_path)
         except:
             pass
-            
     else:
-        print("⏳ Response not ready — waiting briefly")
-        # Just pause, don't redirect to avoid loops
-        response.pause(length=1)
+        # Don't pause - go straight to gather
+        print("⏳ Response not ready — proceeding to gather immediately")
     
-    # Determine optimal speech settings based on context
-    is_first_turn = turn_count.get(call_sid, 0) == 0
-    mode = mode_lock.get(call_sid, "unknown")
+    # Optimized gather parameters based on context
     current_turn = turn_count.get(call_sid, 0)
+    mode = mode_lock.get(call_sid, "unknown")
     
-    # Configure gather parameters based on mode and turn
-    if is_first_turn:
-        # First turn: expect short commands
-        speech_model = "experimental_utterances"  # Better for short utterances
-        speech_timeout = "3"  # Give user time to start speaking
-        gather_timeout = 30
-        hints = "cold call, sales call, customer call, interview, interview prep, small talk, chat, conversation"
-        
-    elif mode == "interview":
-        # Interview mode: expect longer responses
-        speech_model = "experimental_conversations"  # Better for natural conversation
-        
-        # Dynamic timeout based on expected answer length
-        if current_turn < 3:  # Early questions tend to have longer answers
-            speech_timeout = "5"
-            gather_timeout = 60
-        else:  # Later questions might be shorter
-            speech_timeout = "4"
-            gather_timeout = 45
-            
-        # Interview-specific hints
-        hints = "$OOV_CLASS_DIGIT_SEQUENCE, STAR method, situation, task, action, result, experience, skills"
-        
-    elif mode == "cold_call":
-        # Cold call mode: natural conversation flow
-        speech_model = "experimental_conversations"
-        speech_timeout = "3"
-        gather_timeout = 30
-        
-        # Sales conversation hints
-        hints = "yes, no, interested, not interested, maybe, tell me more, pricing, features, demo"
-        
-    elif mode == "small_talk":
-        # Small talk: casual conversation
-        speech_model = "experimental_conversations"
-        speech_timeout = "2"
-        gather_timeout = 30
-        hints = None  # No specific hints for casual conversation
-        
-    else:
-        # Default/unknown mode
-        speech_model = "experimental_conversations"
-        speech_timeout = "2"
-        gather_timeout = 30
-        hints = None
-    
-    # Build gather parameters
+    # Base gather parameters - optimized for low latency
     gather_params = {
         "input": "speech",
         "action": "/process_speech",
         "method": "POST",
-        "speechTimeout": speech_timeout,
-        "speechModel": speech_model,
-        "enhanced": True,  # Use enhanced model for better accuracy
-        "actionOnEmptyResult": False,
-        "timeout": gather_timeout,
+        "speechTimeout": "auto",  # Let Twilio handle VAD
+        "enhanced": True,
         "profanityFilter": False,
         "partialResultCallback": "/partial_speech",
         "partialResultCallbackMethod": "POST",
-        "language": "en-US"
+        "language": "en-US",
+        "actionOnEmptyResult": True,  # Process even on silence
+        "timeout": 10  # Reduced from 30-60
     }
     
-    # Only add hints if they exist
-    if hints:
-        gather_params["hints"] = hints
+    # Configure based on turn and mode
+    if current_turn == 0:
+        # First turn: expect short command
+        gather_params.update({
+            "speechModel": "experimental_utterances",  # Best for short phrases
+            "hints": "cold call, sales, interview, chat, customer",
+            "speechTimeout": "2",  # Faster detection for commands
+            "timeout": 15
+        })
+        
+    elif mode == "interview":
+        # Interview mode: expect longer answers
+        gather_params.update({
+            "speechModel": "experimental_conversations",
+            "speechTimeout": "auto",  # Let VAD handle natural pauses
+            "timeout": 20,  # Give more time for thoughtful answers
+            "bargeIn": True,  # Allow interruption
+            "hints": "$OPERAND"  # For longer responses
+        })
+        
+    elif mode == "cold_call":
+        # Cold call: natural conversation
+        gather_params.update({
+            "speechModel": "experimental_conversations",
+            "speechTimeout": "auto",
+            "timeout": 15,
+            "bargeIn": True,
+            "hints": "yes, no, interested, maybe, pricing, demo, $OOV_CLASS_FULLPHONENUM"
+        })
+        
+    elif mode == "small_talk":
+        # Casual conversation
+        gather_params.update({
+            "speechModel": "experimental_conversations",
+            "speechTimeout": "auto",
+            "timeout": 12,
+            "bargeIn": True
+        })
+        
+    else:
+        # Unknown/default mode
+        gather_params.update({
+            "speechModel": "experimental_conversations",
+            "speechTimeout": "auto",
+            "timeout": 12
+        })
     
-    # Special handling for interviews - add bargeIn
-    if mode == "interview" and current_turn > 0:
-        gather_params["bargeIn"] = True  # Allow interruption during prompts
-    
-    # Log gather configuration
-    print(f"📊 Gather config: model={speech_model}, speechTimeout={speech_timeout}, timeout={gather_timeout}")
-    if hints:
-        print(f"💡 Hints: {hints[:50]}...")
+    # Log configuration
+    print(f"📊 Gather config: model={gather_params.get('speechModel')}, "
+          f"speechTimeout={gather_params.get('speechTimeout')}, "
+          f"timeout={gather_params.get('timeout')}")
     
     # Execute gather
     try:
         response.gather(**gather_params)
     except Exception as e:
         print(f"💥 Gather error: {e}")
-        # Fallback gather with minimal settings
+        # Minimal fallback
         response.gather(
             input="speech",
             action="/process_speech",
             method="POST",
-            timeout=30
+            timeout=10,
+            speechTimeout="auto"
         )
     
-    # Add a fallback say in case gather times out completely
+    # Fallback if gather completely times out
     response.say("I didn't catch that. Please try again.")
     response.redirect(f"{request.url_root}voice")
     

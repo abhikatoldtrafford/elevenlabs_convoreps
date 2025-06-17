@@ -8,4 +8,5 @@ twilio==9.5.2
 pydub==0.25.1
 elevenlabs==2.3.0
 gunicorn
-websocket
+websockets
+aiofiles 

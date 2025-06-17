@@ -212,25 +212,15 @@ def voice():
         response.play(f"{request.url_root}static/beep.mp3") 
         response.pause(length=2)
 
-    gather_timeout = 10  # Default
-    speech_timeout = 3   # Default
-    if call_sid in mode_lock:
-        if mode_lock[call_sid] == "interview":
-            gather_timeout = 30  # More time for interview answers
-            speech_timeout = 5   # Wait longer for pauses
-        elif mode_lock[call_sid] == "cold_call":
-            gather_timeout = 15
-            speech_timeout = 3
-    
     response.gather(
         input='speech',
         action='/process_speech',
         method='POST',
-        speechTimeout=str(speech_timeout),  # Use variable timeout
+        speechTimeout='2',  # Change from 'auto' to fixed 2 seconds
         speechModel='experimental_conversations',
         enhanced=True,
         actionOnEmptyResult=False,
-        timeout=gather_timeout,  # Use variable timeout
+        timeout=30,  # Increase from 3 to 30 seconds to prevent 499 errors
         profanityFilter=False,
         partialResultCallback='/partial_speech',
         partialResultCallbackMethod='POST',
@@ -337,6 +327,10 @@ async def process_speech():
     """Handle final speech recognition results from Gather"""
     global active_call_sid
     
+    # Set a maximum processing time to avoid 499 errors
+    start_time = time.time()
+    MAX_PROCESSING_TIME = 12  # seconds
+    
     print("✅ /process_speech endpoint hit")
     print(f"  USE_STREAMING: {USE_STREAMING}")
     print(f"  SENTENCE_STREAMING: {SENTENCE_STREAMING}")
@@ -345,9 +339,6 @@ async def process_speech():
     call_sid = request.form.get("CallSid")
     speech_result = request.form.get("SpeechResult", "")
     confidence = request.form.get("Confidence", "0.0")
-    beep_response = VoiceResponse()
-    beep_response.play(f"{request.url_root}static/beep.mp3", loop=3)  # Play beep 3 times
-    beep_response.redirect(f"{request.url_root}voice")
     
     print(f"📝 Final Speech Result: '{speech_result}'")
     print(f"🎯 Confidence: {confidence}")
@@ -356,10 +347,21 @@ async def process_speech():
     # Check if we got any speech
     if not speech_result:
         print("⚠️ No speech detected, redirecting back to voice")
-        return redirect(url_for("voice", _external=True))
+        response = VoiceResponse()
+        response.play(f"{request.url_root}static/beep.mp3")
+        response.redirect(url_for("voice", _external=True))
+        return str(response)
     
     # Use the speech result as the transcript
     transcript = speech_result.strip()
+    
+    # If we're taking too long already, send an early response to prevent timeout
+    if time.time() - start_time > 10:
+        print("⚠️ Processing taking too long, sending early response")
+        response = VoiceResponse()
+        response.say("Just a moment please...")
+        response.redirect(url_for("voice", _external=True))
+        return str(response)
     
     # Reset memory for new calls
     if call_sid != active_call_sid:
@@ -454,8 +456,8 @@ async def process_speech():
             {"voice_id": "EXAVITQu4vr4xnSDxMaL", "name": "Clyde"},
             {"voice_id": "6YQMyaUWlj0VX652cY1C", "name": "Stephen"}
         ]
-        
-        # Check if we already have a voice assigned
+
+        # Check if we already have a voice assigned for consistency
         if call_sid not in personality_memory:
             voice_choice = random.choice(interview_voice_pool)
             personality_memory[call_sid] = voice_choice
@@ -538,21 +540,28 @@ async def process_speech():
             else:
                 print(f"   [{i}] INVALID: {msg}")
 
-        # Get GPT response
-        try:
-            if USE_STREAMING:
-                reply = await streaming_gpt_response(messages, voice_id, call_sid)
-            else:
-                gpt_reply = sync_openai.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=messages
-                )
-                reply = gpt_reply.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"💥 GPT error: {e}")
-            # Fallback response
-            reply = "I'm having a bit of trouble understanding. Could you say that again?"
-            
+        # Check if we're close to timeout before GPT call
+        if time.time() - start_time > MAX_PROCESSING_TIME - 3:
+            print("⚠️ Near timeout, using quick response")
+            reply = "Let me think about that for a moment."
+        else:
+            # Get GPT response
+            try:
+                if USE_STREAMING:
+                    reply = await streaming_gpt_response(messages, voice_id, call_sid)
+                else:
+                    gpt_reply = sync_openai.chat.completions.create(
+                        model="gpt-3.5-turbo",
+                        messages=messages,
+                        temperature=0.7,
+                        max_tokens=150  # Limit response length for speed
+                    )
+                    reply = gpt_reply.choices[0].message.content.strip()
+            except Exception as e:
+                print(f"💥 GPT error: {e}")
+                # Fallback response
+                reply = "I'm having a bit of trouble understanding. Could you say that again?"
+                
         # Clean up response
         reply = reply.replace("*", "").replace("_", "").replace("`", "").replace("#", "").replace("-", " ")
         conversation_history[call_sid].append({"role": "assistant", "content": reply})
@@ -560,76 +569,99 @@ async def process_speech():
     print(f"🔣 Generating voice with ID: {voice_id}")
     print(f"🗣️ Reply: {reply[:100]}...")
     
-    # Generate TTS
-    if USE_STREAMING and SENTENCE_STREAMING and turn > 0 and os.path.exists(f"static/response_{call_sid}.mp3"):
-        # Audio already generated by streaming_gpt_response
-        print(f"✅ Audio already generated via sentence streaming for {call_sid}")
-    else:
-        # Generate TTS (streaming or non-streaming)
-        try:
-            audio_gen = elevenlabs_client.text_to_speech.convert(
-                voice_id=voice_id,
-                text=reply,
-                model_id="eleven_monolingual_v1",
-                output_format="mp3_22050_32"
-            )
-            raw_audio = b""
-            for chunk in audio_gen:
-                if chunk:
-                    raw_audio += chunk
-            
-            output_path = f"static/response_{call_sid}.mp3"
-            with open(output_path, "wb") as f:
-                f.write(raw_audio)
-                f.flush()
-            print(f"✅ Audio saved to {output_path} ({len(raw_audio)} bytes)")
-                
-        except Exception as e:
-            print(f"🛑 ElevenLabs generation error: {e}")
-            if "429" in str(e):  # Too Many Requests
-                print("🔁 Retrying after brief pause due to rate limit...")
-                await asyncio.sleep(2)
-                try:
-                    if USE_STREAMING:
-                        raw_audio = await generate_tts_streaming(reply, voice_id)
-                    else:
-                        raw_audio = elevenlabs_client.text_to_speech.convert(
-                            voice_id=voice_id,
-                            text=reply,
-                            model_id="eleven_monolingual_v1",
-                            output_format="mp3_22050_32"
-                        )
-                        
-                    output_path = f"static/response_{call_sid}.mp3"
-                    with open(output_path, "wb") as f:
-                        f.write(raw_audio)
-                    print("✅ Retry succeeded")
-                except Exception as e2:
-                    print(f"❌ Retry failed: {e2}")
-                    fallback_path = "static/fallback.mp3"
-                    if os.path.exists(fallback_path):
-                        os.system(f"cp {fallback_path} static/response_{call_sid}.mp3")
-                        
-                        with open(f"static/response_ready_{call_sid}.txt", "w") as f:
-                            f.write("ready")
-                        print("⚠️ Fallback MP3 used.")
-                        return redirect(url_for("voice", _external=True))
-                    else:
-                        return "ElevenLabs error and no fallback available", 500
+    # Generate TTS with timeout protection
+    output_path = f"static/response_{call_sid}.mp3"
     
-    # Ensure ready flag is always created
+    # Check if we're close to timeout
+    if time.time() - start_time > MAX_PROCESSING_TIME - 2:
+        print("⚠️ Near timeout, using fallback audio")
+        fallback_path = "static/fallback.mp3"
+        if os.path.exists(fallback_path):
+            os.system(f"cp {fallback_path} {output_path}")
+        else:
+            # Create a very quick TTS response
+            try:
+                quick_gen = elevenlabs_client.text_to_speech.convert(
+                    voice_id=voice_id,
+                    text="Just a moment.",
+                    model_id="eleven_turbo_v2_5",
+                    output_format="mp3_22050_32"
+                )
+                raw_audio = b""
+                for chunk in quick_gen:
+                    if chunk:
+                        raw_audio += chunk
+                with open(output_path, "wb") as f:
+                    f.write(raw_audio)
+            except:
+                pass
+    else:
+        # Normal TTS generation
+        if USE_STREAMING and SENTENCE_STREAMING and turn > 0 and os.path.exists(output_path):
+            # Audio already generated by streaming_gpt_response
+            print(f"✅ Audio already generated via sentence streaming for {call_sid}")
+        else:
+            # Generate TTS (streaming or non-streaming)
+            try:
+                audio_gen = elevenlabs_client.text_to_speech.convert(
+                    voice_id=voice_id,
+                    text=reply,
+                    model_id="eleven_turbo_v2_5" if USE_STREAMING else "eleven_monolingual_v1",
+                    output_format="mp3_22050_32"
+                )
+                raw_audio = b""
+                for chunk in audio_gen:
+                    if chunk:
+                        raw_audio += chunk
+                
+                with open(output_path, "wb") as f:
+                    f.write(raw_audio)
+                    f.flush()
+                print(f"✅ Audio saved to {output_path} ({len(raw_audio)} bytes)")
+                    
+            except Exception as e:
+                print(f"🛑 ElevenLabs generation error: {e}")
+                if "429" in str(e):  # Too Many Requests
+                    print("🔁 Retrying after brief pause due to rate limit...")
+                    await asyncio.sleep(2)
+                    try:
+                        if USE_STREAMING:
+                            raw_audio = await generate_tts_streaming(reply, voice_id)
+                        else:
+                            audio_gen = elevenlabs_client.text_to_speech.convert(
+                                voice_id=voice_id,
+                                text=reply,
+                                model_id="eleven_monolingual_v1",
+                                output_format="mp3_22050_32"
+                            )
+                            raw_audio = b""
+                            for chunk in audio_gen:
+                                if chunk:
+                                    raw_audio += chunk
+                            
+                        with open(output_path, "wb") as f:
+                            f.write(raw_audio)
+                        print("✅ Retry succeeded")
+                    except Exception as e2:
+                        print(f"❌ Retry failed: {e2}")
+                        fallback_path = "static/fallback.mp3"
+                        if os.path.exists(fallback_path):
+                            os.system(f"cp {fallback_path} {output_path}")
+    
+    # Always create ready flag after audio is saved
     with open(f"static/response_ready_{call_sid}.txt", "w") as f:
         f.write("ready")
     print(f"🚩 Ready flag created for {call_sid}")
 
     # Schedule cleanup
-    # cleanup_thread = threading.Thread(target=delayed_cleanup, args=(call_sid,))
-    # cleanup_thread.start()
+    cleanup_thread = threading.Thread(target=delayed_cleanup, args=(call_sid,))
+    cleanup_thread.start()
+
+    # Play a beep before the AI response
     response = VoiceResponse()
     response.play(f"{request.url_root}static/beep.mp3")
     response.redirect(url_for("voice", _external=True))
     return str(response)
-
 async def streaming_transcribe(audio_file_path: str) -> str:
     """Transcription with streaming control"""
     try:

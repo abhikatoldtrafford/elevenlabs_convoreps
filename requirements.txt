@@ -1,12 +1,34 @@
+# Core Flask and WebSocket support
 Flask==3.1.0
 flask-cors==5.0.1
 flask-sock==0.7.0
-openai==1.72.0
-requests==2.32.3
-python-dotenv==1.1.0
+gevent==24.2.1
+gevent-websocket==0.10.1
+
+# Twilio
 twilio==9.5.2
-pydub==0.25.1
+
+# OpenAI
+openai==1.72.0
+
+# ElevenLabs
 elevenlabs==2.3.0
+
+# Audio processing
+pydub==0.25.1
+numpy==1.26.3
+
+# Async support
+aiofiles==24.3.0
+websockets==13.1
+
+# Environment and utilities
+python-dotenv==1.1.0
+requests==2.32.3
+
+# Production server
 gunicorn
-websockets
-aiofiles 
+
+# For better WebSocket performance
+websocket-client==1.7.0
+simple-websocket==1.0.0

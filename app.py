@@ -540,13 +540,16 @@ def error_handler(f):
             return str(response)
     return wrapper
 def async_route(f):
-    """Production-ready async route decorator"""
+    """Decorator to run async functions in Flask"""
     @wraps(f)
     def wrapper(*args, **kwargs):
-        # Use asyncio.run() which properly manages the event loop
-        return asyncio.run(f(*args, **kwargs))
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(f(*args, **kwargs))
+        finally:
+            loop.close()
     return wrapper
-
 @app.route("/static/<path:filename>")
 def static_files(filename):
     return send_from_directory("static", filename)

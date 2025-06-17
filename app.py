@@ -90,23 +90,23 @@ personality_profiles = {
 cold_call_personality_pool = {
     "Jerry": {
         "voice_id": "1t1EeRixsJrKbiF1zwM6",
-        "system_prompt": "You're Jerry. You're a skeptical small business owner who's been burned by vendors in the past. You're not rude, but you're direct and hard to win over. Respond naturally based on how the call starts — maybe this is a cold outreach, maybe a follow-up, or even someone calling you with bad news. Stay in character. If the salesperson fumbles, challenge them. If they're smooth, open up a bit. Speak casually, not like a script."
+        "system_prompt": "You're Jerry. You're a skeptical small business owner who's been burned by vendors in the past. You're not rude, but you're direct and hard to win over. Respond naturally based on how the call starts — maybe this is a cold outreach, maybe a follow-up, or even someone calling you with bad news. Stay in character. If the salesperson fumbles, challenge them. If they're smooth, open up a bit. Speak casually, not like a script. Keep responses SHORT - 1-2 sentences max unless truly needed."
     },
     "Miranda": {
         "voice_id": "Ax1GP2W4XTyAyNHuch7v",
-        "system_prompt": "You're Miranda. You're a busy office manager who doesn't have time for fluff. If the caller is clear and respectful, you'll hear them out. Respond naturally depending on how they open — this could be a cold call, a follow-up, or someone delivering news. Keep your tone grounded and real. Interrupt if needed. No robotic replies — talk like a real person at work."
+        "system_prompt": "You're Miranda. You're a busy office manager who doesn't have time for fluff. If the caller is clear and respectful, you'll hear them out. Respond naturally depending on how they open — this could be a cold call, a follow-up, or someone delivering news. Keep your tone grounded and real. Interrupt if needed. No robotic replies — talk like a real person at work. Keep responses SHORT - 1-2 sentences max."
     },
     "Junior": {
         "voice_id": "Nbttze9nhGhK1czblc6j",
-        "system_prompt": "You're Junior. You run a local shop and have heard it all. You're friendly but not easily impressed. Start skeptical, but if the caller handles things well, loosen up. Whether this is a pitch, a follow-up, or some kind of check-in, reply naturally. Use casual language. If something sounds off, call it out. You don't owe anyone your time — but you're not a jerk either."
+        "system_prompt": "You're Junior. You run a local shop and have heard it all. You're friendly but not easily impressed. Start skeptical, but if the caller handles things well, loosen up. Whether this is a pitch, a follow-up, or some kind of check-in, reply naturally. Use casual language. If something sounds off, call it out. You don't owe anyone your time — but you're not a jerk either. Keep responses SHORT - 1-2 sentences."
     },
     "Brett": {
         "voice_id": "7eFTSJ6WtWd9VCU4ZlI1",
-        "system_prompt": "You're Brett. You're a contractor who answers his phone mid-job. You're busy and a little annoyed this person called. If they're direct and helpful, give them a minute. If they ramble, shut it down. This could be a pitch, a check-in, or someone following up on a proposal. React based on how they start the convo. Talk rough, fast, and casual. No fluff, no formalities."
+        "system_prompt": "You're Brett. You're a contractor who answers his phone mid-job. You're busy and a little annoyed this person called. If they're direct and helpful, give them a minute. If they ramble, shut it down. This could be a pitch, a check-in, or someone following up on a proposal. React based on how they start the convo. Talk rough, fast, and casual. No fluff, no formalities. Keep responses SHORT."
     },
     "Kayla": {
         "voice_id": "aTxZrSrp47xsP6Ot4Kgd",
-        "system_prompt": "You're Kayla. You own a business and don't waste time. You've had too many bad sales calls and follow-ups from people who don't know how to close. Respond based on how they open — if it's a pitch, hit them with price objections. If it's a follow-up, challenge their urgency. Keep your tone sharp but fair. You don't sugarcoat things, and you don't fake interest."
+        "system_prompt": "You're Kayla. You own a business and don't waste time. You've had too many bad sales calls and follow-ups from people who don't know how to close. Respond based on how they open — if it's a pitch, hit them with price objections. If it's a follow-up, challenge their urgency. Keep your tone sharp but fair. You don't sugarcoat things, and you don't fake interest. Keep responses VERY SHORT - 1-2 sentences only."
     }
 }
 
@@ -128,28 +128,35 @@ class StreamingSpeechProcessor:
     def __init__(self, call_sid):
         self.call_sid = call_sid
         self.audio_buffer = b''
-        self.silence_threshold = 0.8  # seconds
+        self.silence_threshold = 1.5  # Increased from 0.8 seconds
         self.last_speech_time = time.time()
-        self.min_speech_length = 0.5  # minimum speech length in seconds
+        self.min_speech_length = 0.3  # Decreased from 0.5 seconds
+        self.silence_start_time = None
+        self.speech_detected = False
         
     def add_audio(self, audio_chunk):
         """Add audio chunk to buffer"""
         self.audio_buffer += audio_chunk
         
-        # Simple VAD based on audio energy
-        if self.detect_speech_end():
-            complete_audio = self.audio_buffer
-            self.audio_buffer = b''
-            return complete_audio
+        # Check if we have enough audio for processing
+        if len(self.audio_buffer) >= 160:  # At least 20ms of audio
+            # Simple VAD based on audio energy
+            if self.detect_speech_end():
+                complete_audio = self.audio_buffer
+                self.audio_buffer = b''
+                self.silence_start_time = None
+                self.speech_detected = False
+                return complete_audio
         return None
         
     def detect_speech_end(self):
-        """Simple silence detection"""
-        if len(self.audio_buffer) < 8000:  # Less than 1 second
+        """Improved silence detection"""
+        if len(self.audio_buffer) < 2400:  # Less than 300ms (min speech length)
             return False
             
-        # Check last 400ms for silence
-        last_chunk = self.audio_buffer[-3200:]
+        # Check last 800ms for silence
+        check_size = min(6400, len(self.audio_buffer))
+        last_chunk = self.audio_buffer[-check_size:]
         
         # Calculate RMS (root mean square) for silence detection
         if audioop:
@@ -159,9 +166,22 @@ class StreamingSpeechProcessor:
             audio_array = np.frombuffer(last_chunk, dtype=np.uint8)
             rms = np.sqrt(np.mean(audio_array**2))
         
-        # If silence detected and enough audio accumulated
-        if rms < 500 and len(self.audio_buffer) > 4000:
+        # Speech detection
+        if rms > 800:  # Increased threshold for speech detection
+            self.speech_detected = True
+            self.silence_start_time = None
+            self.last_speech_time = time.time()
+        elif self.speech_detected and rms < 500:  # Silence after speech
+            if self.silence_start_time is None:
+                self.silence_start_time = time.time()
+            elif time.time() - self.silence_start_time > self.silence_threshold:
+                # Enough silence detected after speech
+                return True
+        
+        # Timeout protection - if buffer is too large, process it
+        if len(self.audio_buffer) > 80000:  # 10 seconds of audio
             return True
+            
         return False
 
 def error_handler(f):
@@ -242,10 +262,20 @@ def media_stream(ws):
     stream_sid = None
     call_sid = None
     speech_processor = None
+    last_keepalive = time.time()
     
     try:
         while True:
-            message = ws.receive()
+            # Set timeout for receive to handle keepalive
+            try:
+                message = ws.receive(timeout=1.0)
+            except:
+                # Check if we need to send keepalive
+                if time.time() - last_keepalive > 15:
+                    ws.send(json.dumps({"event": "keepalive"}))
+                    last_keepalive = time.time()
+                continue
+                
             if message is None:
                 break
                 
@@ -266,28 +296,40 @@ def media_stream(ws):
                     'processing': False,
                     'speech_processor': StreamingSpeechProcessor(call_sid),
                     'last_activity': time.time(),
-                    'mark_received': set()
+                    'mark_received': set(),
+                    'is_speaking': False,
+                    'last_response_time': 0
                 }
                 
                 speech_processor = active_streams[call_sid]['speech_processor']
                 
                 print(f"🎤 Stream started - CallSid: {call_sid}, StreamSid: {stream_sid}")
                 
-                # Send initial response after beep if first turn
-                if turn_count.get(call_sid, 0) == 0:
-                    # Use executor to run async function
-                    executor.submit(run_async_task, send_initial_response(call_sid, stream_sid))
+                # Don't send initial response - wait for user to speak first
                 
             elif event_type == 'media':
                 if call_sid and call_sid in active_streams:
+                    # Update last activity
+                    active_streams[call_sid]['last_activity'] = time.time()
+                    
+                    # Skip processing if bot is speaking
+                    if active_streams[call_sid].get('is_speaking', False):
+                        continue
+                    
                     # Decode the audio chunk
                     audio_chunk = base64.b64decode(data['media']['payload'])
                     
                     # Add to speech processor
                     complete_audio = speech_processor.add_audio(audio_chunk)
                     
-                    if complete_audio:
+                    if complete_audio and not active_streams[call_sid]['processing']:
+                        # Prevent rapid-fire responses
+                        current_time = time.time()
+                        if current_time - active_streams[call_sid].get('last_response_time', 0) < 1.0:
+                            continue
+                            
                         # Process complete utterance in background
+                        active_streams[call_sid]['last_response_time'] = current_time
                         executor.submit(run_async_task, 
                             process_complete_utterance(call_sid, stream_sid, complete_audio))
                         
@@ -297,6 +339,11 @@ def media_stream(ws):
                     mark_name = data['mark'].get('name')
                     active_streams[call_sid]['mark_received'].add(mark_name)
                     print(f"✓ Mark received: {mark_name}")
+                    
+                    # Check if all marks received for current response
+                    if mark_name and mark_name.startswith('sentence_'):
+                        # Bot finished speaking this sentence
+                        active_streams[call_sid]['is_speaking'] = False
                     
             elif event_type == 'stop':
                 print(f"🛑 Stream stopped - CallSid: {call_sid}")
@@ -327,32 +374,8 @@ def run_async_task(coro):
         loop.close()
 
 async def send_initial_response(call_sid, stream_sid):
-    """Send initial response based on mode"""
-    await asyncio.sleep(0.5)  # Brief pause after beep
-    
-    # Get initial greeting based on turn
-    turn = turn_count.get(call_sid, 0)
-    if turn == 0:
-        # First interaction - let user speak first but prepare greeting
-        initial_text = None
-        
-        # Check if we have a mode set
-        mode = mode_lock.get(call_sid)
-        if mode == "interview":
-            initial_text = "Great, let's jump in! Can you walk me through your most recent role and responsibilities?"
-        elif mode == "small_talk": 
-            initial_text = "Yo yo yo, how's it goin'?"
-        # For cold_call, let the user start
-            
-        if initial_text:
-            await stream_tts_response(call_sid, stream_sid, initial_text)
-            # Update conversation history
-            if call_sid not in conversation_history:
-                conversation_history[call_sid] = []
-            conversation_history[call_sid].append({
-                "role": "assistant",
-                "content": initial_text
-            })
+    """Send initial response based on mode - REMOVED to prevent auto-talking"""
+    pass  # Don't send anything initially
 
 async def process_complete_utterance(call_sid, stream_sid, audio_data):
     """Process a complete speech utterance"""
@@ -369,13 +392,24 @@ async def process_complete_utterance(call_sid, stream_sid, audio_data):
         # Transcribe
         transcript = await transcribe_audio(audio_pcm)
         
-        if transcript and len(transcript.strip()) > 0:
+        if transcript and len(transcript.strip()) > 1:  # Ignore single character transcripts
             print(f"📝 Transcript: {transcript}")
+            
+            # Filter out noise/spam transcripts
+            if any(spam in transcript.lower() for spam in [
+                "beadaholique.com", "go to", ".com", "www.", "http",
+                "woof woof", "bark bark", "meow", "click here"
+            ]):
+                print("🚫 Ignoring spam/noise transcript")
+                return
             
             # Check for reset command
             if "let's start over" in transcript.lower():
                 await handle_reset(call_sid, stream_sid)
                 return
+                
+            # Mark bot as speaking before generating response
+            active_streams[call_sid]['is_speaking'] = True
                 
             # Process and generate response
             response = await generate_response(call_sid, transcript)
@@ -388,6 +422,7 @@ async def process_complete_utterance(call_sid, stream_sid, audio_data):
     finally:
         if call_sid in active_streams:
             active_streams[call_sid]['processing'] = False
+            # Will be set to False when marks are received
 
 async def handle_reset(call_sid, stream_sid):
     """Handle reset command"""
@@ -427,6 +462,10 @@ async def generate_response(call_sid, transcript):
         "content": transcript
     })
     
+    # Limit conversation history to last 10 messages to prevent context overflow
+    if len(conversation_history[call_sid]) > 10:
+        conversation_history[call_sid] = conversation_history[call_sid][-10:]
+    
     # Get personality and prompt
     voice_id, system_prompt, intro_line = get_personality_for_mode(call_sid, mode)
     
@@ -447,7 +486,7 @@ async def generate_response(call_sid, transcript):
             model="gpt-4.1-nano",
             messages=messages,
             temperature=0.7,
-            max_tokens=150,
+            max_tokens=60,  # Reduced from 150 to keep responses shorter
             stream=True
         )
         
@@ -460,6 +499,11 @@ async def generate_response(call_sid, transcript):
         # Clean response
         reply = clean_response_text(full_response)
         
+        # Further truncate if too long
+        sentences = re.split(r'(?<=[.!?])\s+', reply)
+        if len(sentences) > 2:
+            reply = ' '.join(sentences[:2])
+        
         # Store in history
         conversation_history[call_sid].append({
             "role": "assistant",
@@ -470,7 +514,7 @@ async def generate_response(call_sid, transcript):
         
     except Exception as e:
         print(f"💥 GPT error: {e}")
-        return "I'm having trouble understanding. Could you say that again?"
+        return "I didn't catch that. Could you repeat?"
 
 def detect_intent(text):
     """Detect conversation intent"""
@@ -496,12 +540,11 @@ def add_bad_news_context(messages, transcript):
     """Add context for bad news response"""
     escalation_prompt = (
         "The user just delivered bad news to the customer. Respond as the customer based on your personality, "
-        "but crank up the emotion. If it fits your persona, act furious — like you're raising your voice. "
-        "You can use strong language (not profane), interruptions, and frustration. Show that this ruined your day."
+        "but show reasonable frustration. Keep response SHORT - 1-2 sentences max. Don't overreact."
     )
     
     if any(x in transcript.lower() for x in ["calm down", "relax", "it's not my fault"]):
-        escalation_prompt += " The user got defensive, so now you're even more upset."
+        escalation_prompt += " The user got defensive, so you're more upset but still brief."
         
     messages.insert(0, {"role": "system", "content": escalation_prompt})
     return messages
@@ -519,7 +562,7 @@ def get_personality_for_mode(call_sid, mode):
         return (
             persona["voice_id"],
             persona["system_prompt"],
-            "Alright, I'll be your customer. Start the conversation however you want."
+            "Hello?"  # Simple greeting instead of long intro
         )
         
     elif mode == "interview":
@@ -538,20 +581,20 @@ def get_personality_for_mode(call_sid, mode):
         system_prompt = (
             f"You are {voice_choice['name']}, a friendly, conversational job interviewer. "
             "Ask one interview question at a time, give supportive feedback. "
-            "Keep your tone upbeat and natural."
+            "Keep your tone upbeat and natural. Keep responses SHORT - 1-2 sentences."
         )
         
         return (
             voice_choice["voice_id"],
             system_prompt,
-            "Great, let's jump in! Can you walk me through your most recent role?"
+            "Great, let's start. Tell me about yourself."
         )
         
     else:  # small_talk
         return (
             "2BJW5coyhAzSr8STdHbE",
-            "You're a casual, sarcastic friend. Keep it light, keep it fun.",
-            "Yo yo yo, how's it goin'?"
+            "You're a casual, sarcastic friend. Keep it light, keep it fun. SHORT responses only - 1-2 sentences max.",
+            "Hey, what's up?"
         )
 
 def clean_response_text(text):
@@ -571,6 +614,11 @@ async def stream_tts_response(call_sid, stream_sid, text):
     
     # Split text into sentences for faster streaming
     sentences = re.split(r'(?<=[.!?])\s+', text)
+    
+    # Limit sentences to prevent over-talking
+    sentences = sentences[:3]  # Max 3 sentences per response
+    
+    total_sentences = len([s for s in sentences if s.strip()])
     
     for i, sentence in enumerate(sentences):
         if sentence.strip():
@@ -645,6 +693,18 @@ async def stream_tts_response(call_sid, stream_sid, text):
                     }
                 }
                 ws.send(json.dumps(mark_message))
+                
+                # If this is the last sentence, add end marker
+                if i == total_sentences - 1:
+                    await asyncio.sleep(0.1)
+                    end_mark = {
+                        "event": "mark",
+                        "streamSid": stream_sid,
+                        "mark": {
+                            "name": "response_end"
+                        }
+                    }
+                    ws.send(json.dumps(end_mark))
                 
                 print(f"✅ Sent {chunk_count} audio chunks for sentence {i}")
                 

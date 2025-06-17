@@ -1,3 +1,24 @@
+"""
+ConvoReps WebSocket Edition
+Real-time voice conversation practice using Twilio Media Streams
+
+Features:
+- Bidirectional WebSocket streaming for ultra-low latency
+- Multiple conversation modes (cold calling, interviews, small talk)
+- Dynamic AI personalities with different voices
+- Real-time speech processing and interruption handling
+- GPT-4.1-nano for natural conversations
+- ElevenLabs streaming TTS
+
+Author: ConvoReps Team
+Version: 2.0 (WebSocket)
+"""
+
+import sys
+if sys.version_info < (3, 8):
+    print("❌ Python 3.8+ required")
+    sys.exit(1)
+
 import os
 import io
 import json
@@ -190,8 +211,21 @@ def voice():
     
     # Start bidirectional stream
     connect = Connect()
+    
+    # Build WebSocket URL properly
+    if request.is_secure:
+        ws_scheme = "wss"
+    else:
+        ws_scheme = "ws"
+    
+    # Handle potential proxy headers
+    host = request.headers.get('X-Forwarded-Host', request.host)
+    
+    stream_url = f"{ws_scheme}://{host}/media-stream"
+    print(f"🔗 Stream URL: {stream_url}")
+    
     stream = Stream(
-        url=f"wss://{request.host}/media-stream",
+        url=stream_url,
         name="convoreps_stream"
     )
     connect.append(stream)
@@ -270,6 +304,9 @@ def media_stream(ws):
                 
     except Exception as e:
         print(f"💥 WebSocket error: {e}")
+        print(f"   Error type: {type(e).__name__}")
+        print(f"   Call SID: {call_sid}")
+        print(f"   Stream SID: {stream_sid}")
         import traceback
         traceback.print_exc()
     finally:

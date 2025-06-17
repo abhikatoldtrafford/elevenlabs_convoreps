@@ -18,7 +18,13 @@ from flask_sock import Sock
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 from dotenv import load_dotenv
 from pydub import AudioSegment
-import audioop
+
+# Try to import audioop, use fallback if not available
+try:
+    import audioop
+except ImportError:
+    print("⚠️ audioop not available, using pydub for audio conversion")
+    audioop = None
 
 from openai import OpenAI, AsyncOpenAI
 from elevenlabs import VoiceSettings
@@ -123,7 +129,14 @@ class StreamingSpeechProcessor:
             
         # Check last 400ms for silence
         last_chunk = self.audio_buffer[-3200:]
-        rms = audioop.rms(last_chunk, 1)
+        
+        # Calculate RMS (root mean square) for silence detection
+        if audioop:
+            rms = audioop.rms(last_chunk, 1)
+        else:
+            # Manual RMS calculation
+            audio_array = np.frombuffer(last_chunk, dtype=np.uint8)
+            rms = np.sqrt(np.mean(audio_array**2))
         
         # If silence detected and enough audio accumulated
         if rms < 500 and len(self.audio_buffer) > 4000:
@@ -154,15 +167,16 @@ def voice():
     # Initialize turn count
     if call_sid not in turn_count:
         turn_count[call_sid] = 0
+        print(f"🔢 Initialized turn count for {call_sid}")
     
     response = VoiceResponse()
     
-    # Check if first time caller
+    # Check if first time caller (only play greeting on very first turn)
     if turn_count[call_sid] == 0 and not session.get("has_called_before"):
         session["has_called_before"] = True
         greeting_file = "first_time_greeting.mp3"
         print("👋 New caller detected — playing first-time greeting.")
-    elif turn_count[call_sid] == 0:
+    elif turn_count[call_sid] == 0 and session.get("has_called_before"):
         greeting_file = "returning_user_greeting.mp3"
         print("🔁 Returning caller — playing returning greeting.")
     else:
@@ -625,16 +639,28 @@ async def transcribe_audio(audio_pcm):
 def convert_mulaw_to_pcm(mulaw_data):
     """Convert 8kHz mulaw to 16kHz PCM for Whisper"""
     try:
-        # Decode mulaw to linear PCM
-        pcm_data = audioop.ulaw2lin(mulaw_data, 2)
-        
-        # Create audio segment
-        audio = AudioSegment(
-            data=pcm_data,
-            sample_width=2,
-            frame_rate=8000,
-            channels=1
-        )
+        if audioop:
+            # Use audioop if available
+            pcm_data = audioop.ulaw2lin(mulaw_data, 2)
+            
+            # Create audio segment
+            audio = AudioSegment(
+                data=pcm_data,
+                sample_width=2,
+                frame_rate=8000,
+                channels=1
+            )
+        else:
+            # Use pydub's built-in conversion
+            audio = AudioSegment.from_file(
+                io.BytesIO(mulaw_data),
+                format="mulaw",
+                frame_rate=8000,
+                channels=1,
+                sample_width=1
+            )
+            # Convert to PCM
+            audio = audio.set_sample_width(2)
         
         # Resample to 16kHz
         audio = audio.set_frame_rate(16000)
@@ -658,9 +684,15 @@ def convert_to_mulaw(audio_data):
         # Resample to 8kHz
         audio = audio.set_frame_rate(8000)
         
-        # Convert to mulaw
-        pcm_data = audio.raw_data
-        mulaw_data = audioop.lin2ulaw(pcm_data, 2)
+        if audioop:
+            # Convert to mulaw using audioop
+            pcm_data = audio.raw_data
+            mulaw_data = audioop.lin2ulaw(pcm_data, 2)
+        else:
+            # Export as mulaw using pydub
+            buffer = io.BytesIO()
+            audio.export(buffer, format="mulaw")
+            mulaw_data = buffer.getvalue()
         
         return mulaw_data
     except Exception as e:

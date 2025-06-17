@@ -35,12 +35,7 @@ CORS(app)
 # Initialize WebSocket support
 sock = Sock(app)
 
-# Configure WebSocket settings
-app.config['SOCK_SERVER_OPTIONS'] = {
-    'ping_interval': 25,
-    'ping_timeout': 120,
-    'max_size': 2**20  # 1MB max message size
-}
+# Configure WebSocket settings (removed incompatible options for flask-sock 0.7.0)
 
 # Initialize API clients
 sync_openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -199,7 +194,6 @@ def media_stream(ws):
     stream_sid = None
     call_sid = None
     speech_processor = None
-    processing_task = None
     
     try:
         while True:
@@ -224,7 +218,6 @@ def media_stream(ws):
                     'processing': False,
                     'speech_processor': StreamingSpeechProcessor(call_sid),
                     'last_activity': time.time(),
-                    'audio_queue': asyncio.Queue(),
                     'mark_received': set()
                 }
                 
@@ -232,13 +225,10 @@ def media_stream(ws):
                 
                 print(f"🎤 Stream started - CallSid: {call_sid}, StreamSid: {stream_sid}")
                 
-                # Start async processing task
-                processing_task = asyncio.create_task(
-                    process_stream_continuously(call_sid, stream_sid)
-                )
-                
-                # Send initial response after beep
-                asyncio.create_task(send_initial_response(call_sid, stream_sid))
+                # Send initial response after beep if first turn
+                if turn_count.get(call_sid, 0) == 0:
+                    # Use executor to run async function
+                    executor.submit(run_async_task, send_initial_response(call_sid, stream_sid))
                 
             elif event_type == 'media':
                 if call_sid and call_sid in active_streams:
@@ -249,10 +239,9 @@ def media_stream(ws):
                     complete_audio = speech_processor.add_audio(audio_chunk)
                     
                     if complete_audio:
-                        # Process complete utterance
-                        asyncio.create_task(
-                            process_complete_utterance(call_sid, stream_sid, complete_audio)
-                        )
+                        # Process complete utterance in background
+                        executor.submit(run_async_task, 
+                            process_complete_utterance(call_sid, stream_sid, complete_audio))
                         
             elif event_type == 'mark':
                 # Track mark events for audio playback completion
@@ -271,22 +260,39 @@ def media_stream(ws):
         traceback.print_exc()
     finally:
         # Cleanup
-        if processing_task:
-            processing_task.cancel()
         if call_sid in active_streams:
             del active_streams[call_sid]
         if call_sid in turn_count:
             turn_count[call_sid] = 0
 
+# Helper function to run async tasks
+def run_async_task(coro):
+    """Run async coroutine in new event loop"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
 async def send_initial_response(call_sid, stream_sid):
     """Send initial response based on mode"""
     await asyncio.sleep(0.5)  # Brief pause after beep
     
-    # Determine initial response
+    # Get initial greeting based on turn
     turn = turn_count.get(call_sid, 0)
     if turn == 0:
-        # First turn - send appropriate greeting
-        initial_text = get_initial_greeting(call_sid)
+        # First interaction - let user speak first but prepare greeting
+        initial_text = None
+        
+        # Check if we have a mode set
+        mode = mode_lock.get(call_sid)
+        if mode == "interview":
+            initial_text = "Great, let's jump in! Can you walk me through your most recent role and responsibilities?"
+        elif mode == "small_talk": 
+            initial_text = "Yo yo yo, how's it goin'?"
+        # For cold_call, let the user start
+            
         if initial_text:
             await stream_tts_response(call_sid, stream_sid, initial_text)
             # Update conversation history
@@ -331,26 +337,6 @@ async def process_complete_utterance(call_sid, stream_sid, audio_data):
     finally:
         if call_sid in active_streams:
             active_streams[call_sid]['processing'] = False
-
-async def process_stream_continuously(call_sid, stream_sid):
-    """Continuous processing task for the stream"""
-    try:
-        while call_sid in active_streams:
-            # Check for timeouts or other conditions
-            if time.time() - active_streams[call_sid]['last_activity'] > 300:
-                print(f"⏱️ Stream timeout for {call_sid}")
-                break
-                
-            await asyncio.sleep(0.1)
-            
-    except asyncio.CancelledError:
-        print(f"🛑 Processing task cancelled for {call_sid}")
-
-def get_initial_greeting(call_sid):
-    """Get initial greeting based on mode detection"""
-    # This would be called on first interaction
-    # For now, return None to let the user speak first
-    return None
 
 async def handle_reset(call_sid, stream_sid):
     """Handle reset command"""
@@ -718,14 +704,5 @@ if __name__ == "__main__":
     print("   ✓ GPT-4.1-nano for conversations")
     print("\n")
     
-    # Run with production WSGI server for better WebSocket support
-    try:
-        from gevent import pywsgi
-        from geventwebsocket.handler import WebSocketHandler
-        server = pywsgi.WSGIServer(('0.0.0.0', 5050), app, handler_class=WebSocketHandler)
-        print("🟢 Starting server on port 5050 with gevent...")
-        server.serve_forever()
-    except ImportError:
-        # Fallback to Flask development server
-        print("⚠️  Running in development mode. Install gevent for production.")
-        app.run(host="0.0.0.0", port=5050, debug=True)
+    # Run with Flask's built-in server (flask-sock handles WebSocket upgrade)
+    app.run(host="0.0.0.0", port=5050, debug=False)

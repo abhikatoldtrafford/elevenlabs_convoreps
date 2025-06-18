@@ -33,7 +33,7 @@ from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import numpy as np
-
+from twilio.request_validator import RequestValidator
 from flask import Flask, request, Response, session, send_from_directory
 from flask_cors import CORS
 from flask_sock import Sock
@@ -115,82 +115,89 @@ interview_questions = [
     "How do you handle feedback and criticism?",
     "Do you have any questions for me about the company or the role?"
 ]
+def periodic_cleanup():
+    """Clean up stale connections periodically"""
+    while True:
+        time.sleep(60)  # Run every minute
+        current_time = time.time()
+        stale_calls = []
+        
+        for call_sid, stream_data in active_streams.items():
+            # Remove connections idle for more than 5 minutes
+            if current_time - stream_data.get('last_activity', 0) > 300:
+                stale_calls.append(call_sid)
+        
+        for call_sid in stale_calls:
+            print(f"🧹 Cleaning up stale connection: {call_sid}")
+            cleanup_call_resources(call_sid)
 
+# Start cleanup thread - ADD this at the bottom before if __name__ == "__main__":
+cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
+cleanup_thread.start()
 # Voice Activity Detection for better speech segmentation
 class StreamingSpeechProcessor:
     def __init__(self, call_sid):
         self.call_sid = call_sid
-        self.audio_buffer = b''
-        self.silence_threshold = 1.2  # Reduced from 1.5 seconds
+        self.audio_buffer = bytearray()  # Use bytearray for efficiency
+        self.silence_threshold = 1.0  # Reduced from 1.2
         self.last_speech_time = time.time()
-        self.min_speech_length = 0.3  # minimum speech length
+        self.min_speech_length = 0.3
         self.silence_start_time = None
         self.speech_detected = False
-        self.max_buffer_size = 40000  # 5 seconds max buffer
+        self.max_buffer_size = 24000  # Reduced from 40000 (3 seconds)
+        self.energy_threshold = 500  # Configurable threshold
         
     def add_audio(self, audio_chunk):
-        """Add audio chunk to buffer"""
-        # Limit buffer size to prevent memory issues
-        if len(self.audio_buffer) > self.max_buffer_size:
-            # Force process if buffer is too large
-            complete_audio = self.audio_buffer
-            self.audio_buffer = b''
-            self.clear_state()
+        """Add audio chunk to buffer with improved memory management"""
+        # Immediately process if buffer is getting too large
+        if len(self.audio_buffer) + len(audio_chunk) > self.max_buffer_size:
+            complete_audio = bytes(self.audio_buffer)
+            self.audio_buffer.clear()
             return complete_audio
             
-        self.audio_buffer += audio_chunk
+        self.audio_buffer.extend(audio_chunk)
         
-        # Check if we have enough audio for processing
-        if len(self.audio_buffer) >= 160:  # At least 20ms of audio
-            # Simple VAD based on audio energy
+        # Need minimum audio for detection
+        if len(self.audio_buffer) >= 2400:  # 300ms
             if self.detect_speech_end():
-                complete_audio = self.audio_buffer
-                self.audio_buffer = b''
-                self.clear_state()
+                complete_audio = bytes(self.audio_buffer)
+                self.audio_buffer.clear()
                 return complete_audio
         return None
     
-    def clear_state(self):
-        """Clear internal state to free memory"""
-        self.silence_start_time = None
-        self.speech_detected = False
-        gc.collect()  # Force garbage collection
-        
     def detect_speech_end(self):
-        """Improved silence detection"""
-        if len(self.audio_buffer) < 2400:  # Less than 300ms (min speech length)
+        """Improved silence detection with proper cleanup"""
+        if len(self.audio_buffer) < 2400:
             return False
             
-        # Check last 400ms for silence (reduced from 800ms)
+        # Check last 400ms for silence
         check_size = min(3200, len(self.audio_buffer))
         last_chunk = self.audio_buffer[-check_size:]
         
-        # Calculate RMS (root mean square) for silence detection
         try:
+            # Calculate RMS more efficiently
             if audioop:
-                rms = audioop.rms(last_chunk, 1)
+                rms = audioop.rms(bytes(last_chunk), 1)
             else:
-                # Manual RMS calculation
+                # Faster numpy calculation
                 audio_array = np.frombuffer(last_chunk, dtype=np.uint8)
-                rms = np.sqrt(np.mean(audio_array**2))
-        except:
-            # If error, process what we have
-            return True
+                rms = np.sqrt(np.mean(np.square(audio_array.astype(np.float32))))
+        except Exception:
+            return True  # Process on error
         
-        # Speech detection
-        if rms > 800:  # Speech detected
+        # Speech detection logic
+        if rms > self.energy_threshold:
             self.speech_detected = True
             self.silence_start_time = None
             self.last_speech_time = time.time()
-        elif self.speech_detected and rms < 500:  # Silence after speech
+        elif self.speech_detected and rms < (self.energy_threshold * 0.6):
             if self.silence_start_time is None:
                 self.silence_start_time = time.time()
             elif time.time() - self.silence_start_time > self.silence_threshold:
-                # Enough silence detected after speech
                 return True
         
-        # Timeout protection - if buffer is getting large, process it
-        if len(self.audio_buffer) > 24000:  # 3 seconds of audio
+        # Timeout protection
+        if time.time() - self.last_speech_time > 5.0:  # 5 second timeout
             return True
             
         return False
@@ -212,6 +219,17 @@ def error_handler(f):
 @error_handler
 def voice():
     """Initial voice webhook - start bidirectional stream"""
+    # ADD: Validate Twilio signature
+    validator = RequestValidator(os.getenv("TWILIO_AUTH_TOKEN"))
+    url = request.url
+    params = request.values
+    signature = request.headers.get('X-Twilio-Signature', '')
+    
+    if not validator.validate(url, params, signature):
+        response = VoiceResponse()
+        response.reject()
+        return str(response), 403
+    
     call_sid = request.values.get("CallSid")
     
     print(f"📞 New call: {call_sid}")
@@ -274,23 +292,31 @@ def media_stream(ws):
     call_sid = None
     speech_processor = None
     last_keepalive = time.time()
+    processing_lock = threading.Lock()
     
     try:
         while True:
-            # Set timeout for receive to handle keepalive
             try:
                 message = ws.receive(timeout=1.0)
-            except:
-                # Check if we need to send keepalive
+            except Exception:
+                # Send keepalive every 15 seconds
                 if time.time() - last_keepalive > 15:
-                    ws.send(json.dumps({"event": "keepalive"}))
-                    last_keepalive = time.time()
+                    try:
+                        ws.send(json.dumps({"event": "keepalive"}))
+                        last_keepalive = time.time()
+                    except:
+                        break  # Connection lost
                 continue
                 
             if message is None:
                 break
                 
-            data = json.loads(message)
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                print("Invalid JSON received")
+                continue
+                
             event_type = data.get('event')
             
             if event_type == 'connected':
@@ -300,49 +326,58 @@ def media_stream(ws):
                 stream_sid = data['streamSid']
                 call_sid = data['start']['callSid']
                 
-                # Initialize stream state
-                active_streams[call_sid] = {
-                    'ws': ws,
-                    'stream_sid': stream_sid,
-                    'processing': False,
-                    'speech_processor': StreamingSpeechProcessor(call_sid),
-                    'last_activity': time.time(),
-                    'mark_received': set(),
-                    'is_speaking': False,
-                    'last_response_time': 0
-                }
+                # Initialize with thread-safe lock
+                with processing_lock:
+                    active_streams[call_sid] = {
+                        'ws': ws,
+                        'stream_sid': stream_sid,
+                        'processing': False,
+                        'speech_processor': StreamingSpeechProcessor(call_sid),
+                        'last_activity': time.time(),
+                        'mark_received': set(),
+                        'is_speaking': False,
+                        'last_response_time': 0,
+                        'lock': processing_lock
+                    }
                 
                 speech_processor = active_streams[call_sid]['speech_processor']
-                
                 print(f"🎤 Stream started - CallSid: {call_sid}, StreamSid: {stream_sid}")
                 
-                # Don't send initial response - wait for user to speak first
+            elif event_type == 'media' and call_sid and call_sid in active_streams:
+                # Update activity timestamp
+                active_streams[call_sid]['last_activity'] = time.time()
                 
-            elif event_type == 'media':
-                if call_sid and call_sid in active_streams:
-                    # Update last activity
-                    active_streams[call_sid]['last_activity'] = time.time()
-                    
-                    # Skip processing if bot is speaking
-                    if active_streams[call_sid].get('is_speaking', False):
-                        continue
-                    
-                    # Decode the audio chunk
+                # Skip if bot is speaking or already processing
+                if active_streams[call_sid].get('is_speaking', False):
+                    continue
+                
+                # Decode audio
+                try:
                     audio_chunk = base64.b64decode(data['media']['payload'])
-                    
-                    # Add to speech processor
-                    complete_audio = speech_processor.add_audio(audio_chunk)
-                    
-                    if complete_audio and not active_streams[call_sid]['processing']:
-                        # Prevent rapid-fire responses
-                        current_time = time.time()
-                        if current_time - active_streams[call_sid].get('last_response_time', 0) < 1.0:
-                            continue
+                except Exception as e:
+                    print(f"Failed to decode audio: {e}")
+                    continue
+                
+                # Add to processor
+                complete_audio = speech_processor.add_audio(audio_chunk)
+                
+                if complete_audio:
+                    with processing_lock:
+                        if not active_streams[call_sid]['processing']:
+                            # Rate limiting
+                            current_time = time.time()
+                            last_response = active_streams[call_sid].get('last_response_time', 0)
+                            if current_time - last_response < 0.5:  # 500ms minimum gap
+                                continue
+                                
+                            active_streams[call_sid]['processing'] = True
+                            active_streams[call_sid]['last_response_time'] = current_time
                             
-                        # Process complete utterance in background
-                        active_streams[call_sid]['last_response_time'] = current_time
-                        executor.submit(run_async_task, 
-                            process_complete_utterance(call_sid, stream_sid, complete_audio))
+                            # Process in background
+                            executor.submit(
+                                run_async_task,
+                                process_complete_utterance(call_sid, stream_sid, complete_audio)
+                            )
                         
             elif event_type == 'mark':
                 # Track mark events for audio playback completion
@@ -355,6 +390,17 @@ def media_stream(ws):
                     if mark_name and mark_name.startswith('sentence_'):
                         # Bot finished speaking this sentence
                         active_streams[call_sid]['is_speaking'] = False
+                    elif mark_name == 'response_end':
+                        # Full response completed
+                        active_streams[call_sid]['is_speaking'] = False
+                        active_streams[call_sid]['processing'] = False
+                    
+            elif event_type == 'dtmf':
+                # Handle DTMF (touch-tone) events
+                if call_sid in active_streams:
+                    digit = data.get('dtmf', {}).get('digit')
+                    print(f"📞 DTMF received: {digit}")
+                    # You can add DTMF handling logic here
                     
             elif event_type == 'stop':
                 print(f"🛑 Stream stopped - CallSid: {call_sid}")
@@ -362,28 +408,34 @@ def media_stream(ws):
                 
     except Exception as e:
         print(f"💥 WebSocket error: {e}")
-        print(f"   Error type: {type(e).__name__}")
-        print(f"   Call SID: {call_sid}")
-        print(f"   Stream SID: {stream_sid}")
         import traceback
         traceback.print_exc()
     finally:
-        # Cleanup with aggressive memory freeing
+        # Comprehensive cleanup
         if call_sid:
-            if call_sid in active_streams:
-                del active_streams[call_sid]
-            if call_sid in turn_count:
-                del turn_count[call_sid]
-            if call_sid in conversation_history:
-                del conversation_history[call_sid]
-            if call_sid in personality_memory:
-                del personality_memory[call_sid]
-            if call_sid in mode_lock:
-                del mode_lock[call_sid]
-        
-        # Force garbage collection
-        gc.collect()
-
+            cleanup_call_resources(call_sid)
+            
+def cleanup_call_resources(call_sid):
+    """Centralized cleanup function"""
+    if call_sid in active_streams:
+        # Close WebSocket if still open
+        ws = active_streams[call_sid].get('ws')
+        if ws:
+            try:
+                ws.close()
+            except:
+                pass
+                
+        # Remove from all dictionaries
+        active_streams.pop(call_sid, None)
+        turn_count.pop(call_sid, None)
+        conversation_history.pop(call_sid, None)
+        personality_memory.pop(call_sid, None)
+        mode_lock.pop(call_sid, None)
+        interview_question_index.pop(call_sid, None)
+    
+    # Force garbage collection only after cleanup
+    gc.collect()
 # Helper function to run async tasks
 def run_async_task(coro):
     """Run async coroutine in new event loop"""
@@ -399,60 +451,58 @@ async def send_initial_response(call_sid, stream_sid):
     pass  # Don't send anything initially
 
 async def process_complete_utterance(call_sid, stream_sid, audio_data):
-    """Process a complete speech utterance"""
+    """Process a complete speech utterance with better error handling"""
     if call_sid not in active_streams:
         return
         
-    # Mark as processing to prevent overlaps
-    active_streams[call_sid]['processing'] = True
-    
     try:
-        # Convert mulaw to PCM for transcription
+        # Mark as speaking immediately
+        active_streams[call_sid]['is_speaking'] = True
+        
+        # Convert mulaw to PCM more efficiently
         audio_pcm = convert_mulaw_to_pcm(audio_data)
         
-        # Clear original audio data
-        del audio_data
-        gc.collect()
+        # Free original audio data immediately
+        audio_data = None
         
-        # Transcribe
-        transcript = await transcribe_audio(audio_pcm)
+        # Transcribe with timeout
+        transcript = await asyncio.wait_for(
+            transcribe_audio(audio_pcm),
+            timeout=5.0  # 5 second timeout
+        )
         
-        # Clear PCM data
-        del audio_pcm
-        gc.collect()
+        # Free PCM data
+        audio_pcm = None
         
-        if transcript and len(transcript.strip()) > 1:  # Ignore single character transcripts
+        if transcript and len(transcript.strip()) > 1:
             print(f"📝 Transcript: {transcript}")
             
-            # Filter out noise/spam transcripts
-            if any(spam in transcript.lower() for spam in [
+            # Spam filter
+            spam_patterns = [
                 "beadaholique.com", "go to", ".com", "www.", "http",
                 "woof woof", "bark bark", "meow", "click here"
-            ]):
+            ]
+            if any(spam in transcript.lower() for spam in spam_patterns):
                 print("🚫 Ignoring spam/noise transcript")
                 return
             
-            # Check for reset command
+            # Check for reset
             if "let's start over" in transcript.lower():
                 await handle_reset(call_sid, stream_sid)
                 return
                 
-            # Mark bot as speaking before generating response
-            active_streams[call_sid]['is_speaking'] = True
-                
-            # Process and generate response
+            # Generate and stream response
             response = await generate_response(call_sid, transcript)
-            
-            # Stream response back
             await stream_tts_response(call_sid, stream_sid, response)
             
+    except asyncio.TimeoutError:
+        print(f"⏱️ Processing timeout for call {call_sid}")
     except Exception as e:
         print(f"💥 Processing error: {e}")
     finally:
+        # Always reset processing flag
         if call_sid in active_streams:
             active_streams[call_sid]['processing'] = False
-            # Will be set to False when marks are received
-        gc.collect()  # Clean up after processing
 
 async def handle_reset(call_sid, stream_sid):
     """Handle reset command"""
@@ -492,12 +542,22 @@ async def generate_response(call_sid, transcript):
         "content": transcript
     })
     
-    # Limit conversation history to last 5 messages to prevent memory overflow
-    if len(conversation_history[call_sid]) > 5:
-        conversation_history[call_sid] = conversation_history[call_sid][-5:]
+    # Limit conversation history (KEEP EXISTING LIMITING LOGIC)
+    if len(conversation_history[call_sid]) > 6:
+        conversation_history[call_sid] = conversation_history[call_sid][-6:]
     
     # Get personality and prompt
     voice_id, system_prompt, intro_line = get_personality_for_mode(call_sid, mode)
+    
+    # ADD INTERVIEW QUESTION LOGIC HERE - AFTER getting system_prompt:
+    if mode == "interview":
+        if call_sid not in interview_question_index:
+            interview_question_index[call_sid] = 0
+        
+        current_question_idx = interview_question_index[call_sid]
+        if current_question_idx < len(interview_questions):
+            # Include current question in system prompt
+            system_prompt += f"\n\nAsk this question next: {interview_questions[current_question_idx]}"
     
     # Build messages for GPT
     messages = [{"role": "system", "content": system_prompt}]
@@ -516,7 +576,7 @@ async def generate_response(call_sid, transcript):
             model="gpt-4.1-nano",
             messages=messages,
             temperature=0.7,
-            max_tokens=40,  # Reduced from 60 to keep responses shorter and save memory
+            max_tokens=40,
             stream=True
         )
         
@@ -539,6 +599,10 @@ async def generate_response(call_sid, transcript):
             "role": "assistant",
             "content": reply
         })
+        
+        # INCREMENT INTERVIEW QUESTION INDEX HERE - AFTER response is stored:
+        if mode == "interview":
+            interview_question_index[call_sid] = (interview_question_index[call_sid] + 1) % len(interview_questions)
         
         return reply
         
@@ -645,8 +709,8 @@ async def stream_tts_response(call_sid, stream_sid, text):
     # Split text into sentences for faster streaming
     sentences = re.split(r'(?<=[.!?])\s+', text)
     
-    # Limit sentences to prevent over-talking
-    sentences = sentences[:2]  # Max 2 sentences per response (reduced from 3)
+    # Limit sentences to prevent over-talking (reduced from 3)
+    sentences = sentences[:2]  # Max 2 sentences per response
     
     total_sentences = len([s for s in sentences if s.strip()])
     
@@ -741,88 +805,82 @@ async def stream_tts_response(call_sid, stream_sid, text):
                 print(f"   Error type: {type(e).__name__}")
                 import traceback
                 traceback.print_exc()
-
-async def transcribe_audio(audio_pcm):
-    """Transcribe audio using Whisper"""
-    try:
-        # Create temporary file for transcription
-        with io.BytesIO() as audio_file:
-            # Convert PCM to WAV format with minimal memory usage
-            try:
-                audio = AudioSegment(
-                    data=audio_pcm,
-                    sample_width=2,
-                    frame_rate=16000,
-                    channels=1
-                )
-                audio.export(audio_file, format="wav")
-                audio_file.seek(0)
-                audio_file.name = "temp.wav"  # OpenAI needs a filename
-                
-                # Clear the original audio data
-                del audio
-                del audio_pcm
-                gc.collect()
-                
-                # Transcribe
-                result = await async_openai.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    language="en"
-                )
-                
-                return result.text.strip()
-                
-            except Exception as e:
-                print(f"💥 Audio processing error: {e}")
-                return ""
-            
-    except Exception as e:
-        print(f"💥 Transcription error: {e}")
-        return ""
-
+    
+    # Note: is_speaking flag will be set to False when mark events are received
 def convert_mulaw_to_pcm(mulaw_data):
-    """Convert 8kHz mulaw to 16kHz PCM for Whisper"""
+    """Convert 8kHz mulaw to 16kHz PCM for Whisper - optimized"""
     try:
+        if not mulaw_data:
+            return b''
+            
         if audioop:
-            # Use audioop if available
-            pcm_data = audioop.ulaw2lin(mulaw_data, 2)
-            
-            # Create audio segment
-            audio = AudioSegment(
-                data=pcm_data,
-                sample_width=2,
-                frame_rate=8000,
-                channels=1
-            )
-            
-            # Clear intermediate data
-            del pcm_data
+            # Direct conversion with audioop
+            pcm_8khz = audioop.ulaw2lin(mulaw_data, 2)
+            # Resample using audioop (more efficient)
+            pcm_16khz = audioop.ratecv(
+                pcm_8khz, 2, 1, 8000, 16000, None
+            )[0]
+            return pcm_16khz
         else:
-            # Use pydub's built-in conversion
-            audio = AudioSegment.from_file(
-                io.BytesIO(mulaw_data),
-                format="mulaw",
+            # Fallback to pydub with proper format specification
+            # Create BytesIO object for mulaw data
+            mulaw_buffer = io.BytesIO(mulaw_data)
+            
+            # Load as raw mulaw format
+            audio = AudioSegment.from_raw(
+                mulaw_buffer,
+                sample_width=1,  # mulaw is 8-bit
                 frame_rate=8000,
                 channels=1,
-                sample_width=1
+                frame_width=1
             )
-            # Convert to PCM
-            audio = audio.set_sample_width(2)
-        
-        # Resample to 16kHz
-        audio = audio.set_frame_rate(16000)
-        result = audio.raw_data
-        
-        # Clean up
-        del audio
-        gc.collect()
-        
-        return result
+            
+            # Convert to 16-bit PCM and resample to 16kHz
+            audio = audio.set_sample_width(2).set_frame_rate(16000)
+            return audio.raw_data
+            
     except Exception as e:
         print(f"💥 Audio conversion error: {e}")
         return b''
 
+async def transcribe_audio(audio_pcm):
+    """Transcribe audio using Whisper - memory optimized"""
+    if not audio_pcm or len(audio_pcm) < 1600:  # Min 100ms of audio
+        return ""
+        
+    try:
+        # Use io.BytesIO more efficiently
+        audio_buffer = io.BytesIO()
+        
+        # Create WAV with minimal overhead
+        audio = AudioSegment(
+            data=audio_pcm,
+            sample_width=2,
+            frame_rate=16000,
+            channels=1
+        )
+        
+        # Export directly to buffer
+        audio.export(audio_buffer, format="wav", parameters=["-ac", "1"])
+        audio_buffer.seek(0)
+        audio_buffer.name = "audio.wav"
+        
+        # Free audio segment
+        del audio
+        
+        # Transcribe with smaller model for speed
+        result = await async_openai.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_buffer,
+            language="en",
+            response_format="text"  # Simpler format
+        )
+        
+        return result.strip()
+        
+    except Exception as e:
+        print(f"💥 Transcription error: {e}")
+        return ""
 def convert_to_mulaw(audio_data):
     """Convert audio to 8kHz mulaw for Twilio"""
     try:

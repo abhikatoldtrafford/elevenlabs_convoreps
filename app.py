@@ -209,7 +209,7 @@ def voice():
         response.play(public_mp3_url)
     else:
         print("⏳ Response not ready — waiting briefly")
-        response.play(f"{request.url_root}static/beep.mp3") 
+        #response.play(f"{request.url_root}static/beep.mp3") 
         response.pause(length=2)
 
     response.gather(
@@ -348,7 +348,7 @@ async def process_speech():
     if not speech_result:
         print("⚠️ No speech detected, redirecting back to voice")
         response = VoiceResponse()
-        response.play(f"{request.url_root}static/beep.mp3")
+        #response.play(f"{request.url_root}static/beep.mp3")
         response.redirect(url_for("voice", _external=True))
         return str(response)
     
@@ -659,7 +659,7 @@ async def process_speech():
 
     # Play a beep before the AI response
     response = VoiceResponse()
-    response.play(f"{request.url_root}static/beep.mp3")
+    #response.play(f"{request.url_root}static/beep.mp3")
     response.redirect(url_for("voice", _external=True))
     return str(response)
 async def streaming_transcribe(audio_file_path: str) -> str:

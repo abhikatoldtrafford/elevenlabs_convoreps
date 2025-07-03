@@ -119,14 +119,6 @@ USAGE_CSV_BACKUP_PATH = os.getenv("USAGE_CSV_BACKUP_PATH", "user_usage_backup.cs
 CONVOREPS_URL = os.getenv("CONVOREPS_URL", "https://convoreps.com")
 MIN_CALL_DURATION = float(os.getenv("MIN_CALL_DURATION", "0.5"))  # Minimum 30 seconds
 
-# Audio processing constants
-AUDIO_CHUNK_SIZE = 160  # bytes for Twilio compatibility
-AUDIO_BUFFER_MAX_SIZE = 24000  # 3 seconds at 8kHz
-SILENCE_THRESHOLD_MS = 800  # milliseconds
-ENERGY_THRESHOLD = 500  # RMS energy threshold
-WEBSOCKET_KEEPALIVE_INTERVAL = 15  # seconds
-ELEVENLABS_KEEPALIVE_INTERVAL = 15  # seconds
-
 # Initialize API clients
 sync_openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 async_openai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -188,51 +180,22 @@ cold_call_personality_pool = {
         "voice_id": "1t1EeRixsJrKbiF1zwM6",
         "system_prompt": """You're Jerry, a skeptical small business owner. Be direct but not rude. Stay in character. Keep responses SHORT - 1-2 sentences max.
 
-You have access to a tool called 'check_remaining_time' that tells you how many minutes are left in the user's free call.
+You have access to a tool that can check how much time is left in the call. If asked about time or if you notice the conversation is going long, use this tool.
 
-WHEN TO USE THE TOOL:
-- If user asks "how much time do I have?" or similar questions about time
-- If the conversation has gone on for more than 3 minutes
-- If user mentions wrapping up, ending the call, or asks if there's a time limit
+Example tool usage scenarios:
+- User asks "how much time do we have?"
+- User seems to be wrapping up
+- Conversation has gone on for a while
 
-HOW TO RESPOND WITH TIME INFO:
-- If > 2 minutes left: "You've got about X minutes left to practice."
-- If < 2 minutes: "Just so you know, you have about X minutes remaining."
-- If < 30 seconds: "Looks like your time is almost up - maybe X seconds left."
-
-NEVER mention the tool by name, just naturally work the time info into your response. Stay in character as Jerry - be direct about it."""
+When you get time information from the tool, naturally incorporate it into your response."""
     },
     "Miranda": {
         "voice_id": "Ax1GP2W4XTyAyNHuch7v",
-        "system_prompt": """You're Miranda, a busy office manager. No time for fluff. Be grounded and real. Keep responses SHORT - 1-2 sentences max.
-
-You have access to a tool called 'check_remaining_time' that tells you how many minutes are left in the user's free call.
-
-WHEN TO USE THE TOOL:
-- If user asks about time or mentions time limits
-- If conversation has been going on for a while (3+ minutes)
-- If user seems to be wrapping up
-
-HOW TO RESPOND:
-- Be direct: "You've got X minutes left."
-- If low on time: "Just X minutes remaining, FYI."
-- Stay in character - you're busy, so be matter-of-fact about it."""
+        "system_prompt": "You're Miranda, a busy office manager. No time for fluff. Be grounded and real. Keep responses SHORT - 1-2 sentences max."
     },
     "Brett": {
         "voice_id": "7eFTSJ6WtWd9VCU4ZlI1",
-        "system_prompt": """You're Brett, a contractor answering mid-job. Busy and a bit annoyed. Talk rough, fast, casual. Keep responses SHORT.
-
-You have access to a tool called 'check_remaining_time' for checking remaining call time.
-
-WHEN TO USE IT:
-- If asked about time
-- If call's been going on too long (you're busy!)
-- If they're rambling
-
-HOW TO RESPOND:
-- Gruff: "Look, you got X minutes left."
-- If low: "Time's almost up - X minutes."
-- Stay annoyed but informative."""
+        "system_prompt": "You're Brett, a contractor answering mid-job. Busy and a bit annoyed. Talk rough, fast, casual. Keep responses SHORT."
     }
 }
 
@@ -402,11 +365,6 @@ def update_user_usage(phone_number: str, minutes_used: float):
     """Update user usage in CSV with atomic writes"""
     if not validate_phone_number(phone_number):
         logger.warning(f"Invalid phone number format: {phone_number}")
-        return
-    
-    # Prevent negative or zero updates
-    if minutes_used <= 0:
-        logger.warning(f"Invalid minutes_used: {minutes_used}")
         return
     
     init_csv()
@@ -579,13 +537,13 @@ class StreamingSpeechProcessor:
     def __init__(self, call_sid: str):
         self.call_sid = call_sid
         self.audio_buffer = bytearray()
-        self.silence_threshold = SILENCE_THRESHOLD_MS / 1000.0  # Convert to seconds
+        self.silence_threshold = 0.8
         self.last_speech_time = time.time()
         self.min_speech_length = 0.3
         self.silence_start_time: Optional[float] = None
         self.speech_detected = False
-        self.max_buffer_size = AUDIO_BUFFER_MAX_SIZE
-        self.energy_threshold = ENERGY_THRESHOLD
+        self.max_buffer_size = 24000  # 3 seconds at 8kHz
+        self.energy_threshold = 500
         self.processing_audio = False
         
     def add_audio(self, audio_chunk: bytes) -> Optional[bytes]:
@@ -765,11 +723,6 @@ def voice():
             call_start_times[call_sid] = time.time()
             logger.info(f"User has {minutes_left:.2f} minutes remaining", 
                        extra={'correlation_id': correlation_id})
-        else:
-            # Increment turn count for subsequent turns
-            turn_count[call_sid] += 1
-            logger.info(f"Turn {turn_count[call_sid]} for call {call_sid}", 
-                       extra={'correlation_id': correlation_id})
             
         with metrics_lock:
             metrics['total_calls'] += 1
@@ -819,7 +772,6 @@ def voice():
     stream = Stream(
         url=stream_url,
         name="convoreps_stream",
-        track="inbound_track",  # Explicitly set for bidirectional streams
         statusCallback=f"{request.url_root}stream-status",
         statusCallbackMethod="POST"
     )
@@ -857,13 +809,6 @@ def handle_time_limit(call_sid: str, from_number: str):
     correlation_id = str(uuid.uuid4())
     logger.info(f"Time limit reached for {call_sid}", 
                extra={'correlation_id': correlation_id})
-    
-    # Update CSV immediately before playing message
-    if call_sid in call_start_times:
-        elapsed_minutes = (time.time() - call_start_times[call_sid]) / 60.0
-        update_user_usage(from_number, elapsed_minutes)
-        logger.info(f"Updated usage for {from_number}: {elapsed_minutes:.2f} minutes", 
-                   extra={'correlation_id': correlation_id})
     
     if call_sid in active_streams:
         executor.submit(
@@ -1018,7 +963,7 @@ def media_stream(ws):
                 message = ws.receive(timeout=1.0)
             except Exception:
                 # Keepalive
-                if time.time() - last_keepalive > WEBSOCKET_KEEPALIVE_INTERVAL:
+                if time.time() - last_keepalive > 15:
                     try:
                         ws.send(json.dumps({"event": "keepalive", "timestamp": time.time()}))
                         last_keepalive = time.time()
@@ -1208,28 +1153,25 @@ def cleanup_call_resources(call_sid: str):
         if call_sid in active_streams:
             from_number = active_streams[call_sid].get('from_number', '')
             
-            # Calculate and update usage only if timer didn't already do it
-            if call_sid in call_start_times and call_sid not in call_timers:
-                # Timer was cancelled or didn't fire, so we need to update usage
+            # Calculate and update usage
+            if call_sid in call_start_times:
                 call_duration = time.time() - call_start_times[call_sid]
                 minutes_used = call_duration / 60.0
                 
                 if from_number and validate_phone_number(from_number):
-                    # Check if we need to update (timer might have already done it)
                     usage_before = read_user_usage(from_number)
+                    minutes_left_before = usage_before['minutes_left']
                     
-                    # Only update if there's actual time to update
-                    if minutes_used > 0.01:  # More than ~1 second
-                        update_user_usage(from_number, minutes_used)
-                        logger.info(f"Call {call_sid} lasted {minutes_used:.2f} minutes", 
-                                   extra={'correlation_id': correlation_id})
-                        
-                        # Check if SMS needed (only if time just ran out)
-                        usage_after = read_user_usage(from_number)
-                        if usage_before['minutes_left'] > 0.5 and usage_after['minutes_left'] <= 0.5:
-                            is_first_call = usage_after['total_calls'] <= 1
-                            executor.submit(run_async_task, 
-                                          send_sms_link(from_number, is_first_call=is_first_call))
+                    update_user_usage(from_number, minutes_used)
+                    logger.info(f"Call {call_sid} lasted {minutes_used:.2f} minutes", 
+                               extra={'correlation_id': correlation_id})
+                    
+                    # Check if SMS needed
+                    usage_after = read_user_usage(from_number)
+                    if minutes_left_before > 0 and usage_after['minutes_left'] <= 0:
+                        is_first_call = usage_after['total_calls'] <= 1
+                        executor.submit(run_async_task, 
+                                      send_sms_link(from_number, is_first_call=is_first_call))
                 
                 call_start_times.pop(call_sid, None)
             
@@ -1459,11 +1401,10 @@ async def generate_response(call_sid: str, transcript: str) -> str:
         minutes_left = active_streams[call_sid].get('minutes_left', FREE_CALL_MINUTES)
         remaining = max(0, minutes_left - elapsed_minutes)
         
-        if remaining < 2.0:  # Less than 2 minutes
+        if remaining < 1.0:
             messages[0]["content"] += (
                 f"\n\nIMPORTANT: The user has less than {remaining:.1f} minutes left. "
-                "You should proactively use the check_remaining_time tool to inform them about their remaining time. "
-                "Don't wait for them to ask - be helpful and let them know time is running low."
+                "Use the check_remaining_time tool to inform them."
             )
     
     # Check for bad news
@@ -1524,15 +1465,6 @@ async def generate_response(call_sid: str, transcript: str) -> str:
                         if remaining <= MIN_CALL_DURATION:
                             logger.info(f"Tool detected time exhausted for {call_sid}", 
                                       extra={'correlation_id': correlation_id})
-                            
-                            # Update CSV immediately before time runs out
-                            elapsed_minutes = (time.time() - call_start_times[call_sid]) / 60.0
-                            update_user_usage(from_number, elapsed_minutes)
-                            
-                            # Cancel the timer since we're handling it now
-                            if call_sid in call_timers:
-                                call_timers[call_sid].cancel()
-                                call_timers.pop(call_sid, None)
                             
                             # Trigger end flow
                             executor.submit(
@@ -1690,10 +1622,7 @@ def get_personality_for_mode(call_sid: str, mode: str) -> Tuple[str, str, str]:
             f"You are {voice_choice['name']}, a friendly, conversational job interviewer. "
             "Ask one interview question at a time, give supportive feedback. "
             "Keep your tone upbeat and natural. Keep responses SHORT - 1-2 sentences. "
-            "Be encouraging and professional.\n\n"
-            "You have access to 'check_remaining_time' tool. If the interview has been going on "
-            "for more than 4 minutes, casually check and mention time remaining: "
-            "'We're making good progress - just to let you know, we have about X minutes left.'"
+            "Be encouraging and professional."
         )
         
         return (
@@ -1728,7 +1657,6 @@ async def stream_tts_websocket(call_sid: str, stream_sid: str, text: str):
     voice_id, _, _ = get_personality_for_mode(call_sid, mode)
     
     elevenlabs_ws = None
-    keepalive_task = None
     try:
         # Build WebSocket URL with all parameters
         model_id = "eleven_turbo_v2_5"
@@ -1746,19 +1674,6 @@ async def stream_tts_websocket(call_sid: str, stream_sid: str, text: str):
         
         async with websockets.connect(elevenlabs_url, extra_headers=headers) as elevenlabs_ws:
             elevenlabs_websockets[call_sid] = elevenlabs_ws
-            
-            # Start keepalive task
-            async def keepalive():
-                try:
-                    while elevenlabs_ws.open:
-                        await asyncio.sleep(ELEVENLABS_KEEPALIVE_INTERVAL)
-                        if elevenlabs_ws.open:
-                            await elevenlabs_ws.send(json.dumps({"text": " "}))
-                            logger.debug(f"Sent ElevenLabs keepalive for {call_sid}")
-                except:
-                    pass
-            
-            keepalive_task = asyncio.create_task(keepalive())
             
             # Send initial configuration
             init_message = {
@@ -1863,10 +1778,6 @@ async def stream_tts_websocket(call_sid: str, stream_sid: str, text: str):
                     exc_info=True)
         await stream_tts_response(call_sid, stream_sid, text)
     finally:
-        # Cancel keepalive task
-        if keepalive_task:
-            keepalive_task.cancel()
-        # Clean up WebSocket reference
         if call_sid in elevenlabs_websockets:
             elevenlabs_websockets.pop(call_sid, None)
 
@@ -2271,10 +2182,10 @@ if __name__ == "__main__":
     
     # Generate required static files if missing
     if not os.path.exists("static/beep.mp3"):
-        logger.warning("beep.mp3 not found - generating")
+        logger.warning("beep.mp3 not found - generating placeholder")
+        # Create a simple beep using pydub
         try:
             from pydub.generators import Sine
-            # Generate a 1000Hz sine wave beep, 300ms duration
             beep = Sine(1000).to_audio_segment(duration=300).apply_gain(-6)
             beep.export("static/beep.mp3", format="mp3")
             logger.info("Generated beep.mp3")

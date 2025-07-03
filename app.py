@@ -618,8 +618,16 @@ class StreamingSpeechProcessor:
         self.energy_threshold = ENERGY_THRESHOLD
         self.processing_audio = False
         
+        # Enhanced VAD parameters
+        self.energy_history = []
+        self.energy_history_size = 10
+        self.dynamic_threshold_factor = 1.5
+        self.min_energy_threshold = 300
+        self.consecutive_silence_chunks = 0
+        self.required_silence_chunks = 15  # ~300ms at 20ms chunks
+        
     def add_audio(self, audio_chunk: bytes) -> Optional[bytes]:
-        """Add audio chunk to buffer with improved memory management"""
+        """Add audio chunk to buffer with improved VAD and memory management"""
         try:
             if self.processing_audio:
                 return None
@@ -627,6 +635,7 @@ class StreamingSpeechProcessor:
             if not audio_chunk or not isinstance(audio_chunk, bytes):
                 return None
                 
+            # Prevent buffer overflow
             if len(self.audio_buffer) + len(audio_chunk) > self.max_buffer_size:
                 complete_audio = bytes(self.audio_buffer)
                 self.audio_buffer.clear()
@@ -635,52 +644,79 @@ class StreamingSpeechProcessor:
                 
             self.audio_buffer.extend(audio_chunk)
             
-            if len(self.audio_buffer) >= 2400:  # 300ms
-                if self.detect_speech_end():
+            # Process in 20ms chunks for better VAD accuracy
+            chunk_size = 320  # 20ms at 16kHz
+            if len(self.audio_buffer) >= chunk_size:
+                if self.detect_speech_end_enhanced():
                     complete_audio = bytes(self.audio_buffer)
                     self.audio_buffer.clear()
                     self.processing_audio = True
                     return complete_audio
             return None
         except Exception as e:
-            logger.error(f"Error in add_audio: {e}")
+            logger.error(f"Error in add_audio: {e}", exc_info=True)
             self.audio_buffer.clear()
             self.processing_audio = False
             return None
     
-    def detect_speech_end(self) -> bool:
-        """Enhanced silence detection with better accuracy"""
-        if len(self.audio_buffer) < 2400:
+    def detect_speech_end_enhanced(self) -> bool:
+        """Enhanced VAD with dynamic thresholds and better accuracy"""
+        if len(self.audio_buffer) < 2400:  # Need at least 150ms
             return False
             
+        # Analyze recent audio
         check_size = min(3200, len(self.audio_buffer))
         last_chunk = self.audio_buffer[-check_size:]
         
         try:
+            # Calculate RMS energy
             if AUDIOOP_AVAILABLE and audioop:
                 rms = audioop.rms(bytes(last_chunk), 1)
             else:
                 audio_array = np.frombuffer(last_chunk, dtype=np.uint8)
                 if len(audio_array) == 0:
                     return True
-                rms = np.sqrt(np.mean(np.square(audio_array.astype(np.float32))))
-        except Exception as e:
-            logger.error(f"RMS calculation error: {e}")
-            return True
-        
-        if rms > self.energy_threshold:
-            self.speech_detected = True
-            self.silence_start_time = None
-            self.last_speech_time = time.time()
-        elif self.speech_detected and rms < (self.energy_threshold * 0.5):
-            if self.silence_start_time is None:
-                self.silence_start_time = time.time()
-            elif time.time() - self.silence_start_time > self.silence_threshold:
-                return True
-        
-        if time.time() - self.last_speech_time > 5.0:
-            return True
+                # Convert to signed values centered at 0
+                audio_array = audio_array.astype(np.float32) - 128.0
+                rms = np.sqrt(np.mean(np.square(audio_array))) * 8  # Scale to match audioop
             
+            # Update energy history for dynamic threshold
+            self.energy_history.append(rms)
+            if len(self.energy_history) > self.energy_history_size:
+                self.energy_history.pop(0)
+            
+            # Calculate dynamic threshold
+            if self.energy_history:
+                avg_energy = np.mean(self.energy_history)
+                dynamic_threshold = max(
+                    self.min_energy_threshold,
+                    avg_energy * self.dynamic_threshold_factor
+                )
+            else:
+                dynamic_threshold = self.energy_threshold
+            
+            # Speech detection logic
+            if rms > dynamic_threshold:
+                self.speech_detected = True
+                self.consecutive_silence_chunks = 0
+                self.silence_start_time = None
+                self.last_speech_time = time.time()
+            elif self.speech_detected:
+                self.consecutive_silence_chunks += 1
+                
+                if self.consecutive_silence_chunks >= self.required_silence_chunks:
+                    # Check if we have enough speech
+                    if len(self.audio_buffer) > 4800:  # At least 300ms
+                        return True
+            
+            # Timeout after 5 seconds
+            if time.time() - self.last_speech_time > 5.0:
+                return len(self.audio_buffer) > 1600  # Return if we have any content
+                
+        except Exception as e:
+            logger.error(f"RMS calculation error: {e}", exc_info=True)
+            return True
+        
         return False
     
     def reset(self):
@@ -688,6 +724,9 @@ class StreamingSpeechProcessor:
         self.processing_audio = False
         self.speech_detected = False
         self.silence_start_time = None
+        self.consecutive_silence_chunks = 0
+        self.energy_history.clear()
+
 
 def error_handler(f):
     """Enhanced error handler with correlation ID"""
@@ -1025,7 +1064,7 @@ def stream_status():
 
 @sock.route('/media-stream')
 def media_stream(ws):
-    """Enhanced WebSocket handler with security and monitoring"""
+    """Enhanced WebSocket handler with non-blocking processing and better error handling"""
     stream_sid = None
     call_sid = None
     speech_processor = None
@@ -1034,6 +1073,7 @@ def media_stream(ws):
     audio_queue = asyncio.Queue()
     ws_start_time = time.time()
     correlation_id = None
+    processing_tasks = []
     
     # Check connection limit
     with state_lock:
@@ -1042,185 +1082,204 @@ def media_stream(ws):
             ws.close()
             return
     
+    async def process_audio_async(audio_data: bytes, stream_sid: str):
+        """Async audio processing to prevent blocking"""
+        try:
+            await process_complete_utterance(call_sid, stream_sid, audio_data)
+        except Exception as e:
+            logger.error(f"Audio processing error: {e}", exc_info=True)
+        finally:
+            with processing_lock:
+                if call_sid in active_streams:
+                    active_streams[call_sid]['processing'] = False
+    
     try:
         while not shutdown_event.is_set():
             try:
-                message = ws.receive(timeout=1.0)
-            except Exception:
-                # Keepalive
-                if time.time() - last_keepalive > WEBSOCKET_KEEPALIVE_INTERVAL:
-                    try:
-                        ws.send(json.dumps({"event": "keepalive", "timestamp": time.time()}))
-                        last_keepalive = time.time()
-                    except:
-                        break
-                continue
+                # Non-blocking receive with short timeout
+                message = ws.receive(timeout=0.5)
                 
-            if message is None:
-                break
-                
-            try:
-                data = json.loads(message)
-            except json.JSONDecodeError:
-                logger.error("Invalid JSON received")
-                continue
-                
-            event_type = data.get('event')
-            
-            if event_type == 'connected':
-                logger.info(f"WebSocket connected: {data.get('protocol', 'unknown')}")
-                ws.send(json.dumps({
-                    "event": "connected_ack",
-                    "timestamp": time.time()
-                }))
-                
-            elif event_type == 'start':
-                stream_sid = data['streamSid']
-                
-                # Validate stream SID
-                if not validate_stream_sid(stream_sid):
-                    logger.error(f"Invalid StreamSid: {stream_sid}")
-                    ws.close()
-                    return
-                
-                call_sid = data['start']['callSid']
-                
-                # Validate call SID
-                if not validate_call_sid(call_sid):
-                    logger.error(f"Invalid CallSid: {call_sid}")
-                    ws.close()
-                    return
-                
-                custom_params = data['start'].get('customParameters', {})
-                from_number = custom_params.get('from_number', '')
-                minutes_left = float(custom_params.get('minutes_left', FREE_CALL_MINUTES))
-                correlation_id = custom_params.get('correlation_id', str(uuid.uuid4()))
-                
-                logger.info(f"Stream started - CallSid: {call_sid}, StreamSid: {stream_sid}", 
-                           extra={'correlation_id': correlation_id})
-                
-                # Initialize stream data
-                with processing_lock:
-                    speech_processor = StreamingSpeechProcessor(call_sid)
-                    
-                    with state_lock:
-                        active_streams[call_sid] = {
-                            'ws': ws,
-                            'stream_sid': stream_sid,
-                            'from_number': from_number,
-                            'minutes_left': minutes_left,
-                            'processing': False,
-                            'speech_processor': speech_processor,
-                            'last_activity': time.time(),
-                            'mark_received': set(),
-                            'is_speaking': False,
-                            'last_response_time': 0,
-                            'lock': processing_lock,
-                            'audio_queue': audio_queue,
-                            'custom_params': custom_params,
-                            'interruption_requested': False,
-                            'correlation_id': correlation_id
-                        }
-                
-            elif event_type == 'media' and call_sid and call_sid in active_streams:
-                # Update activity
-                with state_lock:
-                    active_streams[call_sid]['last_activity'] = time.time()
-                
-                # Handle interruption
-                if active_streams[call_sid].get('is_speaking', False):
-                    try:
-                        audio_chunk = base64.b64decode(data['media']['payload'])
-                        if AUDIOOP_AVAILABLE:
-                            rms = audioop.rms(audio_chunk, 1)
-                        else:
-                            audio_array = np.frombuffer(audio_chunk, dtype=np.uint8)
-                            rms = np.sqrt(np.mean(np.square(audio_array.astype(np.float32))))
-                        
-                        if rms > 700:
-                            active_streams[call_sid]['interruption_requested'] = True
-                            ws.send(json.dumps({
-                                "event": "clear",
-                                "streamSid": stream_sid
-                            }))
-                    except:
-                        pass
+                # Handle keepalive
+                if message is None:
+                    if time.time() - last_keepalive > WEBSOCKET_KEEPALIVE_INTERVAL:
+                        try:
+                            ws.send(json.dumps({"event": "keepalive", "timestamp": time.time()}))
+                            last_keepalive = time.time()
+                        except:
+                            break
                     continue
                 
-                # Process audio
                 try:
-                    audio_chunk = base64.b64decode(data['media']['payload'])
-                except Exception as e:
-                    logger.error(f"Failed to decode audio: {e}")
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    logger.error("Invalid JSON received")
                     continue
+                    
+                event_type = data.get('event')
                 
-                complete_audio = speech_processor.add_audio(audio_chunk)
-                
-                if complete_audio:
-                    with processing_lock:
-                        if not active_streams[call_sid]['processing']:
-                            current_time = time.time()
-                            last_response = active_streams[call_sid].get('last_response_time', 0)
-                            
-                            if current_time - last_response < 0.3:
-                                speech_processor.reset()
-                                continue
-                                
-                            active_streams[call_sid]['processing'] = True
-                            active_streams[call_sid]['last_response_time'] = current_time
-                            
-                            executor.submit(
-                                run_async_task,
-                                process_complete_utterance(call_sid, stream_sid, complete_audio)
-                            )
-                        
-            elif event_type == 'mark':
-                if call_sid in active_streams:
-                    mark_data = data.get('mark', {})
-                    mark_name = mark_data.get('name')
+                if event_type == 'connected':
+                    logger.info(f"WebSocket connected: {data.get('protocol', 'unknown')}")
+                    ws.send(json.dumps({
+                        "event": "connected_ack",
+                        "timestamp": time.time()
+                    }))
                     
-                    with state_lock:
-                        active_streams[call_sid]['mark_received'].add(mark_name)
+                elif event_type == 'start':
+                    stream_sid = data['streamSid']
                     
-                    if mark_name == 'response_end':
-                        active_streams[call_sid]['is_speaking'] = False
-                        active_streams[call_sid]['processing'] = False
-                        active_streams[call_sid]['interruption_requested'] = False
-                        if speech_processor:
-                            speech_processor.reset()
+                    # Validate stream SID
+                    if not validate_stream_sid(stream_sid):
+                        logger.error(f"Invalid StreamSid: {stream_sid}")
+                        ws.close()
+                        return
                     
-            elif event_type == 'dtmf':
-                if call_sid in active_streams:
-                    dtmf_data = data.get('dtmf', {})
-                    digit = dtmf_data.get('digit')
-                    logger.info(f"DTMF received: {digit}", 
+                    call_sid = data['start']['callSid']
+                    
+                    # Validate call SID
+                    if not validate_call_sid(call_sid):
+                        logger.error(f"Invalid CallSid: {call_sid}")
+                        ws.close()
+                        return
+                    
+                    custom_params = data['start'].get('customParameters', {})
+                    from_number = custom_params.get('from_number', '')
+                    minutes_left = float(custom_params.get('minutes_left', FREE_CALL_MINUTES))
+                    correlation_id = custom_params.get('correlation_id', str(uuid.uuid4()))
+                    
+                    logger.info(f"Stream started - CallSid: {call_sid}, StreamSid: {stream_sid}", 
                                extra={'correlation_id': correlation_id})
                     
-                    if digit == '#':
-                        executor.submit(
-                            run_async_task,
-                            handle_reset(call_sid, stream_sid)
-                        )
-                    elif digit == '*':
-                        executor.submit(
-                            run_async_task,
-                            repeat_last_response(call_sid, stream_sid)
-                        )
+                    # Initialize stream data
+                    with processing_lock:
+                        speech_processor = StreamingSpeechProcessor(call_sid)
+                        
+                        with state_lock:
+                            active_streams[call_sid] = {
+                                'ws': ws,
+                                'stream_sid': stream_sid,
+                                'from_number': from_number,
+                                'minutes_left': minutes_left,
+                                'processing': False,
+                                'speech_processor': speech_processor,
+                                'last_activity': time.time(),
+                                'mark_received': set(),
+                                'is_speaking': False,
+                                'last_response_time': 0,
+                                'lock': processing_lock,
+                                'audio_queue': audio_queue,
+                                'custom_params': custom_params,
+                                'interruption_requested': False,
+                                'correlation_id': correlation_id
+                            }
                     
-            elif event_type == 'stop':
-                logger.info(f"Stream stopped - CallSid: {call_sid}", 
-                           extra={'correlation_id': correlation_id})
+                elif event_type == 'media' and call_sid and call_sid in active_streams:
+                    # Update activity
+                    with state_lock:
+                        active_streams[call_sid]['last_activity'] = time.time()
+                    
+                    # Handle interruption detection
+                    if active_streams[call_sid].get('is_speaking', False):
+                        try:
+                            audio_chunk = base64.b64decode(data['media']['payload'])
+                            if AUDIOOP_AVAILABLE:
+                                rms = audioop.rms(audio_chunk, 1)
+                            else:
+                                audio_array = np.frombuffer(audio_chunk, dtype=np.uint8)
+                                rms = np.sqrt(np.mean(np.square(audio_array.astype(np.float32))))
+                            
+                            if rms > 700:  # Interruption threshold
+                                active_streams[call_sid]['interruption_requested'] = True
+                                ws.send(json.dumps({
+                                    "event": "clear",
+                                    "streamSid": stream_sid
+                                }))
+                        except:
+                            pass
+                        continue
+                    
+                    # Process audio
+                    try:
+                        audio_chunk = base64.b64decode(data['media']['payload'])
+                    except Exception as e:
+                        logger.error(f"Failed to decode audio: {e}")
+                        continue
+                    
+                    complete_audio = speech_processor.add_audio(audio_chunk)
+                    
+                    if complete_audio:
+                        with processing_lock:
+                            if not active_streams[call_sid]['processing']:
+                                current_time = time.time()
+                                last_response = active_streams[call_sid].get('last_response_time', 0)
+                                
+                                if current_time - last_response < 0.3:
+                                    speech_processor.reset()
+                                    continue
+                                    
+                                active_streams[call_sid]['processing'] = True
+                                active_streams[call_sid]['last_response_time'] = current_time
+                                
+                                # Process asynchronously to prevent blocking
+                                task = asyncio.create_task(
+                                    process_audio_async(complete_audio, stream_sid)
+                                )
+                                processing_tasks.append(task)
+                        
+                elif event_type == 'mark':
+                    if call_sid in active_streams:
+                        mark_data = data.get('mark', {})
+                        mark_name = mark_data.get('name')
+                        
+                        with state_lock:
+                            active_streams[call_sid]['mark_received'].add(mark_name)
+                        
+                        if mark_name == 'response_end':
+                            active_streams[call_sid]['is_speaking'] = False
+                            active_streams[call_sid]['processing'] = False
+                            active_streams[call_sid]['interruption_requested'] = False
+                            if speech_processor:
+                                speech_processor.reset()
+                    
+                elif event_type == 'dtmf':
+                    if call_sid in active_streams:
+                        dtmf_data = data.get('dtmf', {})
+                        digit = dtmf_data.get('digit')
+                        logger.info(f"DTMF received: {digit}", 
+                                   extra={'correlation_id': correlation_id})
+                        
+                        if digit == '#':
+                            task = asyncio.create_task(handle_reset(call_sid, stream_sid))
+                            processing_tasks.append(task)
+                        elif digit == '*':
+                            task = asyncio.create_task(repeat_last_response(call_sid, stream_sid))
+                            processing_tasks.append(task)
+                    
+                elif event_type == 'stop':
+                    logger.info(f"Stream stopped - CallSid: {call_sid}", 
+                               extra={'correlation_id': correlation_id})
+                    break
+                    
+                elif event_type == 'error':
+                    error_code = data.get('error', {}).get('code')
+                    error_message = data.get('error', {}).get('message')
+                    logger.error(f"Stream error - Code: {error_code}, Message: {error_message}", 
+                                extra={'correlation_id': correlation_id})
+                    
+            except websockets.exceptions.ConnectionClosed:
+                logger.info("WebSocket connection closed")
                 break
-                
-            elif event_type == 'error':
-                error_code = data.get('error', {}).get('code')
-                error_message = data.get('error', {}).get('message')
-                logger.error(f"Stream error - Code: {error_code}, Message: {error_message}", 
-                            extra={'correlation_id': correlation_id})
-                
+            except Exception as e:
+                if "timeout" not in str(e).lower():
+                    logger.error(f"WebSocket error: {e}", exc_info=True)
+                    
     except Exception as e:
-        logger.error(f"WebSocket error: {e}", exc_info=True)
+        logger.error(f"WebSocket handler error: {e}", exc_info=True)
     finally:
+        # Cancel any pending tasks
+        for task in processing_tasks:
+            if not task.done():
+                task.cancel()
+                
         # Track WebSocket duration
         ws_duration = time.time() - ws_start_time
         with metrics_lock:
@@ -1229,7 +1288,6 @@ def media_stream(ws):
         
         if call_sid:
             cleanup_call_resources(call_sid)
-
 def cleanup_call_resources(call_sid: str):
     """Enhanced cleanup with metrics and logging"""
     correlation_id = str(uuid.uuid4())
@@ -1747,7 +1805,7 @@ def clean_response_text(text: str) -> str:
     return text.strip()
 
 async def stream_tts_websocket(call_sid: str, stream_sid: str, text: str):
-    """Stream TTS using ElevenLabs WebSocket"""
+    """Stream TTS using ElevenLabs WebSocket with corrected parameters"""
     if call_sid not in active_streams:
         return
     
@@ -1774,6 +1832,7 @@ async def stream_tts_websocket(call_sid: str, stream_sid: str, text: str):
             "xi-api-key": os.getenv("ELEVENLABS_API_KEY")
         }
         
+        # FIXED: Use 'additional_headers' instead of 'extra_headers'
         async with websockets.connect(elevenlabs_url, additional_headers=headers) as elevenlabs_ws:
             elevenlabs_websockets[call_sid] = elevenlabs_ws
             
@@ -1790,25 +1849,25 @@ async def stream_tts_websocket(call_sid: str, stream_sid: str, text: str):
             
             keepalive_task = asyncio.create_task(keepalive())
             
-            # Send initial configuration
+            # Send initial configuration with optimized settings
             init_message = {
                 "text": " ",
                 "voice_settings": {
-                    "stability": 0.4,
+                    "stability": 0.5,
                     "similarity_boost": 0.75,
                     "style": 0.0,
                     "use_speaker_boost": True
                 },
                 "generation_config": {
-                    "chunk_length_schedule": [50, 90, 120, 150]
+                    "chunk_length_schedule": [50, 90, 120, 150, 500]
                 }
             }
             
             await elevenlabs_ws.send(json.dumps(init_message))
             
-            # Send text in sentences
+            # Send text in sentences for better streaming
             sentences = re.split(r'(?<=[.!?])\s+', text)
-            sentences = sentences[:2]
+            sentences = sentences[:2]  # Limit to 2 sentences
             
             for i, sentence in enumerate(sentences):
                 if sentence.strip():
@@ -1826,9 +1885,14 @@ async def stream_tts_websocket(call_sid: str, stream_sid: str, text: str):
             
             # Receive and forward audio
             chunk_count = 0
-            while True:
+            consecutive_timeouts = 0
+            max_consecutive_timeouts = 3
+            
+            while consecutive_timeouts < max_consecutive_timeouts:
                 try:
                     response = await asyncio.wait_for(elevenlabs_ws.recv(), timeout=5.0)
+                    consecutive_timeouts = 0  # Reset on successful receive
+                    
                     data = json.loads(response)
                     
                     if data.get("audio"):
@@ -1845,6 +1909,7 @@ async def stream_tts_websocket(call_sid: str, stream_sid: str, text: str):
                         ws.send(json.dumps(media_message))
                         chunk_count += 1
                         
+                        # Send periodic marks for tracking
                         if chunk_count % 10 == 0:
                             mark_message = {
                                 "event": "mark",
@@ -1859,9 +1924,9 @@ async def stream_tts_websocket(call_sid: str, stream_sid: str, text: str):
                         break
                         
                 except asyncio.TimeoutError:
-                    logger.warning("ElevenLabs WebSocket timeout", 
+                    consecutive_timeouts += 1
+                    logger.warning(f"ElevenLabs WebSocket timeout {consecutive_timeouts}/{max_consecutive_timeouts}", 
                                  extra={'correlation_id': correlation_id})
-                    break
                 except Exception as e:
                     logger.error(f"ElevenLabs WebSocket receive error: {e}", 
                                extra={'correlation_id': correlation_id})
@@ -1885,12 +1950,13 @@ async def stream_tts_websocket(call_sid: str, stream_sid: str, text: str):
                     extra={'correlation_id': correlation_id})
         with metrics_lock:
             metrics['api_errors']['elevenlabs'] += 1
-        # Fallback to HTTP
+        # Fallback to HTTP streaming
         await stream_tts_response(call_sid, stream_sid, text)
     except Exception as e:
         logger.error(f"TTS WebSocket error: {e}", 
                     extra={'correlation_id': correlation_id},
                     exc_info=True)
+        # Fallback to HTTP streaming
         await stream_tts_response(call_sid, stream_sid, text)
     finally:
         # Cancel keepalive task
@@ -1899,7 +1965,6 @@ async def stream_tts_websocket(call_sid: str, stream_sid: str, text: str):
         # Clean up WebSocket reference
         if call_sid in elevenlabs_websockets:
             elevenlabs_websockets.pop(call_sid, None)
-
 async def stream_tts_response(call_sid: str, stream_sid: str, text: str):
     """Fallback TTS streaming via HTTP"""
     if call_sid not in active_streams:
@@ -2009,7 +2074,7 @@ async def stream_tts_response(call_sid: str, stream_sid: str, text: str):
     ws.send(json.dumps(end_mark))
 
 def convert_mulaw_to_pcm(mulaw_data: bytes) -> bytes:
-    """Convert mulaw to PCM with validation"""
+    """Convert mulaw to PCM with proper validation and error handling"""
     try:
         if not mulaw_data or not isinstance(mulaw_data, bytes):
             return b''
@@ -2020,29 +2085,36 @@ def convert_mulaw_to_pcm(mulaw_data: bytes) -> bytes:
             
         if AUDIOOP_AVAILABLE and audioop:
             try:
+                # Convert μ-law to 16-bit linear PCM
                 pcm_8khz = audioop.ulaw2lin(mulaw_data, 2)
-                pcm_16khz = audioop.ratecv(pcm_8khz, 2, 1, 8000, 16000, None)[0]
+                # Resample from 8kHz to 16kHz using proper ratecv
+                pcm_16khz, _ = audioop.ratecv(pcm_8khz, 2, 1, 8000, 16000, None)
                 return pcm_16khz
             except audioop.error as e:
                 logger.warning(f"audioop conversion error: {e}, falling back to pydub")
         
+        # Fallback to pydub - create proper audio segment
         mulaw_buffer = io.BytesIO(mulaw_data)
-        audio = AudioSegment.from_raw(
-            mulaw_buffer,
-            sample_width=1,
+        audio = AudioSegment(
+            data=mulaw_data,
+            sample_width=1,  # μ-law is 1 byte per sample
             frame_rate=8000,
-            channels=1,
-            frame_width=1
+            channels=1
         )
-        audio = audio.set_sample_width(2).set_frame_rate(16000)
+        
+        # Convert to 16-bit PCM
+        audio = audio.set_sample_width(2)
+        # Resample to 16kHz
+        audio = audio.set_frame_rate(16000)
+        
         return audio.raw_data
             
     except Exception as e:
-        logger.error(f"Audio conversion error: {e}")
+        logger.error(f"Audio conversion error: {e}", exc_info=True)
         return b''
 
 async def transcribe_audio(audio_pcm: bytes) -> str:
-    """Transcribe audio with retry logic"""
+    """Transcribe audio using OpenAI's new streaming API with gpt-4o-mini-transcribe"""
     if not audio_pcm or len(audio_pcm) < 1600:
         return ""
     
@@ -2051,8 +2123,10 @@ async def transcribe_audio(audio_pcm: bytes) -> str:
     
     while retry_count < max_retries:
         try:
+            # Create WAV format in memory
             audio_buffer = io.BytesIO()
             
+            # Create audio segment for proper WAV export
             audio = AudioSegment(
                 data=audio_pcm,
                 sample_width=2,
@@ -2060,6 +2134,7 @@ async def transcribe_audio(audio_pcm: bytes) -> str:
                 channels=1
             )
             
+            # Export as WAV with proper headers
             audio.export(
                 audio_buffer, 
                 format="wav",
@@ -2070,20 +2145,50 @@ async def transcribe_audio(audio_pcm: bytes) -> str:
             
             del audio
             
-            result = await async_openai.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_buffer,
-                language="en",
-                response_format="text",
-                temperature=0.0
-            )
-            
-            return result.strip()
-            
+            # Try streaming transcription with new model
+            try:
+                # Use streaming with gpt-4o-mini-transcribe for better performance
+                stream = await async_openai.audio.transcriptions.create(
+                    model="gpt-4o-mini-transcribe",  # New faster model
+                    file=audio_buffer,
+                    language="en",
+                    stream=True,
+                    temperature=0.0,
+                    response_format="text",
+                    chunking_strategy="auto"  # Let OpenAI handle VAD
+                )
+                
+                # Collect streaming response
+                transcript = ""
+                async for event in stream:
+                    if hasattr(event, 'type'):
+                        if event.type == "transcript.text.delta":
+                            transcript += event.delta
+                        elif event.type == "transcript.text.done":
+                            transcript = event.text
+                            break
+                
+                return transcript.strip()
+                
+            except Exception as streaming_error:
+                logger.warning(f"Streaming transcription failed, trying non-streaming: {streaming_error}")
+                
+                # Fallback to non-streaming with whisper-1
+                audio_buffer.seek(0)
+                result = await async_openai.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_buffer,
+                    language="en",
+                    response_format="text",
+                    temperature=0.0
+                )
+                
+                return result.strip()
+                
         except Exception as e:
             retry_count += 1
             if retry_count >= max_retries:
-                logger.error(f"Transcription error after {max_retries} retries: {e}")
+                logger.error(f"Transcription error after {max_retries} retries: {e}", exc_info=True)
                 with metrics_lock:
                     metrics['api_errors']['openai'] += 1
                 return ""

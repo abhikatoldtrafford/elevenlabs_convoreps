@@ -2,12 +2,6 @@
 ConvoReps OpenAI Realtime Edition - Production Ready v1.0
 Real-time voice conversation practice with OpenAI Realtime API
 
-To run locally:
-  python app.py
-
-To run with gunicorn (for production):
-  gunicorn app:app -w 1 -k uvicorn.workers.UvicornWorker
-
 FEATURES:
 ✅ OpenAI Realtime API for end-to-end audio processing
 ✅ Twilio Media Streams integration
@@ -35,6 +29,7 @@ import websockets
 import csv
 import uuid
 import logging
+import signal
 import tempfile
 import shutil
 import threading
@@ -47,11 +42,10 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, WebSocket, Request, HTTPException, Response
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.websockets import WebSocketDisconnect
-import websockets.exceptions
-from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Play, Pause, Stream as TwilioStream
+from flask import Flask, request, Response, session, send_from_directory
+from flask_cors import CORS
+from flask_sock import Sock
+from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Play, Pause, Stream
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client as TwilioClient
 from dotenv import load_dotenv
@@ -95,13 +89,18 @@ root_logger.addHandler(console_handler)
 
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI
-app = FastAPI(title="ConvoReps Realtime API", version="1.0")
+# Initialize Flask app
+app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "your-secret-key-here")
+CORS(app)
+
+# Initialize WebSocket support
+sock = Sock(app)
 
 # Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12-17")
-PORT = int(os.getenv("PORT", "5050"))  # Render sets PORT to 10000
+PORT = int(os.getenv("PORT", 5050))
 FREE_CALL_MINUTES = float(os.getenv("FREE_CALL_MINUTES", "5.0"))
 MIN_CALL_DURATION = float(os.getenv("MIN_CALL_DURATION", "0.5"))
 USAGE_CSV_PATH = os.getenv("USAGE_CSV_PATH", "user_usage.csv")
@@ -115,13 +114,16 @@ TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 TWILIO_TO_NUMBER = os.getenv("TWILIO_TO_NUMBER")  # Default recipient for SMS/email notifications
 
 # Initialize clients
-twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID else None
-twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
-openai_client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # Validate configuration
 if not OPENAI_API_KEY:
     raise ValueError('Missing the OpenAI API key. Please set it in the .env file.')
+
+if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+    raise ValueError('Missing Twilio credentials. Please set them in the .env file.')
 
 # Thread pool for async operations
 executor = ThreadPoolExecutor(max_workers=5)
@@ -227,6 +229,26 @@ interview_questions = [
 
 # Graceful shutdown
 shutdown_event = threading.Event()
+
+def signal_handler(sig, frame):
+    """Handle graceful shutdown"""
+    logger.info("Graceful shutdown initiated...")
+    shutdown_event.set()
+    
+    with state_lock:
+        for call_sid in list(active_streams.keys()):
+            cleanup_call_resources(call_sid)
+    
+    with state_lock:
+        for timer in call_timers.values():
+            timer.cancel()
+    
+    create_csv_backup()
+    logger.info("Shutdown complete")
+    exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 # Validation functions
 def validate_phone_number(phone_number: str) -> bool:
@@ -881,23 +903,44 @@ def cleanup_call_resources(call_sid: str):
     
     gc.collect()  # Memory optimization
 
+# Periodic cleanup
+def periodic_cleanup():
+    """Clean up stale connections periodically"""
+    while not shutdown_event.is_set():
+        try:
+            time.sleep(60)
+            current_time = time.time()
+            stale_calls = []
+            
+            with state_lock:
+                for call_sid, stream_data in list(active_streams.items()):
+                    if current_time - stream_data.get('last_activity', 0) > 300:
+                        stale_calls.append(call_sid)
+            
+            for call_sid in stale_calls:
+                logger.info(f"Cleaning up stale connection: {call_sid}")
+                cleanup_call_resources(call_sid)
+                
+        except Exception as e:
+            logger.error(f"Cleanup thread error: {e}")
+
+cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
+cleanup_thread.start()
+
 # Twilio endpoints
-@app.get("/", response_class=HTMLResponse)
-async def index_page():
+@app.route("/", methods=["GET"])
+def index_page():
     return "<html><body><h1>ConvoReps Realtime Server is running!</h1></body></html>"
 
-@app.api_route("/voice", methods=["GET", "POST"])
-async def handle_incoming_call(request: Request):
+@app.route("/voice", methods=["POST", "GET"])
+def handle_incoming_call():
     """Handle incoming call and return TwiML response"""
     correlation_id = str(uuid.uuid4())
     
-    # Get form data
-    form_data = await request.form()
-    params = dict(form_data)
-    
     # Security validation
     if TWILIO_AUTH_TOKEN:
-        url = str(request.url)
+        url = request.url
+        params = request.values
         signature = request.headers.get('X-Twilio-Signature', '')
         
         if not twilio_validator.validate(url, params, signature):
@@ -905,12 +948,12 @@ async def handle_incoming_call(request: Request):
                          extra={'correlation_id': correlation_id})
             response = VoiceResponse()
             response.reject()
-            return HTMLResponse(content=str(response), media_type="application/xml", status_code=403)
+            return str(response), 403
     
     # Get parameters
-    call_sid = params.get("CallSid")
-    from_number = params.get("From", "+10000000000")
-    recording_url = params.get("RecordingUrl")
+    call_sid = request.values.get("CallSid")
+    from_number = request.values.get("From", "+10000000000")
+    recording_url = request.values.get("RecordingUrl")
     
     if not validate_call_sid(call_sid):
         logger.error(f"Invalid CallSid: {call_sid}", 
@@ -918,7 +961,7 @@ async def handle_incoming_call(request: Request):
         response = VoiceResponse()
         response.say("Sorry, there was an error processing your call.")
         response.hangup()
-        return HTMLResponse(content=str(response), media_type="application/xml")
+        return str(response)
     
     logger.info(f"New call: {call_sid} from {from_number}", 
                extra={'correlation_id': correlation_id})
@@ -935,7 +978,7 @@ async def handle_incoming_call(request: Request):
         response = VoiceResponse()
         response.say("Sorry, we couldn't validate your phone number.")
         response.hangup()
-        return HTMLResponse(content=str(response), media_type="application/xml")
+        return str(response)
     
     # Check free minutes
     usage_data = read_user_usage(from_number)
@@ -955,7 +998,7 @@ async def handle_incoming_call(request: Request):
         
         executor.submit(run_async_task, send_sms_link(from_number, is_first_call=False))
         
-        return HTMLResponse(content=str(response), media_type="application/xml")
+        return str(response)
     
     # Initialize call state
     with state_lock:
@@ -976,7 +1019,11 @@ async def handle_incoming_call(request: Request):
     
     # Play greeting with beep
     if turn_count.get(call_sid, 0) == 0:
-        if not is_repeat_caller:
+        # Check session for first-time caller status
+        has_called_session = session.get("has_called_before", False)
+        
+        if not has_called_session and not is_repeat_caller:
+            session["has_called_before"] = True
             greeting_file = "first_time_greeting.mp3"
             logger.info("New caller detected — playing first-time greeting", 
                        extra={'correlation_id': correlation_id})
@@ -1001,14 +1048,14 @@ async def handle_incoming_call(request: Request):
         response.pause(length=1)
     
     # Connect to WebSocket stream
-    host = request.headers.get('X-Forwarded-Host', request.headers.get('Host', request.url.hostname))
-    ws_scheme = "wss" if request.url.scheme == "https" else "ws"
+    host = request.headers.get('X-Forwarded-Host', request.headers.get('Host', request.url_root.replace('http://', '').replace('https://', '').rstrip('/')))
+    ws_scheme = "wss" if request.is_secure else "ws"
     stream_url = f"{ws_scheme}://{host}/media-stream"
     
     logger.info(f"Stream URL: {stream_url}", extra={'correlation_id': correlation_id})
     
     connect = Connect()
-    stream = TwilioStream(
+    stream = Stream(
         url=stream_url,
         track="inbound_track"  # Bidirectional streams
     )
@@ -1038,14 +1085,40 @@ async def handle_incoming_call(request: Request):
     with state_lock:
         call_timers[call_sid] = timer
     
-    return HTMLResponse(content=str(response), media_type="application/xml")
+    return str(response)
 
-@app.websocket("/media-stream")
-async def handle_media_stream(websocket: WebSocket):
+@sock.route('/media-stream')
+def handle_media_stream(ws):
     """Handle WebSocket connection between Twilio and OpenAI Realtime"""
-    await websocket.accept()
     logger.info("Client connected to media stream")
     
+    stream_sid = None
+    call_sid = None
+    from_number = None
+    minutes_left = FREE_CALL_MINUTES
+    correlation_id = None
+    openai_ws = None
+    latest_media_timestamp = 0
+    response_start_timestamp_twilio = None
+    mark_queue = []
+    last_assistant_item = None
+    
+    def run_websocket_handler():
+        """Run the async websocket handler in a new event loop"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(handle_media_stream_async(ws))
+        finally:
+            loop.close()
+    
+    # Run the async handler in a thread
+    handler_thread = threading.Thread(target=run_websocket_handler)
+    handler_thread.start()
+    handler_thread.join()
+
+async def handle_media_stream_async(ws):
+    """Async handler for WebSocket connection"""
     stream_sid = None
     call_sid = None
     from_number = None
@@ -1394,13 +1467,12 @@ async def handle_media_stream(websocket: WebSocket):
             # Run both tasks concurrently
             await asyncio.gather(receive_from_twilio(), send_to_twilio())
             
-    except websockets.exceptions.WebSocketException as e:
-        logger.error(f"WebSocket error: {e}", exc_info=True)
     except Exception as e:
         logger.error(f"WebSocket handler error: {e}", exc_info=True)
     finally:
         if call_sid:
             cleanup_call_resources(call_sid)
+        await websocket.close()
 
 async def send_session_update(openai_ws):
     """Send session configuration to OpenAI"""
@@ -1700,8 +1772,8 @@ async def repeat_last_response(openai_ws, call_sid: str):
     await openai_ws.send(json.dumps(response_event))
 
 # Health and monitoring endpoints
-@app.get("/health")
-async def health_check():
+@app.route("/health", methods=["GET"])
+def health_check():
     """Health check endpoint"""
     with state_lock:
         active_count = len(active_streams)
@@ -1720,8 +1792,8 @@ async def health_check():
         "realtime_model": OPENAI_REALTIME_MODEL
     }
 
-@app.get("/metrics")
-async def metrics_endpoint():
+@app.route("/metrics", methods=["GET"])
+def metrics_endpoint():
     """Detailed metrics endpoint"""
     with state_lock:
         active_count = len(active_streams)
@@ -1790,51 +1862,33 @@ def get_csv_statistics() -> Dict[str, Any]:
         return {"error": str(e)}
 
 # Static file serving
-@app.get("/static/{filename:path}")
-async def serve_static(filename: str):
+@app.route("/static/<path:filename>")
+def serve_static(filename):
     """Serve static files securely"""
     if '..' in filename or filename.startswith('/'):
-        raise HTTPException(status_code=400, detail="Invalid filename")
-    
-    file_path = os.path.join("static", filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    # Determine content type
-    content_type = "application/octet-stream"
-    if filename.endswith('.mp3'):
-        content_type = "audio/mpeg"
-    elif filename.endswith('.wav'):
-        content_type = "audio/wav"
-    
-    with open(file_path, 'rb') as f:
-        content = f.read()
-    
-    return Response(content=content, media_type=content_type)
+        return "Invalid filename", 400
+    return send_from_directory("static", filename)
 
-@app.api_route("/sms", methods=["GET", "POST"])
-async def sms_webhook(request: Request):
+@app.route("/sms", methods=["GET", "POST"])
+def sms_webhook():
     """Handle incoming SMS messages from Twilio"""
     correlation_id = str(uuid.uuid4())
     
     try:
-        # Get form data
-        form_data = await request.form()
-        params = dict(form_data)
-        
         # Security validation
         if TWILIO_AUTH_TOKEN:
-            url = str(request.url)
+            url = request.url
+            params = request.values
             signature = request.headers.get('X-Twilio-Signature', '')
             
             if not twilio_validator.validate(url, params, signature):
                 logger.warning("Invalid Twilio signature for SMS", 
                              extra={'correlation_id': correlation_id})
-                raise HTTPException(status_code=403, detail="Invalid signature")
+                return "", 403
         
-        from_number = params.get('From')
-        to_number = params.get('To')
-        body = params.get('Body', '').strip().lower()
+        from_number = request.values.get('From')
+        to_number = request.values.get('To')
+        body = request.values.get('Body', '').strip().lower()
         
         logger.info(f"Incoming SMS from {from_number}: {body}", 
                    extra={'correlation_id': correlation_id})
@@ -1858,17 +1912,15 @@ async def sms_webhook(request: Request):
                 "Visit convoreps.com for more info."
             )
         
-        return HTMLResponse(content=str(response), media_type="application/xml")
+        return str(response)
         
     except Exception as e:
         logger.error(f"SMS webhook error: {e}", 
                     extra={'correlation_id': correlation_id},
                     exc_info=True)
-        return HTMLResponse(content="", status_code=200)
+        return "", 200
 
 if __name__ == "__main__":
-    import uvicorn
-    
     # Ensure directories exist
     os.makedirs("static", exist_ok=True)
     os.makedirs(os.path.dirname(USAGE_CSV_PATH) or ".", exist_ok=True)
@@ -1910,5 +1962,4 @@ if __name__ == "__main__":
     logger.info(f"   - Port: {PORT}")
     logger.info("\n")
     
-    # Run with uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    app.run(host="0.0.0.0", port=PORT, debug=False)

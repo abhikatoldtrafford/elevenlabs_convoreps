@@ -1,12 +1,9 @@
 """
-ConvoReps FastAPI OpenAI Realtime Edition - Production Ready v3.0
-Based on working implementation with minimal modifications
-
-This version uses as much of the working code as possible, only adding
-ConvoReps-specific features on top of the proven pattern.
+ConvoReps FastAPI OpenAI Realtime Edition - Production Ready v3.1 FIXED
+Complete implementation with proper minute tracking and original settings
 
 Author: ConvoReps Team
-Version: 3.0 (Based on Working Implementation)
+Version: 3.1 (Fixed minute calculation)
 """
 
 import os
@@ -52,7 +49,7 @@ except ImportError:
 # Load environment variables
 load_dotenv()
 
-# Configure logging - matching working implementation
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -61,9 +58,9 @@ OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12-17")
 PORT = int(os.getenv('PORT', 5050))
 
-# ConvoReps specific configuration
+# ConvoReps specific configuration - FROM ORIGINAL APP.PY
 FREE_CALL_MINUTES = float(os.getenv("FREE_CALL_MINUTES", "5.0"))
-MIN_CALL_DURATION = float(os.getenv("MIN_CALL_DURATION", "0.5"))
+MIN_CALL_DURATION = float(os.getenv("MIN_CALL_DURATION", "0.5"))  # Minimum 30 seconds
 USAGE_CSV_PATH = os.getenv("USAGE_CSV_PATH", "user_usage.csv")
 USAGE_CSV_BACKUP_PATH = os.getenv("USAGE_CSV_BACKUP_PATH", "user_usage_backup.csv")
 CONVOREPS_URL = os.getenv("CONVOREPS_URL", "https://convoreps.com")
@@ -74,7 +71,10 @@ TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 
-# Voice configuration - ConvoReps voices
+# OpenAI Realtime supported voices
+OPENAI_REALTIME_VOICES = ['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse']
+
+# Voice configuration - Default to supported voices
 VOICE = 'echo'  # Default voice
 LOG_EVENT_TYPES = [
     'response.content.done', 'rate_limits.updated', 'response.done',
@@ -110,6 +110,7 @@ interview_question_index: Dict[str, int] = {}
 mode_lock: Dict[str, str] = {}
 turn_count: Dict[str, int] = {}
 active_sessions: Dict[str, bool] = {}
+processed_calls: Set[str] = set()  # Track processed calls to prevent double-counting
 
 # Metrics
 metrics = {
@@ -126,10 +127,10 @@ metrics_lock = threading.Lock()
 # CSV lock
 csv_lock = threading.Lock()
 
-# Voice profiles for ConvoReps
+# ORIGINAL VOICE PROFILES FROM APP.PY - Updated with OpenAI voices
 cold_call_personality_pool = {
     "Jerry": {
-        "voice": "ash",
+        "voice": "ash",  # Changed from ElevenLabs ID to OpenAI voice
         "system_prompt": """You're Jerry, a skeptical small business owner. Be direct but not rude. Stay in character. Keep responses SHORT - 1-2 sentences max.
 
 You have access to a tool called 'check_remaining_time' that tells you how many minutes are left in the user's free call.
@@ -147,7 +148,7 @@ HOW TO RESPOND WITH TIME INFO:
 NEVER mention the tool by name, just naturally work the time info into your response. Stay in character as Jerry - be direct about it."""
     },
     "Miranda": {
-        "voice": "echo",
+        "voice": "echo",  # Changed from ElevenLabs ID
         "system_prompt": """You're Miranda, a busy office manager. No time for fluff. Be grounded and real. Keep responses SHORT - 1-2 sentences max.
 
 You have access to a tool called 'check_remaining_time' that tells you how many minutes are left in the user's free call.
@@ -163,7 +164,7 @@ HOW TO RESPOND:
 - Stay in character - you're busy, so be matter-of-fact about it."""
     },
     "Brett": {
-        "voice": "sage",
+        "voice": "sage",  # Changed from ElevenLabs ID
         "system_prompt": """You're Brett, a contractor answering mid-job. Busy and a bit annoyed. Talk rough, fast, casual. Keep responses SHORT.
 
 You have access to a tool called 'check_remaining_time' for checking remaining call time.
@@ -180,6 +181,20 @@ HOW TO RESPOND:
     }
 }
 
+# Additional voices from original
+additional_voices = {
+    "Burt": {"voice": "ballad"},
+    "Brad": {"voice": "coral"},
+    "Gregory": {"voice": "verse"},
+    "Belle": {"voice": "shimmer"},
+    "Hope": {"voice": "alloy"},
+    "Jamahal": {"voice": "ash"}
+}
+
+# Special voice for time limit messages
+TIME_LIMIT_VOICE = "alloy"
+
+# ORIGINAL INTERVIEW QUESTIONS FROM APP.PY
 interview_questions = [
     "Can you walk me through your most recent role and responsibilities?",
     "What would you say are your greatest strengths?",
@@ -193,7 +208,7 @@ interview_questions = [
     "Do you have any questions for me about the company or the role?"
 ]
 
-# CSV filename for continuous logging - matching working implementation
+# CSV filename for continuous logging
 CSV_FILE_NAME = "conversation_transcript.csv"
 
 # Initialize directories
@@ -341,14 +356,9 @@ def update_user_usage(phone_number: str, minutes_used: float):
     except Exception as e:
         logger.error(f"Error updating CSV: {e}")
 
-# Helper function to append transcript - from working implementation
+# Helper function to append transcript
 def append_transcript_to_csv(role: str, transcript: str, stream_sid: str):
-    """
-    Appends a single row to a CSV file. Each row will contain:
-    - streamSid (which call)
-    - role (assistant/user)
-    - transcript text
-    """
+    """Appends a single row to a CSV file"""
     file_exists = os.path.isfile(CSV_FILE_NAME)
 
     with open(CSV_FILE_NAME, mode="a", newline="", encoding="utf-8") as csvfile:
@@ -483,7 +493,7 @@ async def send_convoreps_sms_link(phone_number: str, is_first_call: bool = True)
         with state_lock:
             sms_sent_flags[phone_number] = False
 
-# Mode detection
+# ORIGINAL MODE DETECTION FROM APP.PY
 def detect_intent(text: str) -> str:
     """Detect conversation mode from text"""
     lowered = text.lower()
@@ -528,7 +538,7 @@ def get_personality_for_mode(call_sid: str, mode: str) -> Tuple[str, str, str]:
         )
         
     elif mode == "interview":
-        voice = "alloy"
+        voice = "alloy"  # Using OpenAI voice
         system_prompt = (
             f"You are Rachel, a friendly, conversational job interviewer. "
             "Ask one interview question at a time, give supportive feedback. "
@@ -552,16 +562,31 @@ def get_personality_for_mode(call_sid: str, mode: str) -> Tuple[str, str, str]:
             "Hey, what's up?"
         )
 
-# Timer handling
+# Timer handling - FIXED VERSION
 def handle_time_limit(call_sid: str, from_number: str):
     """Handle when free time limit is reached"""
     logger.info(f"Time limit reached for {call_sid}")
     
-    # Update CSV immediately
+    # Check if call is still active
+    with state_lock:
+        if call_sid not in active_streams:
+            logger.info(f"Call {call_sid} already ended, skipping time limit processing")
+            return
+        
+        # Check if already processed
+        if call_sid in processed_calls:
+            logger.info(f"Call {call_sid} already processed, skipping")
+            return
+    
+    # Only update if call is still active
     if call_sid in call_start_times:
         elapsed_minutes = (time.time() - call_start_times[call_sid]) / 60.0
         update_user_usage(from_number, elapsed_minutes)
-        logger.info(f"Updated usage for {from_number}: {elapsed_minutes:.2f} minutes")
+        logger.info(f"Updated usage for {from_number}: {elapsed_minutes:.2f} minutes (time limit reached)")
+        
+        # Mark as processed
+        with state_lock:
+            processed_calls.add(call_sid)
     
     # Mark session for time limit message
     with state_lock:
@@ -569,32 +594,38 @@ def handle_time_limit(call_sid: str, from_number: str):
             active_sessions[call_sid] = False
 
 def cleanup_call_resources(call_sid: str):
-    """Clean up call resources"""
+    """Clean up call resources - FIXED VERSION WITH PROPER MINUTE TRACKING"""
     with state_lock:
         if call_sid in active_streams:
             from_number = active_streams[call_sid].get('from_number', '')
             
-            # Update usage if not already done
-            if call_sid in call_start_times and call_sid not in call_timers:
-                call_duration = time.time() - call_start_times[call_sid]
-                minutes_used = call_duration / 60.0
-                
-                if from_number and validate_phone_number(from_number) and minutes_used > 0.01:
-                    update_user_usage(from_number, minutes_used)
-                    logger.info(f"Call {call_sid} lasted {minutes_used:.2f} minutes")
-                    
-                    # Check if SMS needed
-                    usage_after = read_user_usage(from_number)
-                    if usage_after['minutes_left'] <= 0.5:
-                        is_first_call = usage_after['total_calls'] <= 1
-                        asyncio.create_task(send_convoreps_sms_link(from_number, is_first_call=is_first_call))
-                
-                call_start_times.pop(call_sid, None)
-            
-            # Cancel timer
+            # Cancel timer FIRST to prevent it from firing
             if call_sid in call_timers:
                 call_timers[call_sid].cancel()
                 call_timers.pop(call_sid, None)
+            
+            # Update usage based on ACTUAL call duration
+            if call_sid in call_start_times and from_number and validate_phone_number(from_number):
+                # Check if not already processed
+                if call_sid not in processed_calls:
+                    call_duration = time.time() - call_start_times[call_sid]
+                    minutes_used = call_duration / 60.0
+                    
+                    # Only update if meaningful duration (more than 1 second)
+                    if minutes_used > 0.01:
+                        update_user_usage(from_number, minutes_used)
+                        logger.info(f"Call {call_sid} lasted {minutes_used:.2f} minutes (actual duration)")
+                        
+                        # Mark as processed
+                        processed_calls.add(call_sid)
+                        
+                        # Check if SMS needed
+                        usage_after = read_user_usage(from_number)
+                        if usage_after['minutes_left'] <= 0.5:
+                            is_first_call = usage_after['total_calls'] <= 1
+                            asyncio.create_task(send_convoreps_sms_link(from_number, is_first_call=is_first_call))
+                
+                call_start_times.pop(call_sid, None)
             
             # Clean up state
             active_streams.pop(call_sid, None)
@@ -612,11 +643,15 @@ def cleanup_call_resources(call_sid: str):
                     with state_lock:
                         sms_sent_flags.pop(from_number, None)
                 threading.Thread(target=clear_sms_flag, daemon=True).start()
+            
+            # Clean up processed_calls periodically
+            if len(processed_calls) > 100:
+                processed_calls.clear()
     
     with metrics_lock:
         metrics['active_calls'] = max(0, metrics['active_calls'] - 1)
 
-# HTTP endpoints - matching working implementation structure
+# HTTP endpoints
 @app.get("/", response_class=HTMLResponse)
 async def index_page():
     return "<html><body><h1>ConvoReps Realtime Server is running!</h1></body></html>"
@@ -694,7 +729,7 @@ async def handle_incoming_call(request: Request):
     
     response = VoiceResponse()
     
-    # Play greeting with beep
+    # Play greeting with beep - FROM ORIGINAL APP.PY
     if turn_count.get(call_sid, 0) == 0:
         if not is_repeat_caller:
             greeting_file = "first_time_greeting.mp3"
@@ -723,6 +758,11 @@ async def handle_incoming_call(request: Request):
     connect.stream(url=f'wss://{host}/media-stream')
     response.append(connect)
     
+    # Fallback TwiML
+    response.say("Thank you for practicing with ConvoReps!")
+    response.pause(length=1)
+    response.hangup()
+    
     # Set up timer
     timer_duration = minutes_left * 60 if minutes_left < FREE_CALL_MINUTES else FREE_CALL_MINUTES * 60
     logger.info(f"Setting timer for {timer_duration:.0f} seconds")
@@ -747,10 +787,10 @@ async def handle_media_stream(websocket: WebSocket):
     call_sid = None
     
     try:
-        # Connect to OpenAI using websockets library - matching working implementation
+        # Connect to OpenAI using websockets library
         openai_ws = await websockets.connect(
             f'wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}',
-            additional_headers={
+            additional_headers={  # FIXED: Changed from extra_headers
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
                 "OpenAI-Beta": "realtime=v1"
             }
@@ -771,10 +811,8 @@ async def handle_media_stream(websocket: WebSocket):
                     
                     if data['event'] == 'start':
                         stream_sid = data['start']['streamSid']
-                        # Get call_sid from Twilio params
                         call_sid = data['start'].get('callSid')
                         if not call_sid:
-                            # Try custom parameters
                             call_sid = data['start'].get('customParameters', {}).get('call_sid')
                         
                         print(f"Incoming stream has started {stream_sid} for call {call_sid}")
@@ -860,7 +898,7 @@ async def handle_media_stream(websocket: WebSocket):
 
                         await send_mark(websocket, stream_sid)
 
-                    # ADDED: Parse transcripts and append to CSV
+                    # Parse transcripts and append to CSV
                     if response.get('type') == 'response.done':
                         if 'response' in response and 'output' in response['response']:
                             for item in response['response']['output']:
@@ -1123,6 +1161,12 @@ async def send_session_update(openai_ws, call_sid: str = None):
     mode = mode_lock.get(call_sid, "cold_call") if call_sid else "cold_call"
     voice, system_prompt, greeting = get_personality_for_mode(call_sid or "", mode)
     
+    # Add interview question if needed
+    if mode == "interview" and call_sid:
+        current_q_idx = interview_question_index.get(call_sid, 0)
+        if current_q_idx < len(interview_questions):
+            system_prompt += f"\n\nAsk this question next: {interview_questions[current_q_idx]}"
+    
     session_update = {
         "type": "session.update",
         "session": {
@@ -1169,7 +1213,7 @@ async def health_check():
         "timestamp": datetime.utcnow().isoformat(),
         "active_streams": active_count,
         "api_health": api_health,
-        "version": "3.0-working-pattern",
+        "version": "3.1-fixed",
         "realtime_model": OPENAI_REALTIME_MODEL
     }
 
@@ -1196,8 +1240,12 @@ if __name__ == "__main__":
     # Initialize CSV
     init_csv()
     
-    logger.info("\n🚀 ConvoReps FastAPI OpenAI Realtime Edition v3.0")
-    logger.info("   Based on working implementation pattern")
+    logger.info("\n🚀 ConvoReps FastAPI OpenAI Realtime Edition v3.1 FIXED")
+    logger.info("   ✅ Fixed minute calculation - tracks actual call duration")
+    logger.info("   ✅ All original settings from app.py preserved")
+    logger.info("   ✅ Original personality prompts")
+    logger.info("   ✅ Original mode detection")
+    logger.info("   ✅ OpenAI Realtime API voices")
     logger.info(f"   Model: {OPENAI_REALTIME_MODEL}")
     logger.info(f"   Free Minutes: {FREE_CALL_MINUTES}")
     logger.info(f"   Port: {PORT}")

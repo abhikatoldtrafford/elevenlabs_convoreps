@@ -1,46 +1,30 @@
 """
-ConvoReps WebSocket Streaming Edition - Production Ready v4.2 FINAL
-Real-time voice conversation practice with ultra-low latency streaming
+ConvoReps OpenAI Realtime Edition - Production Ready v1.0
+Real-time voice conversation practice with OpenAI Realtime API
 
-PRODUCTION-READY VERSION WITH ALL FIXES:
-✅ Non-streaming tool calling for reliability
-✅ SMS deduplication with atomic operations
-✅ CSV atomic writes with temp files
-✅ Comprehensive input validation
-✅ WebSocket security validation
-✅ Enhanced error recovery and retries
-✅ Backup mechanisms for critical data
-✅ Advanced health checks with WebSocket status
-✅ Detailed monitoring metrics
-✅ Structured logging with correlation IDs (FIXED in v4.1)
-✅ Graceful shutdown handling
-✅ All original features retained
-
-FINAL FIXES:
-v4.1: Fixed logging error where correlation_id was missing from third-party library logs
-v4.2: Fixed websockets.connect() parameter from extra_headers to additional_headers
-
-IMPORTANT: Add 'websockets' to your requirements.txt
+FEATURES:
+✅ OpenAI Realtime API for end-to-end audio processing
+✅ Twilio Media Streams integration
+✅ User tracking with CSV (minutes used/remaining)
+✅ SMS sending with deduplication
+✅ Function calling for time checking
+✅ Different conversation modes (cold_call, interview, small_talk)
+✅ Time limit enforcement with automatic SMS
+✅ Graceful shutdown and error handling
+✅ Health checks and metrics
+✅ Voice activity detection (server-side)
+✅ Atomic CSV writes with backups
+✅ Comprehensive logging with correlation IDs
 
 Author: ConvoReps Team
-Version: 4.2 FINAL (Production Ready & Tested)
+Version: 1.0 (OpenAI Realtime Edition)
 """
-
-import sys
-if sys.version_info < (3, 8):
-    print("❌ Python 3.8+ required")
-    sys.exit(1)
 
 import os
 import io
 import json
 import base64
-import random
-import time
-import threading
 import asyncio
-import re
-import gc
 import websockets
 import csv
 import uuid
@@ -48,144 +32,109 @@ import logging
 import signal
 import tempfile
 import shutil
-import traceback
+import threading
+import time
+import re
+import gc
+import random
 from pathlib import Path
-from functools import wraps
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple, Set
-import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+
+from fastapi import FastAPI, WebSocket, Request, HTTPException, Response
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.websockets import WebSocketDisconnect
+import websockets.exceptions
+from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Play, Pause, Stream as TwilioStream
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client as TwilioClient
-from flask import Flask, request, Response, session, send_from_directory
-from flask_cors import CORS
-from flask_sock import Sock
-from twilio.twiml.voice_response import VoiceResponse, Connect, Stream, Say, Play, Pause, Gather
 from dotenv import load_dotenv
-from pydub import AudioSegment
+import openai
+import pandas as pd
 
-# Try to import audioop, use fallback if not available
 try:
-    import audioop
-    AUDIOOP_AVAILABLE = True
+    from pydub.generators import Sine
+    from pydub import AudioSegment
+    PYDUB_AVAILABLE = True
 except ImportError:
-    print("⚠️ audioop not available, using pydub for audio conversion")
-    audioop = None
-    AUDIOOP_AVAILABLE = False
-
-# Cross-platform file locking
-try:
-    import fcntl
-    HAS_FCNTL = True
-except ImportError:
-    HAS_FCNTL = False
-    print("⚠️ fcntl not available (Windows), using thread lock for CSV access")
-
-from openai import OpenAI, AsyncOpenAI
-from elevenlabs import VoiceSettings
-from elevenlabs.client import ElevenLabs
+    PYDUB_AVAILABLE = False
+    print("⚠️ pydub not available, beep generation disabled")
 
 # Load environment variables
 load_dotenv()
 
-# Custom formatter that handles missing correlation_id gracefully
+# Custom formatter for correlation IDs
 class CorrelationFormatter(logging.Formatter):
     def format(self, record):
-        # Add correlation_id if not present
         if not hasattr(record, 'correlation_id'):
             record.correlation_id = getattr(record, 'correlation_id', 'NO-ID')
-        
-        # Format the message
         return super().format(record)
 
-# Initialize structured logging with custom formatter
+# Initialize structured logging
 formatter = CorrelationFormatter(
     '%(asctime)s - %(name)s - %(levelname)s - [%(correlation_id)s] - %(message)s'
 )
 
-# Set up handlers
-file_handler = logging.FileHandler('convoreps.log')
+file_handler = logging.FileHandler('convoreps_realtime.log')
 file_handler.setFormatter(formatter)
 
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(formatter)
 
-# Configure root logger to catch all logs
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
-root_logger.handlers = []  # Clear existing handlers
+root_logger.handlers = []
 root_logger.addHandler(file_handler)
 root_logger.addHandler(console_handler)
 
-# Create logger for this module
 logger = logging.getLogger(__name__)
 
-# Disable propagation for some noisy libraries
-logging.getLogger('httpx').setLevel(logging.WARNING)
-logging.getLogger('httpcore').setLevel(logging.WARNING)
-logging.getLogger('openai').setLevel(logging.WARNING)
-
-# Helper function to log with correlation ID
-def log_with_correlation(level, msg, correlation_id=None):
-    """Log a message with optional correlation ID"""
-    extra = {'correlation_id': correlation_id} if correlation_id else {}
-    getattr(logger, level)(msg, extra=extra)
-
-# Initialize Flask app
-app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "your-secret-key-here")
-CORS(app)
-
-# Initialize WebSocket support
-sock = Sock(app)
+# Initialize FastAPI
+app = FastAPI()
 
 # Configuration
-ELEVENLABS_WEBSOCKET_ENABLED = os.getenv("ELEVENLABS_WEBSOCKET_ENABLED", "true").lower() == "true"
-OPENAI_STREAMING_ENABLED = os.getenv("OPENAI_STREAMING_ENABLED", "false").lower() == "true"  # Disabled for tool calling
-MAX_WEBSOCKET_CONNECTIONS = int(os.getenv("MAX_WEBSOCKET_CONNECTIONS", "50"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12-17")
+PORT = int(os.getenv("PORT", 5050))
 FREE_CALL_MINUTES = float(os.getenv("FREE_CALL_MINUTES", "5.0"))
+MIN_CALL_DURATION = float(os.getenv("MIN_CALL_DURATION", "0.5"))
 USAGE_CSV_PATH = os.getenv("USAGE_CSV_PATH", "user_usage.csv")
 USAGE_CSV_BACKUP_PATH = os.getenv("USAGE_CSV_BACKUP_PATH", "user_usage_backup.csv")
 CONVOREPS_URL = os.getenv("CONVOREPS_URL", "https://convoreps.com")
-MIN_CALL_DURATION = float(os.getenv("MIN_CALL_DURATION", "0.5"))  # Minimum 30 seconds
 
-# Audio processing constants
-AUDIO_CHUNK_SIZE = 160  # bytes for Twilio compatibility
-AUDIO_BUFFER_MAX_SIZE = 24000  # 3 seconds at 8kHz
-SILENCE_THRESHOLD_MS = 800  # milliseconds
-ENERGY_THRESHOLD = 500  # RMS energy threshold
-WEBSOCKET_KEEPALIVE_INTERVAL = 15  # seconds
-ELEVENLABS_KEEPALIVE_INTERVAL = 15  # seconds
+# Twilio configuration
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+TWILIO_TO_NUMBER = os.getenv("TWILIO_TO_NUMBER")  # Default recipient for SMS/email notifications
 
-# Initialize API clients
-sync_openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-async_openai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-elevenlabs_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
+# Initialize clients
+twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-# Initialize Twilio client for SMS
-twilio_client = TwilioClient(
-    os.getenv("TWILIO_ACCOUNT_SID"),
-    os.getenv("TWILIO_AUTH_TOKEN")
-)
+# Validate configuration
+if not OPENAI_API_KEY:
+    raise ValueError('Missing the OpenAI API key. Please set it in the .env file.')
 
-# Twilio security validator
-twilio_validator = RequestValidator(os.getenv("TWILIO_AUTH_TOKEN"))
+if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+    raise ValueError('Missing Twilio credentials. Please set them in the .env file.')
 
-# Thread pool for async operations - optimized for memory
+# Thread pool for async operations
 executor = ThreadPoolExecutor(max_workers=5)
 
-# Global state management with thread safety
+# Global state management
 state_lock = threading.Lock()
 active_streams: Dict[str, Dict[str, Any]] = {}
-turn_count: Dict[str, int] = {}
-mode_lock: Dict[str, str] = {}
-conversation_history: Dict[str, List[Dict[str, str]]] = {}
-personality_memory: Dict[str, Any] = {}
-interview_question_index: Dict[str, int] = {}
-elevenlabs_websockets: Dict[str, Any] = {}
 call_start_times: Dict[str, float] = {}
 call_timers: Dict[str, threading.Timer] = {}
-sms_sent_flags: Dict[str, bool] = {}  # Track SMS sent status
+sms_sent_flags: Dict[str, bool] = {}
+conversation_transcripts: Dict[str, List[Dict[str, str]]] = {}
+personality_memory: Dict[str, Any] = {}
+interview_question_index: Dict[str, int] = {}
+mode_lock: Dict[str, str] = {}
+turn_count: Dict[str, int] = {}
 last_response_cache: Dict[str, str] = {}  # Cache for repeat functionality
 recording_urls: Dict[str, str] = {}  # Store recording URLs
 
@@ -197,25 +146,20 @@ metrics = {
     "sms_sent": 0,
     "sms_failed": 0,
     "tool_calls_made": 0,
-    "api_errors": {"openai": 0, "elevenlabs": 0, "twilio": 0},
-    "websocket_duration_sum": 0.0,
-    "websocket_count": 0
+    "api_errors": 0
 }
 metrics_lock = threading.Lock()
 
-# CSV lock for all platforms
+# CSV lock for thread safety
 csv_lock = threading.Lock()
 
-# Voice profiles (preserved from original + new voices)
-personality_profiles = {
-    "rude/skeptical": {"voice_id": "1t1EeRixsJrKbiF1zwM6"},
-    "super busy": {"voice_id": "6YQMyaUWlj0VX652cY1C"},
-    "small_talk": {"voice_id": "2BJW5coyhAzSr8STdHbE"}
-}
+# Conversation transcript CSV for SMS/email parsing
+CONVERSATION_TRANSCRIPT_CSV = "conversation_transcript.csv"
 
+# Voice profiles for different personalities
 cold_call_personality_pool = {
     "Jerry": {
-        "voice_id": "1t1EeRixsJrKbiF1zwM6",
+        "voice": "ash",  # OpenAI Realtime voice
         "system_prompt": """You're Jerry, a skeptical small business owner. Be direct but not rude. Stay in character. Keep responses SHORT - 1-2 sentences max.
 
 You have access to a tool called 'check_remaining_time' that tells you how many minutes are left in the user's free call.
@@ -233,7 +177,7 @@ HOW TO RESPOND WITH TIME INFO:
 NEVER mention the tool by name, just naturally work the time info into your response. Stay in character as Jerry - be direct about it."""
     },
     "Miranda": {
-        "voice_id": "Ax1GP2W4XTyAyNHuch7v",
+        "voice": "echo",  # OpenAI Realtime voice
         "system_prompt": """You're Miranda, a busy office manager. No time for fluff. Be grounded and real. Keep responses SHORT - 1-2 sentences max.
 
 You have access to a tool called 'check_remaining_time' that tells you how many minutes are left in the user's free call.
@@ -249,7 +193,7 @@ HOW TO RESPOND:
 - Stay in character - you're busy, so be matter-of-fact about it."""
     },
     "Brett": {
-        "voice_id": "7eFTSJ6WtWd9VCU4ZlI1",
+        "voice": "sage",  # OpenAI Realtime voice
         "system_prompt": """You're Brett, a contractor answering mid-job. Busy and a bit annoyed. Talk rough, fast, casual. Keep responses SHORT.
 
 You have access to a tool called 'check_remaining_time' for checking remaining call time.
@@ -266,19 +210,6 @@ HOW TO RESPOND:
     }
 }
 
-# Additional voice profiles
-additional_voices = {
-    "Burt": {"voice_id": "4YYIPFl9wE5c4L2eu2Gb"},
-    "Brad": {"voice_id": "f5HLTX707KIM4SzJYzSz"},
-    "Gregory": {"voice_id": "PzuBz8h2SxBvQ7lnUC44"},
-    "Belle": {"voice_id": "tIb1FHpzlwSiTGg6JxF0"},
-    "Hope": {"voice_id": "zGjIP4SZlMnY9m93k97r"},
-    "Jamahal": {"voice_id": "DTKMou8ccj1ZaWGBiotd"}
-}
-
-# Special voice for time limit messages
-TIME_LIMIT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
-
 interview_questions = [
     "Can you walk me through your most recent role and responsibilities?",
     "What would you say are your greatest strengths?",
@@ -292,7 +223,7 @@ interview_questions = [
     "Do you have any questions for me about the company or the role?"
 ]
 
-# Graceful shutdown handler
+# Graceful shutdown
 shutdown_event = threading.Event()
 
 def signal_handler(sig, frame):
@@ -300,64 +231,47 @@ def signal_handler(sig, frame):
     logger.info("Graceful shutdown initiated...")
     shutdown_event.set()
     
-    # Close all WebSocket connections
     with state_lock:
         for call_sid in list(active_streams.keys()):
             cleanup_call_resources(call_sid)
     
-    # Cancel all timers
     with state_lock:
         for timer in call_timers.values():
             timer.cancel()
     
-    # Create final backup
     create_csv_backup()
-    
     logger.info("Shutdown complete")
-    sys.exit(0)
+    exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# Input validation functions
+# Validation functions
 def validate_phone_number(phone_number: str) -> bool:
     """Validate phone number format"""
     if not phone_number:
         return False
-    # E.164 format validation
     pattern = r'^\+[1-9]\d{1,14}$'
     return bool(re.match(pattern, phone_number))
-
-def sanitize_csv_value(value: str) -> str:
-    """Sanitize values for CSV to prevent injection"""
-    if not value:
-        return ""
-    # Remove any CSV control characters
-    value = str(value).replace('\r', '').replace('\n', ' ')
-    # Escape quotes
-    value = value.replace('"', '""')
-    # Remove any formula injection attempts
-    if value.strip().startswith(('=', '+', '-', '@')):
-        value = "'" + value
-    return value
 
 def validate_call_sid(call_sid: str) -> bool:
     """Validate Twilio Call SID format"""
     if not call_sid:
         return False
-    # Twilio Call SIDs start with CA
     pattern = r'^CA[0-9a-fA-F]{32}$'
     return bool(re.match(pattern, call_sid))
 
-def validate_stream_sid(stream_sid: str) -> bool:
-    """Validate Twilio Stream SID format"""
-    if not stream_sid:
-        return False
-    # Twilio Stream SIDs start with MZ
-    pattern = r'^MZ[0-9a-fA-F]{32}$'
-    return bool(re.match(pattern, stream_sid))
+def sanitize_csv_value(value: str) -> str:
+    """Sanitize values for CSV to prevent injection"""
+    if not value:
+        return ""
+    value = str(value).replace('\r', '').replace('\n', ' ')
+    value = value.replace('"', '""')
+    if value.strip().startswith(('=', '+', '-', '@')):
+        value = "'" + value
+    return value
 
-# Enhanced CSV functions with atomic writes and backups
+# CSV functions
 def init_csv():
     """Initialize CSV file if it doesn't exist"""
     try:
@@ -383,7 +297,7 @@ def create_csv_backup():
         logger.error(f"Error creating CSV backup: {e}")
 
 def read_user_usage(phone_number: str) -> Dict[str, Any]:
-    """Read user usage from CSV with validation"""
+    """Read user usage from CSV"""
     if not validate_phone_number(phone_number):
         logger.warning(f"Invalid phone number format: {phone_number}")
         return {
@@ -411,7 +325,6 @@ def read_user_usage(phone_number: str) -> Dict[str, Any]:
                         }
     except Exception as e:
         logger.error(f"Error reading CSV: {e}")
-        # Try backup
         if os.path.exists(USAGE_CSV_BACKUP_PATH):
             try:
                 shutil.copy2(USAGE_CSV_BACKUP_PATH, USAGE_CSV_PATH)
@@ -419,7 +332,6 @@ def read_user_usage(phone_number: str) -> Dict[str, Any]:
             except:
                 pass
     
-    logger.info(f"New user detected: {phone_number}")
     return {
         'phone_number': phone_number,
         'minutes_used': 0.0,
@@ -430,20 +342,13 @@ def read_user_usage(phone_number: str) -> Dict[str, Any]:
 
 def update_user_usage(phone_number: str, minutes_used: float):
     """Update user usage in CSV with atomic writes"""
-    if not validate_phone_number(phone_number):
-        logger.warning(f"Invalid phone number format: {phone_number}")
-        return
-    
-    # Prevent negative or zero updates
-    if minutes_used <= 0:
-        logger.warning(f"Invalid minutes_used: {minutes_used}")
+    if not validate_phone_number(phone_number) or minutes_used <= 0:
         return
     
     init_csv()
     
     try:
         with csv_lock:
-            # Read all data
             rows = []
             user_found = False
             
@@ -479,19 +384,16 @@ def update_user_usage(phone_number: str, minutes_used: float):
                 }
                 rows.append(new_user)
             
-            # Atomic write with temp file
             with tempfile.NamedTemporaryFile(mode='w', delete=False, newline='') as tmp_file:
                 writer = csv.DictWriter(tmp_file, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(rows)
                 temp_name = tmp_file.name
             
-            # Atomic replace
             shutil.move(temp_name, USAGE_CSV_PATH)
             
         logger.info(f"Updated usage for {phone_number}: {minutes_used:.2f} minutes used")
         
-        # Periodic backup every 10 updates
         with metrics_lock:
             if metrics['total_calls'] % 10 == 0:
                 create_csv_backup()
@@ -499,26 +401,227 @@ def update_user_usage(phone_number: str, minutes_used: float):
     except Exception as e:
         logger.error(f"Error updating CSV: {e}", exc_info=True)
 
-def check_time_remaining(phone_number: str) -> float:
-    """Check remaining free minutes for a phone number"""
-    if not validate_phone_number(phone_number):
-        logger.warning(f"Invalid phone number format: {phone_number}")
-        return FREE_CALL_MINUTES
-    
-    usage = read_user_usage(phone_number)
-    return max(0.0, usage['minutes_left'])
+# Transcript CSV functions
+def append_transcript_to_csv(role: str, transcript: str, stream_sid: str):
+    """Append a single transcript row to CSV file"""
+    try:
+        file_exists = os.path.isfile(CONVERSATION_TRANSCRIPT_CSV)
+        
+        with open(CONVERSATION_TRANSCRIPT_CSV, mode="a", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            if not file_exists:
+                writer.writerow(["streamSid", "role", "transcript"])
+            writer.writerow([stream_sid, role, transcript])
+    except Exception as e:
+        logger.error(f"Error appending to transcript CSV: {e}")
 
-async def send_sms_link(phone_number: str, is_first_call: bool = True, retry_count: int = 0):
-    """Send SMS with ConvoReps link with retry mechanism"""
+def parse_sms_instructions_from_transcript() -> Tuple[Optional[str], Optional[str]]:
+    """Parse SMS instructions from conversation transcript"""
+    if not os.path.exists(CONVERSATION_TRANSCRIPT_CSV):
+        return None, None
+        
+    try:
+        df = pd.read_csv(CONVERSATION_TRANSCRIPT_CSV, header=None, names=["streamSid", "role", "transcript"])
+        
+        sms_instruction_rows = df[df['transcript'].str.contains(r'SMS sent to', case=False, na=False)]
+        if sms_instruction_rows.empty:
+            logger.info("No SMS instructions found in transcript")
+            return None, None
+        
+        relevant_lines = "\n".join(sms_instruction_rows['transcript'].tolist())
+        
+        system_prompt = """
+        You are a parser agent. You will receive a transcript of a conversation that may contain:
+        "SMS sent to <phone_number> : <sms_body>".
+
+        Your job is to extract two fields:
+        1) phone_number (valid phone number)
+        2) sms_body (the actual message text)
+
+        ***OUTPUT JSON***
+        {'phone_number': 'extracted_phone_number',
+        'sms_body': 'extracted_sms_body'}
+
+        If multiple lines are provided, parse the last one.
+        If no valid pattern is found, output an empty JSON.
+        """
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Parse this: {relevant_lines}"}
+        ]
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            max_tokens=150,
+            temperature=0.7,
+            response_format={"type": "json_object"}
+        )
+        
+        parsed_json = json.loads(response.choices[0].message.content.strip())
+        phone_number = parsed_json.get("phone_number")
+        sms_body = parsed_json.get("sms_body")
+        
+        return phone_number, sms_body
+        
+    except Exception as e:
+        logger.error(f"Error parsing SMS instructions: {e}")
+        return None, None
+
+def send_sms_via_twilio():
+    """Send SMS using parsed instructions from transcript"""
+    phone_number, sms_body = parse_sms_instructions_from_transcript()
+    
+    if not phone_number or not sms_body:
+        # If no specific SMS instructions, try generating from general content
+        sms_body = generate_sms_body_with_openai()
+        phone_number = TWILIO_TO_NUMBER  # Use default recipient
+        
+        if not sms_body:
+            logger.info("No valid SMS content found")
+            return
+        
+    try:
+        message = twilio_client.messages.create(
+            body=sms_body,
+            from_=TWILIO_PHONE_NUMBER,
+            to=phone_number
+        )
+        logger.info(f"SMS sent successfully: {message.sid}")
+    except Exception as e:
+        logger.error(f"Error sending SMS: {e}")
+
+def parse_email_instructions_from_transcript():
+    """Parse email instructions from conversation transcript and format for SMS"""
+    if not os.path.exists(CONVERSATION_TRANSCRIPT_CSV):
+        return None
+        
+    try:
+        df = pd.read_csv(CONVERSATION_TRANSCRIPT_CSV, header=None, names=["streamSid", "role", "transcript"])
+        
+        email_instruction_rows = df[df['transcript'].str.contains(r'mail sent to', case=False, na=False)]
+        if email_instruction_rows.empty:
+            logger.info("No email instructions found in transcript")
+            return None
+        
+        relevant_lines = "\n".join(email_instruction_rows['transcript'].tolist())
+        
+        system_prompt = """
+        You are a parser agent. You will receive a transcript of a conversation that may contain:
+        "email sent to <email_id> : <body>".
+
+        Your job is to extract the email content and format it as an SMS message that includes:
+        1) The recipient email address
+        2) The email subject
+        3) The email body
+
+        Format the SMS as:
+        "Email for: [email_address]
+        Subject: [subject]
+        Message: [body]"
+
+        If multiple lines are provided, parse the last one.
+        """
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Parse this and format as SMS: {relevant_lines}"}
+        ]
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            max_tokens=150,
+            temperature=0.7
+        )
+        
+        sms_formatted_email = response.choices[0].message.content.strip()
+        return sms_formatted_email
+        
+    except Exception as e:
+        logger.error(f"Error parsing email instructions: {e}")
+        return None
+
+def send_email_via_twilio_sms():
+    """Send email content via Twilio SMS"""
+    sms_body = parse_email_instructions_from_transcript()
+    
+    if not sms_body:
+        logger.info("No valid email instructions found")
+        return
+        
+    try:
+        # Send to the configured number or extract from transcript
+        to_number = TWILIO_TO_NUMBER or os.getenv('TWILIO_TO_NUMBER')
+        
+        if not to_number:
+            logger.error("No recipient phone number configured for email notifications")
+            return
+            
+        message = twilio_client.messages.create(
+            body=f"📧 {sms_body}",  # Add email emoji to distinguish from regular SMS
+            from_=TWILIO_PHONE_NUMBER,
+            to=to_number
+        )
+        logger.info(f"Email sent via SMS! Message ID: {message.sid}")
+    except Exception as e:
+        logger.error(f"Error sending email via SMS: {e}")
+
+def generate_sms_body_with_openai():
+    """Generate an SMS body using OpenAI API based on conversation transcript"""
+    if not os.path.exists(CONVERSATION_TRANSCRIPT_CSV):
+        return None
+        
+    try:
+        df = pd.read_csv(CONVERSATION_TRANSCRIPT_CSV, header=None, names=["streamSid", "role", "transcript"])
+        
+        # Filter for SMS-related content
+        sms_related_rows = df[df['transcript'].str.contains(r'\bsend(ing)?\s*(sms|mail|message)\b', case=False, na=False)]
+        
+        if sms_related_rows.empty:
+            logger.info("No SMS or mail-related content found in the transcript")
+            return None
+        
+        relevant_transcript = " ".join(sms_related_rows['transcript'].tolist())
+        
+        system_prompt = '''
+        You are an assistant tasked with generating concise, meaningful SMS messages based on a conversation transcript.
+        Focus only on parts of the transcript related to sending SMS, mail, or messages.
+        Do not include unrelated parts of the transcript.
+        '''
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": f"Here is the relevant part of the conversation transcript:\n\n{relevant_transcript}\n\nGenerate a concise SMS based on this."
+            }
+        ]
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            max_tokens=150,
+            temperature=0.7,
+        )
+        
+        sms_body = response.choices[0].message.content.strip()
+        return sms_body
+        
+    except Exception as e:
+        logger.error(f"Error generating SMS body: {e}")
+        return None
+
+# SMS functions
+async def send_sms_link(phone_number: str, is_first_call: bool = True):
+    """Send SMS with ConvoReps link"""
     correlation_id = str(uuid.uuid4())
     
     try:
         if not validate_phone_number(phone_number):
-            logger.warning(f"Invalid phone number for SMS: {phone_number}", 
-                         extra={'correlation_id': correlation_id})
             return
         
-        # Check if SMS already sent for this call
         with state_lock:
             if sms_sent_flags.get(phone_number, False):
                 logger.info(f"SMS already sent to {phone_number}", 
@@ -526,13 +629,6 @@ async def send_sms_link(phone_number: str, is_first_call: bool = True, retry_cou
                 return
             sms_sent_flags[phone_number] = True
         
-        from_number = os.getenv("TWILIO_PHONE_NUMBER")
-        if not from_number:
-            logger.error("TWILIO_PHONE_NUMBER not configured", 
-                        extra={'correlation_id': correlation_id})
-            return
-        
-        # Choose message based on context
         if is_first_call:
             message_body = (
                 "Nice work on your first ConvoReps call! Ready for more? "
@@ -544,10 +640,9 @@ async def send_sms_link(phone_number: str, is_first_call: bool = True, retry_cou
                 "a Starter Pass for $6.99 and unlock more time: convoreps.com"
             )
         
-        # Send SMS
         message = twilio_client.messages.create(
             body=message_body,
-            from_=from_number,
+            from_=TWILIO_PHONE_NUMBER,
             to=phone_number
         )
         
@@ -559,815 +654,13 @@ async def send_sms_link(phone_number: str, is_first_call: bool = True, retry_cou
             
     except Exception as e:
         logger.error(f"SMS error: {e}", extra={'correlation_id': correlation_id})
-        
         with metrics_lock:
             metrics['sms_failed'] += 1
-        
-        # Retry logic
-        if retry_count < 3:
-            await asyncio.sleep(2 ** retry_count)  # Exponential backoff
-            await send_sms_link(phone_number, is_first_call, retry_count + 1)
-        else:
-            # Clear flag if all retries failed
-            with state_lock:
-                sms_sent_flags[phone_number] = False
-
-def periodic_cleanup():
-    """Clean up stale connections periodically"""
-    while not shutdown_event.is_set():
-        try:
-            time.sleep(60)
-            current_time = time.time()
-            stale_calls = []
-            
-            with state_lock:
-                for call_sid, stream_data in list(active_streams.items()):
-                    if current_time - stream_data.get('last_activity', 0) > 300:
-                        stale_calls.append(call_sid)
-            
-            for call_sid in stale_calls:
-                logger.info(f"Cleaning up stale connection: {call_sid}")
-                cleanup_call_resources(call_sid)
-                
-            # Clean up old SMS flags
-            with state_lock:
-                cutoff_time = current_time - 3600  # 1 hour
-                old_numbers = [num for num, _ in sms_sent_flags.items() 
-                             if num not in [s.get('from_number') for s in active_streams.values()]]
-                for num in old_numbers:
-                    sms_sent_flags.pop(num, None)
-                    
-        except Exception as e:
-            logger.error(f"Cleanup thread error: {e}")
-
-# Start cleanup thread
-cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
-cleanup_thread.start()
-
-# Enhanced Voice Activity Detection
-class StreamingSpeechProcessor:
-    def __init__(self, call_sid: str):
-        self.call_sid = call_sid
-        self.audio_buffer = bytearray()
-        self.silence_threshold = SILENCE_THRESHOLD_MS / 1000.0  # Convert to seconds
-        self.last_speech_time = time.time()
-        self.min_speech_length = 0.3
-        self.silence_start_time: Optional[float] = None
-        self.speech_detected = False
-        self.max_buffer_size = AUDIO_BUFFER_MAX_SIZE
-        self.energy_threshold = ENERGY_THRESHOLD
-        self.processing_audio = False
-        
-        # Enhanced VAD parameters
-        self.energy_history = []
-        self.energy_history_size = 10
-        self.dynamic_threshold_factor = 1.5
-        self.min_energy_threshold = 300
-        self.consecutive_silence_chunks = 0
-        self.required_silence_chunks = 15  # ~300ms at 20ms chunks
-        
-    def add_audio(self, audio_chunk: bytes) -> Optional[bytes]:
-        """Add audio chunk to buffer with improved VAD and memory management"""
-        try:
-            if self.processing_audio:
-                return None
-                
-            if not audio_chunk or not isinstance(audio_chunk, bytes):
-                return None
-                
-            # Prevent buffer overflow
-            if len(self.audio_buffer) + len(audio_chunk) > self.max_buffer_size:
-                complete_audio = bytes(self.audio_buffer)
-                self.audio_buffer.clear()
-                self.processing_audio = True
-                return complete_audio
-                
-            self.audio_buffer.extend(audio_chunk)
-            
-            # Process in 20ms chunks for better VAD accuracy
-            chunk_size = 320  # 20ms at 16kHz
-            if len(self.audio_buffer) >= chunk_size:
-                if self.detect_speech_end_enhanced():
-                    complete_audio = bytes(self.audio_buffer)
-                    self.audio_buffer.clear()
-                    self.processing_audio = True
-                    return complete_audio
-            return None
-        except Exception as e:
-            logger.error(f"Error in add_audio: {e}", exc_info=True)
-            self.audio_buffer.clear()
-            self.processing_audio = False
-            return None
-    
-    def detect_speech_end_enhanced(self) -> bool:
-        """Enhanced VAD with dynamic thresholds and better accuracy"""
-        if len(self.audio_buffer) < 2400:  # Need at least 150ms
-            return False
-            
-        # Analyze recent audio
-        check_size = min(3200, len(self.audio_buffer))
-        last_chunk = self.audio_buffer[-check_size:]
-        
-        try:
-            # Calculate RMS energy
-            if AUDIOOP_AVAILABLE and audioop:
-                rms = audioop.rms(bytes(last_chunk), 1)
-            else:
-                audio_array = np.frombuffer(last_chunk, dtype=np.uint8)
-                if len(audio_array) == 0:
-                    return True
-                # Convert to signed values centered at 0
-                audio_array = audio_array.astype(np.float32) - 128.0
-                rms = np.sqrt(np.mean(np.square(audio_array))) * 8  # Scale to match audioop
-            
-            # Update energy history for dynamic threshold
-            self.energy_history.append(rms)
-            if len(self.energy_history) > self.energy_history_size:
-                self.energy_history.pop(0)
-            
-            # Calculate dynamic threshold
-            if self.energy_history:
-                avg_energy = np.mean(self.energy_history)
-                dynamic_threshold = max(
-                    self.min_energy_threshold,
-                    avg_energy * self.dynamic_threshold_factor
-                )
-            else:
-                dynamic_threshold = self.energy_threshold
-            
-            # Speech detection logic
-            if rms > dynamic_threshold:
-                self.speech_detected = True
-                self.consecutive_silence_chunks = 0
-                self.silence_start_time = None
-                self.last_speech_time = time.time()
-            elif self.speech_detected:
-                self.consecutive_silence_chunks += 1
-                
-                if self.consecutive_silence_chunks >= self.required_silence_chunks:
-                    # Check if we have enough speech
-                    if len(self.audio_buffer) > 4800:  # At least 300ms
-                        return True
-            
-            # Timeout after 5 seconds
-            if time.time() - self.last_speech_time > 5.0:
-                return len(self.audio_buffer) > 1600  # Return if we have any content
-                
-        except Exception as e:
-            logger.error(f"RMS calculation error: {e}", exc_info=True)
-            return True
-        
-        return False
-    
-    def reset(self):
-        """Reset processor state"""
-        self.processing_audio = False
-        self.speech_detected = False
-        self.silence_start_time = None
-        self.consecutive_silence_chunks = 0
-        self.energy_history.clear()
-
-
-def error_handler(f):
-    """Enhanced error handler with correlation ID"""
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        correlation_id = str(uuid.uuid4())
-        try:
-            return f(*args, **kwargs)
-        except Exception as e:
-            logger.error(f"Route error in {f.__name__}: {e}", 
-                        extra={'correlation_id': correlation_id},
-                        exc_info=True)
-            
-            response = VoiceResponse()
-            response.say("I'm sorry, I encountered an error. Please try again.")
-            response.hangup()
-            
-            with metrics_lock:
-                metrics['failed_calls'] += 1
-                
-            return str(response), 500
-    return wrapper
-
-@app.route("/voice", methods=["POST", "GET"])
-@error_handler
-def voice():
-    """Initial voice webhook with security validation"""
-    correlation_id = str(uuid.uuid4())
-    
-    # Security validation
-    if os.getenv("TWILIO_AUTH_TOKEN"):
-        url = request.url
-        params = request.values
-        signature = request.headers.get('X-Twilio-Signature', '')
-        
-        if not twilio_validator.validate(url, params, signature):
-            logger.warning("Invalid Twilio signature", 
-                         extra={'correlation_id': correlation_id})
-            response = VoiceResponse()
-            response.reject()
-            return str(response), 403
-    
-    # Get and validate parameters
-    call_sid = request.values.get("CallSid")
-    from_number = request.values.get("From")
-    recording_url = request.values.get("RecordingUrl")
-    
-    if not validate_call_sid(call_sid):
-        logger.error(f"Invalid CallSid: {call_sid}", 
-                    extra={'correlation_id': correlation_id})
-        response = VoiceResponse()
-        response.say("Sorry, there was an error processing your call.")
-        response.hangup()
-        return str(response)
-    
-    logger.info(f"New call: {call_sid} from {from_number}", 
-               extra={'correlation_id': correlation_id})
-    
-    # Store recording URL if provided
-    if recording_url:
         with state_lock:
-            recording_urls[call_sid] = recording_url
-        logger.info(f"Recording URL stored: {recording_url}", 
-                   extra={'correlation_id': correlation_id})
-    
-    # Default phone number for testing
-    if not from_number:
-        from_number = "+10000000000"
-        logger.warning("Missing From number, using test number", 
-                      extra={'correlation_id': correlation_id})
-    
-    # Validate phone number
-    if not validate_phone_number(from_number):
-        logger.error(f"Invalid phone number: {from_number}", 
-                    extra={'correlation_id': correlation_id})
-        response = VoiceResponse()
-        response.say("Sorry, we couldn't validate your phone number.")
-        response.hangup()
-        return str(response)
-    
-    # Check free minutes
-    minutes_left = check_time_remaining(from_number)
-    usage_data = read_user_usage(from_number)
-    is_repeat_caller = usage_data['total_calls'] > 0
-    
-    # Require minimum call duration
-    if minutes_left < MIN_CALL_DURATION and is_repeat_caller:
-        response = VoiceResponse()
-        response.say(
-            "Hey! You've already used your free call. But no worries, we just texted you a link to Convoreps.com. "
-            "Grab a Starter Pass for $6.99 and turn practice into real-world results.",
-            voice="alice",
-            language="en-US"
-        )
-        response.hangup()
-        
-        executor.submit(run_async_task, send_sms_link(from_number, is_first_call=False))
-        
-        return str(response)
-    
-    # Initialize call state
-    with state_lock:
-        if call_sid not in turn_count:
-            turn_count[call_sid] = 0
-            call_start_times[call_sid] = time.time()
-            logger.info(f"User has {minutes_left:.2f} minutes remaining", 
-                       extra={'correlation_id': correlation_id})
-        else:
-            # Increment turn count for subsequent turns
-            turn_count[call_sid] += 1
-            logger.info(f"Turn {turn_count[call_sid]} for call {call_sid}", 
-                       extra={'correlation_id': correlation_id})
-            
-        with metrics_lock:
-            metrics['total_calls'] += 1
-            metrics['active_calls'] += 1
-    
-    response = VoiceResponse()
-    
-    # Play greeting with beep
-    if turn_count.get(call_sid, 0) == 0:
-        # Check session and CSV for first-time caller status
-        has_called_session = session.get("has_called_before", False)
-        has_called_csv = is_repeat_caller
-        
-        if not has_called_session and not has_called_csv:
-            session["has_called_before"] = True
-            greeting_file = "first_time_greeting.mp3"
-            logger.info("New caller detected — playing first-time greeting", 
-                       extra={'correlation_id': correlation_id})
-        else:
-            greeting_file = "returning_user_greeting.mp3"
-            logger.info("Returning caller — playing returning greeting", 
-                       extra={'correlation_id': correlation_id})
-        
-        # Play greeting and beep if files exist
-        if os.path.exists(f"static/{greeting_file}"):
-            response.play(f"{request.url_root}static/{greeting_file}")
-        else:
-            # Fallback TTS greeting
-            if greeting_file == "first_time_greeting.mp3":
-                response.say("Welcome to ConvoReps! Let's practice.", voice="alice")
-            else:
-                response.say("Welcome back! Ready to practice?", voice="alice")
-        
-        # Play beep sound
-        if os.path.exists("static/beep.mp3"):
-            response.play(f"{request.url_root}static/beep.mp3")
-        response.pause(length=1)
-    
-    # Start bidirectional stream
-    connect = Connect()
-    
-    ws_scheme = "wss" if request.is_secure else "ws"
-    host = request.headers.get('X-Forwarded-Host', request.host)
-    stream_url = f"{ws_scheme}://{host}/media-stream"
-    logger.info(f"Stream URL: {stream_url}", extra={'correlation_id': correlation_id})
-    
-    stream = Stream(
-        url=stream_url,
-        name="convoreps_stream",
-        track="inbound_track",  # Explicitly set for bidirectional streams
-        statusCallback=f"{request.url_root}stream-status",
-        statusCallbackMethod="POST"
-    )
-    
-    # Add custom parameters
-    stream.parameter(name="call_sid", value=call_sid)
-    stream.parameter(name="from_number", value=from_number)
-    stream.parameter(name="timestamp", value=str(int(time.time())))
-    stream.parameter(name="minutes_left", value=str(minutes_left))
-    stream.parameter(name="correlation_id", value=correlation_id)
-    
-    connect.append(stream)
-    response.append(connect)
-    
-    # Fallback TwiML
-    response.say("Thank you for practicing with ConvoReps!")
-    response.pause(length=1)
-    response.hangup()
-    
-    # Set up timer for time limit
-    timer_duration = minutes_left * 60 if minutes_left < FREE_CALL_MINUTES else FREE_CALL_MINUTES * 60
-    logger.info(f"Setting timer for {timer_duration:.0f} seconds", 
-               extra={'correlation_id': correlation_id})
-    
-    timer = threading.Timer(timer_duration, lambda: handle_time_limit(call_sid, from_number))
-    timer.start()
-    
-    with state_lock:
-        call_timers[call_sid] = timer
-    
-    return str(response)
-
-def handle_time_limit(call_sid: str, from_number: str):
-    """Handle when free time limit is reached"""
-    correlation_id = str(uuid.uuid4())
-    logger.info(f"Time limit reached for {call_sid}", 
-               extra={'correlation_id': correlation_id})
-    
-    # Update CSV immediately before playing message
-    if call_sid in call_start_times:
-        elapsed_minutes = (time.time() - call_start_times[call_sid]) / 60.0
-        update_user_usage(from_number, elapsed_minutes)
-        logger.info(f"Updated usage for {from_number}: {elapsed_minutes:.2f} minutes", 
-                   extra={'correlation_id': correlation_id})
-    
-    if call_sid in active_streams:
-        executor.submit(
-            run_async_task,
-            play_time_limit_message(call_sid, from_number)
-        )
-
-async def play_time_limit_message(call_sid: str, from_number: str):
-    """Play the time limit message and end call"""
-    if call_sid not in active_streams:
-        return
-    
-    stream_sid = active_streams[call_sid].get('stream_sid')
-    if not stream_sid:
-        return
-    
-    ws = active_streams[call_sid]['ws']
-    
-    # Clear any ongoing audio
-    try:
-        ws.send(json.dumps({
-            "event": "clear",
-            "streamSid": stream_sid
-        }))
-    except:
-        pass
-    
-    message = (
-        "Alright, that's the end of your free call — but this is only the beginning. "
-        "We just texted you a link to ConvoReps.com. Whether you're prepping for interviews "
-        "or sharpening your pitch, this is how you level up — don't wait, your next opportunity is already calling."
-    )
-    
-    await stream_tts_with_voice_id(call_sid, stream_sid, message, TIME_LIMIT_VOICE_ID)
-    
-    usage_data = read_user_usage(from_number)
-    is_first_call = usage_data['total_calls'] <= 1
-    
-    await send_sms_link(from_number, is_first_call=is_first_call)
-    
-    await asyncio.sleep(2)
-    
-    if call_sid in active_streams and active_streams[call_sid].get('ws'):
-        try:
-            active_streams[call_sid]['ws'].close()
-        except:
-            pass
-
-async def stream_tts_with_voice_id(call_sid: str, stream_sid: str, text: str, voice_id: str):
-    """Stream TTS with a specific voice ID"""
-    if call_sid not in active_streams:
-        return
-        
-    ws = active_streams[call_sid]['ws']
-    
-    try:
-        logger.info(f"Generating TTS with voice {voice_id}: {text[:50]}...")
-        
-        audio_stream = elevenlabs_client.text_to_speech.stream(
-            text=text,
-            voice_id=voice_id,
-            model_id="eleven_turbo_v2_5",
-            voice_settings=VoiceSettings(
-                stability=0.5,
-                similarity_boost=0.75,
-                style=0.0,
-                use_speaker_boost=True
-            ),
-            output_format="ulaw_8000",
-            optimize_streaming_latency=4
-        )
-        
-        chunk_count = 0
-        audio_buffer = bytearray()
-        
-        for audio_chunk in audio_stream:
-            if isinstance(audio_chunk, bytes) and audio_chunk:
-                audio_buffer.extend(audio_chunk)
-                
-                while len(audio_buffer) >= 160:
-                    chunk_to_send = bytes(audio_buffer[:160])
-                    audio_buffer = audio_buffer[160:]
-                    
-                    payload = base64.b64encode(chunk_to_send).decode('utf-8')
-                    media_message = {
-                        "event": "media",
-                        "streamSid": stream_sid,
-                        "media": {
-                            "payload": payload
-                        }
-                    }
-                    ws.send(json.dumps(media_message))
-                    chunk_count += 1
-                    
-                    if chunk_count % 10 == 0:
-                        await asyncio.sleep(0.001)
-        
-        if audio_buffer:
-            payload = base64.b64encode(bytes(audio_buffer)).decode('utf-8')
-            media_message = {
-                "event": "media",
-                "streamSid": stream_sid,
-                "media": {
-                    "payload": payload
-                }
-            }
-            ws.send(json.dumps(media_message))
-        
-        logger.info(f"Sent {chunk_count} audio chunks")
-        
-    except Exception as e:
-        logger.error(f"TTS streaming error: {e}")
-        with metrics_lock:
-            metrics['api_errors']['elevenlabs'] += 1
-
-@app.route("/stream-status", methods=["POST"])
-def stream_status():
-    """Handle stream status callbacks"""
-    call_sid = request.values.get("CallSid")
-    stream_sid = request.values.get("StreamSid")
-    status = request.values.get("StreamStatus")
-    
-    logger.info(f"Stream status - CallSid: {call_sid}, StreamSid: {stream_sid}, Status: {status}")
-    
-    if status == "stopped":
-        cleanup_call_resources(call_sid)
-    
-    return "", 204
-
-@sock.route('/media-stream')
-def media_stream(ws):
-    """Enhanced WebSocket handler with non-blocking processing and better error handling"""
-    stream_sid = None
-    call_sid = None
-    speech_processor = None
-    last_keepalive = time.time()
-    processing_lock = threading.Lock()
-    audio_queue = asyncio.Queue()
-    ws_start_time = time.time()
-    correlation_id = None
-    processing_tasks = []
-    
-    # Check connection limit
-    with state_lock:
-        if len(active_streams) >= MAX_WEBSOCKET_CONNECTIONS:
-            logger.warning("Maximum WebSocket connections reached")
-            ws.close()
-            return
-    
-    async def process_audio_async(audio_data: bytes, stream_sid: str):
-        """Async audio processing to prevent blocking"""
-        try:
-            await process_complete_utterance(call_sid, stream_sid, audio_data)
-        except Exception as e:
-            logger.error(f"Audio processing error: {e}", exc_info=True)
-        finally:
-            with processing_lock:
-                if call_sid in active_streams:
-                    active_streams[call_sid]['processing'] = False
-    
-    try:
-        while not shutdown_event.is_set():
-            try:
-                # Non-blocking receive with short timeout
-                message = ws.receive(timeout=0.5)
-                
-                # Handle keepalive
-                if message is None:
-                    if time.time() - last_keepalive > WEBSOCKET_KEEPALIVE_INTERVAL:
-                        try:
-                            ws.send(json.dumps({"event": "keepalive", "timestamp": time.time()}))
-                            last_keepalive = time.time()
-                        except:
-                            break
-                    continue
-                
-                try:
-                    data = json.loads(message)
-                except json.JSONDecodeError:
-                    logger.error("Invalid JSON received")
-                    continue
-                    
-                event_type = data.get('event')
-                
-                if event_type == 'connected':
-                    logger.info(f"WebSocket connected: {data.get('protocol', 'unknown')}")
-                    ws.send(json.dumps({
-                        "event": "connected_ack",
-                        "timestamp": time.time()
-                    }))
-                    
-                elif event_type == 'start':
-                    stream_sid = data['streamSid']
-                    
-                    # Validate stream SID
-                    if not validate_stream_sid(stream_sid):
-                        logger.error(f"Invalid StreamSid: {stream_sid}")
-                        ws.close()
-                        return
-                    
-                    call_sid = data['start']['callSid']
-                    
-                    # Validate call SID
-                    if not validate_call_sid(call_sid):
-                        logger.error(f"Invalid CallSid: {call_sid}")
-                        ws.close()
-                        return
-                    
-                    custom_params = data['start'].get('customParameters', {})
-                    from_number = custom_params.get('from_number', '')
-                    minutes_left = float(custom_params.get('minutes_left', FREE_CALL_MINUTES))
-                    correlation_id = custom_params.get('correlation_id', str(uuid.uuid4()))
-                    
-                    logger.info(f"Stream started - CallSid: {call_sid}, StreamSid: {stream_sid}", 
-                               extra={'correlation_id': correlation_id})
-                    
-                    # Initialize stream data
-                    with processing_lock:
-                        speech_processor = StreamingSpeechProcessor(call_sid)
-                        
-                        with state_lock:
-                            active_streams[call_sid] = {
-                                'ws': ws,
-                                'stream_sid': stream_sid,
-                                'from_number': from_number,
-                                'minutes_left': minutes_left,
-                                'processing': False,
-                                'speech_processor': speech_processor,
-                                'last_activity': time.time(),
-                                'mark_received': set(),
-                                'is_speaking': False,
-                                'last_response_time': 0,
-                                'lock': processing_lock,
-                                'audio_queue': audio_queue,
-                                'custom_params': custom_params,
-                                'interruption_requested': False,
-                                'correlation_id': correlation_id
-                            }
-                    
-                elif event_type == 'media' and call_sid and call_sid in active_streams:
-                    # Update activity
-                    with state_lock:
-                        active_streams[call_sid]['last_activity'] = time.time()
-                    
-                    # Handle interruption detection
-                    if active_streams[call_sid].get('is_speaking', False):
-                        try:
-                            audio_chunk = base64.b64decode(data['media']['payload'])
-                            if AUDIOOP_AVAILABLE:
-                                rms = audioop.rms(audio_chunk, 1)
-                            else:
-                                audio_array = np.frombuffer(audio_chunk, dtype=np.uint8)
-                                rms = np.sqrt(np.mean(np.square(audio_array.astype(np.float32))))
-                            
-                            if rms > 700:  # Interruption threshold
-                                active_streams[call_sid]['interruption_requested'] = True
-                                ws.send(json.dumps({
-                                    "event": "clear",
-                                    "streamSid": stream_sid
-                                }))
-                        except:
-                            pass
-                        continue
-                    
-                    # Process audio
-                    try:
-                        audio_chunk = base64.b64decode(data['media']['payload'])
-                    except Exception as e:
-                        logger.error(f"Failed to decode audio: {e}")
-                        continue
-                    
-                    complete_audio = speech_processor.add_audio(audio_chunk)
-                    
-                    if complete_audio:
-                        with processing_lock:
-                            if not active_streams[call_sid]['processing']:
-                                current_time = time.time()
-                                last_response = active_streams[call_sid].get('last_response_time', 0)
-                                
-                                if current_time - last_response < 0.3:
-                                    speech_processor.reset()
-                                    continue
-                                    
-                                active_streams[call_sid]['processing'] = True
-                                active_streams[call_sid]['last_response_time'] = current_time
-                                
-                                # Process asynchronously to prevent blocking
-                                task = asyncio.create_task(
-                                    process_audio_async(complete_audio, stream_sid)
-                                )
-                                processing_tasks.append(task)
-                        
-                elif event_type == 'mark':
-                    if call_sid in active_streams:
-                        mark_data = data.get('mark', {})
-                        mark_name = mark_data.get('name')
-                        
-                        with state_lock:
-                            active_streams[call_sid]['mark_received'].add(mark_name)
-                        
-                        if mark_name == 'response_end':
-                            active_streams[call_sid]['is_speaking'] = False
-                            active_streams[call_sid]['processing'] = False
-                            active_streams[call_sid]['interruption_requested'] = False
-                            if speech_processor:
-                                speech_processor.reset()
-                    
-                elif event_type == 'dtmf':
-                    if call_sid in active_streams:
-                        dtmf_data = data.get('dtmf', {})
-                        digit = dtmf_data.get('digit')
-                        logger.info(f"DTMF received: {digit}", 
-                                   extra={'correlation_id': correlation_id})
-                        
-                        if digit == '#':
-                            task = asyncio.create_task(handle_reset(call_sid, stream_sid))
-                            processing_tasks.append(task)
-                        elif digit == '*':
-                            task = asyncio.create_task(repeat_last_response(call_sid, stream_sid))
-                            processing_tasks.append(task)
-                    
-                elif event_type == 'stop':
-                    logger.info(f"Stream stopped - CallSid: {call_sid}", 
-                               extra={'correlation_id': correlation_id})
-                    break
-                    
-                elif event_type == 'error':
-                    error_code = data.get('error', {}).get('code')
-                    error_message = data.get('error', {}).get('message')
-                    logger.error(f"Stream error - Code: {error_code}, Message: {error_message}", 
-                                extra={'correlation_id': correlation_id})
-                    
-            except websockets.exceptions.ConnectionClosed:
-                logger.info("WebSocket connection closed")
-                break
-            except Exception as e:
-                if "timeout" not in str(e).lower():
-                    logger.error(f"WebSocket error: {e}", exc_info=True)
-                    
-    except Exception as e:
-        logger.error(f"WebSocket handler error: {e}", exc_info=True)
-    finally:
-        # Cancel any pending tasks
-        for task in processing_tasks:
-            if not task.done():
-                task.cancel()
-                
-        # Track WebSocket duration
-        ws_duration = time.time() - ws_start_time
-        with metrics_lock:
-            metrics['websocket_duration_sum'] += ws_duration
-            metrics['websocket_count'] += 1
-        
-        if call_sid:
-            cleanup_call_resources(call_sid)
-def cleanup_call_resources(call_sid: str):
-    """Enhanced cleanup with metrics and logging"""
-    correlation_id = str(uuid.uuid4())
-    
-    with state_lock:
-        if call_sid in active_streams:
-            from_number = active_streams[call_sid].get('from_number', '')
-            
-            # Calculate and update usage only if timer didn't already do it
-            if call_sid in call_start_times and call_sid not in call_timers:
-                # Timer was cancelled or didn't fire, so we need to update usage
-                call_duration = time.time() - call_start_times[call_sid]
-                minutes_used = call_duration / 60.0
-                
-                if from_number and validate_phone_number(from_number):
-                    # Check if we need to update (timer might have already done it)
-                    usage_before = read_user_usage(from_number)
-                    
-                    # Only update if there's actual time to update
-                    if minutes_used > 0.01:  # More than ~1 second
-                        update_user_usage(from_number, minutes_used)
-                        logger.info(f"Call {call_sid} lasted {minutes_used:.2f} minutes", 
-                                   extra={'correlation_id': correlation_id})
-                        
-                        # Check if SMS needed (only if time just ran out)
-                        usage_after = read_user_usage(from_number)
-                        if usage_before['minutes_left'] > 0.5 and usage_after['minutes_left'] <= 0.5:
-                            is_first_call = usage_after['total_calls'] <= 1
-                            executor.submit(run_async_task, 
-                                          send_sms_link(from_number, is_first_call=is_first_call))
-                
-                call_start_times.pop(call_sid, None)
-            
-            # Cancel timer
-            if call_sid in call_timers:
-                call_timers[call_sid].cancel()
-                call_timers.pop(call_sid, None)
-            
-            # Close WebSocket
-            ws = active_streams[call_sid].get('ws')
-            if ws:
-                try:
-                    ws.close()
-                except:
-                    pass
-            
-            # Close ElevenLabs WebSocket
-            if call_sid in elevenlabs_websockets:
-                try:
-                    asyncio.run(elevenlabs_websockets[call_sid].close())
-                except:
-                    pass
-                elevenlabs_websockets.pop(call_sid, None)
-            
-            # Clean up state
-            active_streams.pop(call_sid, None)
-            turn_count.pop(call_sid, None)
-            conversation_history.pop(call_sid, None)
-            personality_memory.pop(call_sid, None)
-            mode_lock.pop(call_sid, None)
-            interview_question_index.pop(call_sid, None)
-            last_response_cache.pop(call_sid, None)
-            recording_urls.pop(call_sid, None)
-            
-            # Clear SMS flag after delay
-            if from_number:
-                def clear_sms_flag():
-                    time.sleep(300)  # 5 minutes
-                    with state_lock:
-                        sms_sent_flags.pop(from_number, None)
-                threading.Thread(target=clear_sms_flag, daemon=True).start()
-    
-    # Update metrics
-    with metrics_lock:
-        metrics['active_calls'] = max(0, metrics['active_calls'] - 1)
-    
-    gc.collect()
+            sms_sent_flags[phone_number] = False
 
 def run_async_task(coro):
-    """Run async coroutine with proper error handling"""
+    """Run async coroutine"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -1377,316 +670,9 @@ def run_async_task(coro):
     finally:
         loop.close()
 
-async def process_complete_utterance(call_sid: str, stream_sid: str, audio_data: bytes):
-    """Process utterance with enhanced error handling"""
-    if call_sid not in active_streams:
-        return
-    
-    correlation_id = active_streams[call_sid].get('correlation_id', str(uuid.uuid4()))
-    
-    try:
-        with state_lock:
-            active_streams[call_sid]['is_speaking'] = True
-        
-        # Convert audio
-        audio_pcm = convert_mulaw_to_pcm(audio_data)
-        audio_data = None
-        
-        # Transcribe
-        transcript = await asyncio.wait_for(
-            transcribe_audio(audio_pcm),
-            timeout=5.0
-        )
-        audio_pcm = None
-        
-        if transcript and len(transcript.strip()) > 1:
-            logger.info(f"Transcript: {transcript}", 
-                       extra={'correlation_id': correlation_id})
-            
-            # Spam filter
-            spam_patterns = [
-                r"beadaholique\.com", r"go\s+to", r"\.com", r"www\.", r"http",
-                r"woof\s+woof", r"bark\s+bark", r"meow", r"click\s+here"
-            ]
-            if any(re.search(pattern, transcript.lower()) for pattern in spam_patterns):
-                logger.info("Ignoring spam/noise transcript", 
-                           extra={'correlation_id': correlation_id})
-                return
-            
-            # Check for reset
-            if "let's start over" in transcript.lower() or "reset" in transcript.lower():
-                await handle_reset(call_sid, stream_sid)
-                return
-            
-            # Generate response
-            response = await generate_response(call_sid, transcript)
-            
-            # Cache response for repeat function
-            with state_lock:
-                last_response_cache[call_sid] = response
-            
-            # Stream response
-            if ELEVENLABS_WEBSOCKET_ENABLED:
-                await stream_tts_websocket(call_sid, stream_sid, response)
-            else:
-                await stream_tts_response(call_sid, stream_sid, response)
-            
-    except asyncio.TimeoutError:
-        logger.warning(f"Processing timeout for call {call_sid}", 
-                      extra={'correlation_id': correlation_id})
-    except Exception as e:
-        logger.error(f"Processing error: {e}", 
-                    extra={'correlation_id': correlation_id},
-                    exc_info=True)
-    finally:
-        with state_lock:
-            if call_sid in active_streams:
-                active_streams[call_sid]['processing'] = False
-
-async def handle_reset(call_sid: str, stream_sid: str):
-    """Handle conversation reset"""
-    logger.info("Reset triggered by user")
-    
-    with state_lock:
-        conversation_history.pop(call_sid, None)
-        personality_memory.pop(call_sid, None)
-        mode_lock.pop(call_sid, None)
-        turn_count[call_sid] = 0
-        interview_question_index.pop(call_sid, None)
-        last_response_cache.pop(call_sid, None)
-    
-    reset_message = "Alright, let's start fresh. What would you like to practice?"
-    
-    if ELEVENLABS_WEBSOCKET_ENABLED:
-        await stream_tts_websocket(call_sid, stream_sid, reset_message)
-    else:
-        await stream_tts_response(call_sid, stream_sid, reset_message)
-
-async def repeat_last_response(call_sid: str, stream_sid: str):
-    """Repeat the last assistant response"""
-    # First check cache
-    with state_lock:
-        cached_response = last_response_cache.get(call_sid)
-    
-    if cached_response:
-        if ELEVENLABS_WEBSOCKET_ENABLED:
-            await stream_tts_websocket(call_sid, stream_sid, cached_response)
-        else:
-            await stream_tts_response(call_sid, stream_sid, cached_response)
-        return
-    
-    # Fall back to conversation history
-    if call_sid in conversation_history:
-        messages = conversation_history[call_sid]
-        for message in reversed(messages):
-            if message['role'] == 'assistant':
-                if ELEVENLABS_WEBSOCKET_ENABLED:
-                    await stream_tts_websocket(call_sid, stream_sid, message['content'])
-                else:
-                    await stream_tts_response(call_sid, stream_sid, message['content'])
-                return
-    
-    no_response_message = "I don't have a previous response to repeat."
-    if ELEVENLABS_WEBSOCKET_ENABLED:
-        await stream_tts_websocket(call_sid, stream_sid, no_response_message)
-    else:
-        await stream_tts_response(call_sid, stream_sid, no_response_message)
-
-async def generate_response(call_sid: str, transcript: str) -> str:
-    """Generate response with tool calling (non-streaming for reliability)"""
-    correlation_id = active_streams[call_sid].get('correlation_id', str(uuid.uuid4()))
-    
-    # Update turn count
-    with state_lock:
-        turn = turn_count.get(call_sid, 0)
-        turn_count[call_sid] = turn + 1
-    
-    # Detect intent
-    mode = mode_lock.get(call_sid)
-    if not mode:
-        mode = detect_intent(transcript)
-        with state_lock:
-            mode_lock[call_sid] = mode
-    
-    logger.info(f"Mode: {mode}, Turn: {turn}", 
-               extra={'correlation_id': correlation_id})
-    
-    # Initialize conversation history
-    with state_lock:
-        if call_sid not in conversation_history:
-            conversation_history[call_sid] = []
-        
-        conversation_history[call_sid].append({
-            "role": "user",
-            "content": transcript
-        })
-        
-        # Limit history
-        if len(conversation_history[call_sid]) > 10:
-            conversation_history[call_sid] = conversation_history[call_sid][-10:]
-    
-    # Get personality
-    voice_id, system_prompt, intro_line = get_personality_for_mode(call_sid, mode)
-    
-    # Handle interview questions
-    if mode == "interview":
-        with state_lock:
-            if call_sid not in interview_question_index:
-                interview_question_index[call_sid] = 0
-            
-            current_question_idx = interview_question_index[call_sid]
-            if current_question_idx < len(interview_questions):
-                system_prompt += f"\n\nAsk this question next: {interview_questions[current_question_idx]}"
-    
-    # Build messages
-    messages = [{"role": "system", "content": system_prompt}]
-    
-    # Add time awareness if low
-    if call_sid in call_start_times:
-        elapsed_minutes = (time.time() - call_start_times[call_sid]) / 60.0
-        minutes_left = active_streams[call_sid].get('minutes_left', FREE_CALL_MINUTES)
-        remaining = max(0, minutes_left - elapsed_minutes)
-        
-        if remaining < 2.0:  # Less than 2 minutes
-            messages[0]["content"] += (
-                f"\n\nIMPORTANT: The user has less than {remaining:.1f} minutes left. "
-                "You should proactively use the check_remaining_time tool to inform them about their remaining time. "
-                "Don't wait for them to ask - be helpful and let them know time is running low."
-            )
-    
-    # Check for bad news
-    if detect_bad_news(transcript):
-        messages = add_bad_news_context(messages, transcript)
-    
-    # Add conversation history
-    messages.extend(conversation_history[call_sid])
-    
-    # Define tool with clear description
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "check_remaining_time",
-                "description": "Check how many minutes the user has left in their free call. Use this when: 1) User asks about time, 2) You notice time might be running low, 3) The conversation seems to be wrapping up.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }
-            }
-        }
-    ]
-    
-    # Generate response (non-streaming for tool calling reliability)
-    try:
-        completion = await async_openai.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=messages,
-            temperature=0.7,
-            max_tokens=60,
-            tools=tools,
-            tool_choice="auto"
-        )
-        
-        message = completion.choices[0].message
-        
-        # Check for tool calls
-        if hasattr(message, 'tool_calls') and message.tool_calls:
-            logger.info(f"Tool calls detected: {len(message.tool_calls)}", 
-                       extra={'correlation_id': correlation_id})
-            
-            with metrics_lock:
-                metrics['tool_calls_made'] += 1
-            
-            # Process tool calls
-            for tool_call in message.tool_calls:
-                if tool_call.function.name == "check_remaining_time":
-                    # Calculate remaining time
-                    from_number = active_streams[call_sid].get('from_number', '')
-                    if from_number and call_sid in call_start_times:
-                        elapsed_minutes = (time.time() - call_start_times[call_sid]) / 60.0
-                        minutes_left = active_streams[call_sid].get('minutes_left', FREE_CALL_MINUTES)
-                        remaining = max(0, minutes_left - elapsed_minutes)
-                        
-                        # Check if time is exhausted
-                        if remaining <= MIN_CALL_DURATION:
-                            logger.info(f"Tool detected time exhausted for {call_sid}", 
-                                      extra={'correlation_id': correlation_id})
-                            
-                            # Update CSV immediately before time runs out
-                            elapsed_minutes = (time.time() - call_start_times[call_sid]) / 60.0
-                            update_user_usage(from_number, elapsed_minutes)
-                            
-                            # Cancel the timer since we're handling it now
-                            if call_sid in call_timers:
-                                call_timers[call_sid].cancel()
-                                call_timers.pop(call_sid, None)
-                            
-                            # Trigger end flow
-                            executor.submit(
-                                run_async_task,
-                                play_time_limit_message(call_sid, from_number)
-                            )
-                            
-                            return "Your free time is up! I'm sending you a link to continue practicing."
-                        
-                        # Add assistant message with tool call
-                        messages.append(message)
-                        
-                        # Add tool response
-                        tool_response = f"User has {remaining:.1f} minutes remaining in their free call."
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_response
-                        })
-                        
-                        # Get final response
-                        final_completion = await async_openai.chat.completions.create(
-                            model="gpt-3.5-turbo",
-                            messages=messages,
-                            temperature=0.7,
-                            max_tokens=60
-                        )
-                        full_response = final_completion.choices[0].message.content
-                    else:
-                        full_response = message.content or "I didn't catch that. Could you repeat?"
-                else:
-                    full_response = message.content or "I didn't catch that. Could you repeat?"
-        else:
-            full_response = message.content or "I didn't catch that. Could you repeat?"
-        
-        # Clean response
-        reply = clean_response_text(full_response)
-        
-        # Truncate if needed
-        sentences = re.split(r'(?<=[.!?])\s+', reply)
-        if len(sentences) > 2:
-            reply = ' '.join(sentences[:2])
-        
-        # Store in history
-        with state_lock:
-            conversation_history[call_sid].append({
-                "role": "assistant",
-                "content": reply
-            })
-            
-            # Update interview index
-            if mode == "interview":
-                interview_question_index[call_sid] = (interview_question_index[call_sid] + 1) % len(interview_questions)
-        
-        return reply
-        
-    except Exception as e:
-        logger.error(f"GPT error: {e}", 
-                    extra={'correlation_id': correlation_id},
-                    exc_info=True)
-        with metrics_lock:
-            metrics['api_errors']['openai'] += 1
-        return "I didn't catch that. Could you repeat?"
-
+# Mode detection
 def detect_intent(text: str) -> str:
-    """Enhanced intent detection"""
+    """Detect conversation mode from text"""
     lowered = text.lower()
     
     cold_call_patterns = [
@@ -1722,7 +708,7 @@ def detect_bad_news(text: str) -> bool:
     ]
     return any(re.search(pattern, lowered) for pattern in bad_news_patterns)
 
-def add_bad_news_context(messages: List[Dict[str, str]], transcript: str) -> List[Dict[str, str]]:
+def add_bad_news_context(system_prompt: str, transcript: str) -> str:
     """Add context for bad news scenarios"""
     escalation_level = 1
     
@@ -1732,22 +718,19 @@ def add_bad_news_context(messages: List[Dict[str, str]], transcript: str) -> Lis
         escalation_level = 3
     
     escalation_prompts = {
-        1: "The user just delivered bad news. Respond based on your personality, showing reasonable frustration. Keep response SHORT - 1-2 sentences max.",
-        2: "The user got defensive, so you're more upset but still professional. Express frustration clearly but briefly.",
-        3: "The user is being dismissive. You're quite frustrated now but keep it brief and end the conversation if needed."
+        1: "\n\nThe user just delivered bad news. Respond based on your personality, showing reasonable frustration. Keep response SHORT - 1-2 sentences max.",
+        2: "\n\nThe user got defensive, so you're more upset but still professional. Express frustration clearly but briefly.",
+        3: "\n\nThe user is being dismissive. You're quite frustrated now but keep it brief and end the conversation if needed."
     }
     
-    messages.insert(0, {
-        "role": "system", 
-        "content": escalation_prompts.get(escalation_level, escalation_prompts[1])
-    })
-    return messages
+    return system_prompt + escalation_prompts.get(escalation_level, escalation_prompts[1])
 
 def get_personality_for_mode(call_sid: str, mode: str) -> Tuple[str, str, str]:
-    """Get personality configuration"""
+    """Get personality configuration for mode"""
     if mode == "cold_call":
         with state_lock:
             if call_sid not in personality_memory:
+                import random
                 persona_name = random.choice(list(cold_call_personality_pool.keys()))
                 personality_memory[call_sid] = persona_name
             else:
@@ -1755,27 +738,15 @@ def get_personality_for_mode(call_sid: str, mode: str) -> Tuple[str, str, str]:
             
         persona = cold_call_personality_pool[persona_name]
         return (
-            persona["voice_id"],
+            persona["voice"],
             persona["system_prompt"],
             "Hello?"
         )
         
     elif mode == "interview":
-        voice_pool = [
-            {"voice_id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel"},
-            {"voice_id": "EXAVITQu4vr4xnSDxMaL", "name": "Clyde"},
-            {"voice_id": "6YQMyaUWlj0VX652cY1C", "name": "Stephen"}
-        ]
-        
-        with state_lock:
-            if call_sid not in personality_memory:
-                voice_choice = random.choice(voice_pool)
-                personality_memory[call_sid] = voice_choice
-            else:
-                voice_choice = personality_memory[call_sid]
-            
+        voice = "alloy"  # Professional voice for interviews
         system_prompt = (
-            f"You are {voice_choice['name']}, a friendly, conversational job interviewer. "
+            f"You are Rachel, a friendly, conversational job interviewer. "
             "Ask one interview question at a time, give supportive feedback. "
             "Keep your tone upbeat and natural. Keep responses SHORT - 1-2 sentences. "
             "Be encouraging and professional.\n\n"
@@ -1785,560 +756,1044 @@ def get_personality_for_mode(call_sid: str, mode: str) -> Tuple[str, str, str]:
         )
         
         return (
-            voice_choice["voice_id"],
+            voice,
             system_prompt,
             "Great, let's start. Tell me about yourself."
         )
         
     else:  # small_talk
         return (
-            "2BJW5coyhAzSr8STdHbE",
+            "shimmer",  # Casual voice for small talk
             "You're a casual, sarcastic friend. Keep it light and fun. Use humor and be relatable. SHORT responses only - 1-2 sentences max.",
             "Hey, what's up?"
         )
 
-def clean_response_text(text: str) -> str:
-    """Clean response text"""
-    text = re.sub(r'[*_`#]', '', text)
-    text = re.sub(r'\s+([,.!?])', r'\1', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
+# Timer handling
+def handle_time_limit(call_sid: str, from_number: str):
+    """Handle when free time limit is reached"""
+    correlation_id = str(uuid.uuid4())
+    logger.info(f"Time limit reached for {call_sid}", 
+               extra={'correlation_id': correlation_id})
+    
+    # Update CSV immediately before playing message
+    if call_sid in call_start_times:
+        elapsed_minutes = (time.time() - call_start_times[call_sid]) / 60.0
+        update_user_usage(from_number, elapsed_minutes)
+        logger.info(f"Updated usage for {from_number}: {elapsed_minutes:.2f} minutes", 
+                   extra={'correlation_id': correlation_id})
+    
+    # Send end message through OpenAI WebSocket if still connected
+    if call_sid in active_streams:
+        ws = active_streams[call_sid].get('openai_ws')
+        if ws:
+            asyncio.create_task(send_time_limit_message(ws, call_sid, from_number))
 
-async def stream_tts_websocket(call_sid: str, stream_sid: str, text: str):
-    """Stream TTS using ElevenLabs WebSocket with corrected parameters"""
-    if call_sid not in active_streams:
-        return
-    
-    ws = active_streams[call_sid]['ws']
-    correlation_id = active_streams[call_sid].get('correlation_id', str(uuid.uuid4()))
-    
-    mode = mode_lock.get(call_sid, "cold_call")
-    voice_id, _, _ = get_personality_for_mode(call_sid, mode)
-    
-    elevenlabs_ws = None
-    keepalive_task = None
+async def send_time_limit_message(openai_ws, call_sid: str, from_number: str):
+    """Send time limit message through OpenAI Realtime"""
     try:
-        # Build WebSocket URL with all parameters
-        model_id = "eleven_turbo_v2_5"
-        elevenlabs_url = (
-            f"wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input"
-            f"?model_id={model_id}"
-            f"&optimize_streaming_latency=4"
-            f"&output_format=ulaw_8000"
-            f"&inactivity_timeout=180"
+        # Create a conversation item with the time limit message
+        message = (
+            "Alright, that's the end of your free call — but this is only the beginning. "
+            "We just texted you a link to ConvoReps.com. Whether you're prepping for interviews "
+            "or sharpening your pitch, this is how you level up — don't wait, your next opportunity is already calling."
         )
         
-        headers = {
-            "xi-api-key": os.getenv("ELEVENLABS_API_KEY")
+        time_limit_item = {
+            "type": "conversation.item.create",
+            "event_id": f"time_limit_{call_sid[:8]}",
+            "item": {
+                "type": "message",
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": f"Say exactly this to end the call: {message}"
+                    }
+                ]
+            }
         }
         
-        # FIXED: Use 'additional_headers' instead of 'extra_headers'
-        async with websockets.connect(elevenlabs_url, additional_headers=headers) as elevenlabs_ws:
-            elevenlabs_websockets[call_sid] = elevenlabs_ws
+        await openai_ws.send(json.dumps(time_limit_item))
+        
+        response_event = {
+            "type": "response.create",
+            "event_id": f"time_limit_response_{call_sid[:8]}"
+        }
+        await openai_ws.send(json.dumps(response_event))
+        
+        # Send SMS
+        usage_data = read_user_usage(from_number)
+        is_first_call = usage_data['total_calls'] <= 1
+        await send_sms_link(from_number, is_first_call=is_first_call)
+        
+        # Close connection after a delay
+        await asyncio.sleep(5)
+        if call_sid in active_streams:
+            cleanup_call_resources(call_sid)
             
-            # Start keepalive task
-            async def keepalive():
+    except Exception as e:
+        logger.error(f"Error sending time limit message: {e}")
+
+def cleanup_call_resources(call_sid: str):
+    """Clean up call resources"""
+    with state_lock:
+        if call_sid in active_streams:
+            from_number = active_streams[call_sid].get('from_number', '')
+            
+            # Update usage if not already done
+            if call_sid in call_start_times and call_sid not in call_timers:
+                call_duration = time.time() - call_start_times[call_sid]
+                minutes_used = call_duration / 60.0
+                
+                if from_number and validate_phone_number(from_number) and minutes_used > 0.01:
+                    update_user_usage(from_number, minutes_used)
+                    logger.info(f"Call {call_sid} lasted {minutes_used:.2f} minutes")
+                    
+                    # Check if SMS needed
+                    usage_after = read_user_usage(from_number)
+                    if usage_after['minutes_left'] <= 0.5:
+                        is_first_call = usage_after['total_calls'] <= 1
+                        executor.submit(run_async_task, 
+                                      send_sms_link(from_number, is_first_call=is_first_call))
+                
+                call_start_times.pop(call_sid, None)
+            
+            # Cancel timer
+            if call_sid in call_timers:
+                call_timers[call_sid].cancel()
+                call_timers.pop(call_sid, None)
+            
+            # Close WebSockets
+            if 'openai_ws' in active_streams[call_sid]:
                 try:
-                    while elevenlabs_ws.open:
-                        await asyncio.sleep(ELEVENLABS_KEEPALIVE_INTERVAL)
-                        if elevenlabs_ws.open:
-                            await elevenlabs_ws.send(json.dumps({"text": " "}))
-                            logger.debug(f"Sent ElevenLabs keepalive for {call_sid}")
+                    asyncio.create_task(active_streams[call_sid]['openai_ws'].close())
                 except:
                     pass
             
-            keepalive_task = asyncio.create_task(keepalive())
-            
-            # Send initial configuration with optimized settings
-            init_message = {
-                "text": " ",
-                "voice_settings": {
-                    "stability": 0.5,
-                    "similarity_boost": 0.75,
-                    "style": 0.0,
-                    "use_speaker_boost": True
-                },
-                "generation_config": {
-                    "chunk_length_schedule": [50, 90, 120, 150, 500]
-                }
-            }
-            
-            await elevenlabs_ws.send(json.dumps(init_message))
-            
-            # Send text in sentences for better streaming
-            sentences = re.split(r'(?<=[.!?])\s+', text)
-            sentences = sentences[:2]  # Limit to 2 sentences
-            
-            for i, sentence in enumerate(sentences):
-                if sentence.strip():
-                    if active_streams[call_sid].get('interruption_requested', False):
-                        break
-                    
-                    text_message = {
-                        "text": sentence + " ",
-                        "flush": i == len(sentences) - 1
-                    }
-                    await elevenlabs_ws.send(json.dumps(text_message))
-            
-            # Send end of sequence
-            await elevenlabs_ws.send(json.dumps({"text": ""}))
-            
-            # Receive and forward audio
-            chunk_count = 0
-            consecutive_timeouts = 0
-            max_consecutive_timeouts = 3
-            
-            while consecutive_timeouts < max_consecutive_timeouts:
+            if 'twilio_ws' in active_streams[call_sid]:
                 try:
-                    response = await asyncio.wait_for(elevenlabs_ws.recv(), timeout=5.0)
-                    consecutive_timeouts = 0  # Reset on successful receive
-                    
-                    data = json.loads(response)
-                    
-                    if data.get("audio"):
-                        if active_streams[call_sid].get('interruption_requested', False):
-                            break
-                        
-                        media_message = {
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {
-                                "payload": data["audio"]
-                            }
-                        }
-                        ws.send(json.dumps(media_message))
-                        chunk_count += 1
-                        
-                        # Send periodic marks for tracking
-                        if chunk_count % 10 == 0:
-                            mark_message = {
-                                "event": "mark",
-                                "streamSid": stream_sid,
-                                "mark": {
-                                    "name": f"audio_chunk_{chunk_count}"
-                                }
-                            }
-                            ws.send(json.dumps(mark_message))
-                    
-                    if data.get("isFinal"):
-                        break
-                        
-                except asyncio.TimeoutError:
-                    consecutive_timeouts += 1
-                    logger.warning(f"ElevenLabs WebSocket timeout {consecutive_timeouts}/{max_consecutive_timeouts}", 
-                                 extra={'correlation_id': correlation_id})
-                except Exception as e:
-                    logger.error(f"ElevenLabs WebSocket receive error: {e}", 
-                               extra={'correlation_id': correlation_id})
-                    break
+                    asyncio.create_task(active_streams[call_sid]['twilio_ws'].close())
+                except:
+                    pass
             
-            # Send end marker
-            end_mark = {
-                "event": "mark",
-                "streamSid": stream_sid,
-                "mark": {
-                    "name": "response_end"
-                }
-            }
-            ws.send(json.dumps(end_mark))
+            # Clean up state
+            active_streams.pop(call_sid, None)
+            turn_count.pop(call_sid, None)
+            conversation_transcripts.pop(call_sid, None)
+            personality_memory.pop(call_sid, None)
+            mode_lock.pop(call_sid, None)
+            interview_question_index.pop(call_sid, None)
+            last_response_cache.pop(call_sid, None)
+            recording_urls.pop(call_sid, None)
             
-            logger.info(f"Sent {chunk_count} audio chunks via WebSocket", 
-                       extra={'correlation_id': correlation_id})
+            # Clear SMS flag after delay
+            if from_number:
+                def clear_sms_flag():
+                    time.sleep(300)  # 5 minutes
+                    with state_lock:
+                        sms_sent_flags.pop(from_number, None)
+                threading.Thread(target=clear_sms_flag, daemon=True).start()
+    
+    with metrics_lock:
+        metrics['active_calls'] = max(0, metrics['active_calls'] - 1)
+    
+    gc.collect()  # Memory optimization
+
+# Periodic cleanup
+def periodic_cleanup():
+    """Clean up stale connections periodically"""
+    while not shutdown_event.is_set():
+        try:
+            time.sleep(60)
+            current_time = time.time()
+            stale_calls = []
             
-    except websockets.exceptions.WebSocketException as e:
-        logger.error(f"ElevenLabs WebSocket connection error: {e}", 
+            with state_lock:
+                for call_sid, stream_data in list(active_streams.items()):
+                    if current_time - stream_data.get('last_activity', 0) > 300:
+                        stale_calls.append(call_sid)
+            
+            for call_sid in stale_calls:
+                logger.info(f"Cleaning up stale connection: {call_sid}")
+                cleanup_call_resources(call_sid)
+                
+        except Exception as e:
+            logger.error(f"Cleanup thread error: {e}")
+
+cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
+cleanup_thread.start()
+
+# Twilio endpoints
+@app.get("/", response_class=HTMLResponse)
+async def index_page():
+    return "<html><body><h1>ConvoReps Realtime Server is running!</h1></body></html>"
+
+@app.api_route("/voice", methods=["GET", "POST"])
+async def handle_incoming_call(request: Request):
+    """Handle incoming call and return TwiML response"""
+    correlation_id = str(uuid.uuid4())
+    
+    # Get form data
+    form_data = await request.form()
+    params = dict(form_data)
+    
+    # Security validation
+    if TWILIO_AUTH_TOKEN:
+        url = str(request.url)
+        signature = request.headers.get('X-Twilio-Signature', '')
+        
+        if not twilio_validator.validate(url, params, signature):
+            logger.warning("Invalid Twilio signature", 
+                         extra={'correlation_id': correlation_id})
+            response = VoiceResponse()
+            response.reject()
+            return HTMLResponse(content=str(response), media_type="application/xml", status_code=403)
+    
+    # Get parameters
+    call_sid = params.get("CallSid")
+    from_number = params.get("From", "+10000000000")
+    recording_url = params.get("RecordingUrl")
+    
+    if not validate_call_sid(call_sid):
+        logger.error(f"Invalid CallSid: {call_sid}", 
                     extra={'correlation_id': correlation_id})
+        response = VoiceResponse()
+        response.say("Sorry, there was an error processing your call.")
+        response.hangup()
+        return HTMLResponse(content=str(response), media_type="application/xml")
+    
+    logger.info(f"New call: {call_sid} from {from_number}", 
+               extra={'correlation_id': correlation_id})
+    
+    # Store recording URL if provided
+    if recording_url:
+        with state_lock:
+            recording_urls[call_sid] = recording_url
+            
+    # Validate phone number
+    if not validate_phone_number(from_number):
+        logger.error(f"Invalid phone number: {from_number}", 
+                    extra={'correlation_id': correlation_id})
+        response = VoiceResponse()
+        response.say("Sorry, we couldn't validate your phone number.")
+        response.hangup()
+        return HTMLResponse(content=str(response), media_type="application/xml")
+    
+    # Check free minutes
+    usage_data = read_user_usage(from_number)
+    is_repeat_caller = usage_data['total_calls'] > 0
+    minutes_left = usage_data['minutes_left']
+    
+    # Require minimum call duration
+    if minutes_left < MIN_CALL_DURATION and is_repeat_caller:
+        response = VoiceResponse()
+        response.say(
+            "Hey! You've already used your free call. But no worries, we just texted you a link to Convoreps.com. "
+            "Grab a Starter Pass for $6.99 and turn practice into real-world results.",
+            voice="alice",
+            language="en-US"
+        )
+        response.hangup()
+        
+        executor.submit(run_async_task, send_sms_link(from_number, is_first_call=False))
+        
+        return HTMLResponse(content=str(response), media_type="application/xml")
+    
+    # Initialize call state
+    with state_lock:
+        if call_sid not in turn_count:
+            turn_count[call_sid] = 0
+            call_start_times[call_sid] = time.time()
+            conversation_transcripts[call_sid] = []
+            logger.info(f"User has {minutes_left:.2f} minutes remaining", 
+                       extra={'correlation_id': correlation_id})
+        else:
+            turn_count[call_sid] += 1
+            
         with metrics_lock:
-            metrics['api_errors']['elevenlabs'] += 1
-        # Fallback to HTTP streaming
-        await stream_tts_response(call_sid, stream_sid, text)
-    except Exception as e:
-        logger.error(f"TTS WebSocket error: {e}", 
-                    extra={'correlation_id': correlation_id},
-                    exc_info=True)
-        # Fallback to HTTP streaming
-        await stream_tts_response(call_sid, stream_sid, text)
-    finally:
-        # Cancel keepalive task
-        if keepalive_task:
-            keepalive_task.cancel()
-        # Clean up WebSocket reference
-        if call_sid in elevenlabs_websockets:
-            elevenlabs_websockets.pop(call_sid, None)
-async def stream_tts_response(call_sid: str, stream_sid: str, text: str):
-    """Fallback TTS streaming via HTTP"""
-    if call_sid not in active_streams:
-        return
+            metrics['total_calls'] += 1
+            metrics['active_calls'] += 1
     
-    ws = active_streams[call_sid]['ws']
-    correlation_id = active_streams[call_sid].get('correlation_id', str(uuid.uuid4()))
+    response = VoiceResponse()
     
-    mode = mode_lock.get(call_sid, "cold_call")
-    voice_id, _, _ = get_personality_for_mode(call_sid, mode)
+    # Play greeting with beep
+    if turn_count.get(call_sid, 0) == 0:
+        if not is_repeat_caller:
+            greeting_file = "first_time_greeting.mp3"
+            logger.info("New caller detected — playing first-time greeting", 
+                       extra={'correlation_id': correlation_id})
+        else:
+            greeting_file = "returning_user_greeting.mp3"
+            logger.info("Returning caller — playing returning greeting", 
+                       extra={'correlation_id': correlation_id})
+        
+        # Play greeting if file exists
+        if os.path.exists(f"static/{greeting_file}"):
+            response.play(f"{request.url_root}static/{greeting_file}")
+        else:
+            # Fallback TTS greeting
+            if greeting_file == "first_time_greeting.mp3":
+                response.say("Welcome to ConvoReps! Let's practice.", voice="alice")
+            else:
+                response.say("Welcome back! Ready to practice?", voice="alice")
+        
+        # Play beep sound
+        if os.path.exists("static/beep.mp3"):
+            response.play(f"{request.url_root}static/beep.mp3")
+        response.pause(length=1)
     
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    sentences = sentences[:2]
+    # Connect to WebSocket stream
+    host = request.headers.get('X-Forwarded-Host', request.headers.get('Host', request.url.hostname))
+    ws_scheme = "wss" if request.url.scheme == "https" else "ws"
+    stream_url = f"{ws_scheme}://{host}/media-stream"
     
-    for i, sentence in enumerate(sentences):
-        if sentence.strip():
-            if active_streams[call_sid].get('interruption_requested', False):
-                break
+    logger.info(f"Stream URL: {stream_url}", extra={'correlation_id': correlation_id})
+    
+    connect = Connect()
+    stream = TwilioStream(
+        url=stream_url,
+        track="inbound_track"  # Bidirectional streams
+    )
+    
+    # Add custom parameters
+    stream.parameter(name="call_sid", value=call_sid)
+    stream.parameter(name="from_number", value=from_number)
+    stream.parameter(name="minutes_left", value=str(minutes_left))
+    stream.parameter(name="correlation_id", value=correlation_id)
+    
+    connect.append(stream)
+    response.append(connect)
+    
+    # Fallback TwiML
+    response.say("Thank you for practicing with ConvoReps!")
+    response.pause(length=1)
+    response.hangup()
+    
+    # Set up timer
+    timer_duration = minutes_left * 60 if minutes_left < FREE_CALL_MINUTES else FREE_CALL_MINUTES * 60
+    logger.info(f"Setting timer for {timer_duration:.0f} seconds", 
+               extra={'correlation_id': correlation_id})
+    
+    timer = threading.Timer(timer_duration, lambda: handle_time_limit(call_sid, from_number))
+    timer.start()
+    
+    with state_lock:
+        call_timers[call_sid] = timer
+    
+    return HTMLResponse(content=str(response), media_type="application/xml")
+
+@app.websocket("/media-stream")
+async def handle_media_stream(websocket: WebSocket):
+    """Handle WebSocket connection between Twilio and OpenAI Realtime"""
+    await websocket.accept()
+    logger.info("Client connected to media stream")
+    
+    stream_sid = None
+    call_sid = None
+    from_number = None
+    minutes_left = FREE_CALL_MINUTES
+    correlation_id = None
+    openai_ws = None
+    latest_media_timestamp = 0
+    response_start_timestamp_twilio = None
+    mark_queue = []
+    last_assistant_item = None
+    
+    try:
+        # Connect to OpenAI Realtime API
+        openai_url = f'wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}'
+        async with websockets.connect(
+            openai_url,
+            additional_headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "OpenAI-Beta": "realtime=v1"
+            }
+        ) as openai_ws:
+            
+            # Send initial session configuration
+            await send_session_update(openai_ws)
+            
+            async def receive_from_twilio():
+                """Receive audio from Twilio and forward to OpenAI"""
+                nonlocal stream_sid, call_sid, from_number, minutes_left, correlation_id, latest_media_timestamp
                 
-            try:
-                logger.info(f"Generating TTS for: {sentence[:50]}...", 
-                           extra={'correlation_id': correlation_id})
-                
-                audio_stream = elevenlabs_client.text_to_speech.stream(
-                    text=sentence,
-                    voice_id=voice_id,
-                    model_id="eleven_turbo_v2_5",
-                    voice_settings=VoiceSettings(
-                        stability=0.4,
-                        similarity_boost=0.75,
-                        style=0.0,
-                        use_speaker_boost=True
-                    ),
-                    output_format="ulaw_8000",
-                    optimize_streaming_latency=4
-                )
-                
-                chunk_count = 0
-                audio_buffer = bytearray()
-                
-                for audio_chunk in audio_stream:
-                    if isinstance(audio_chunk, bytes) and audio_chunk:
-                        audio_buffer.extend(audio_chunk)
+                try:
+                    async for message in websocket.iter_text():
+                        data = json.loads(message)
                         
-                        while len(audio_buffer) >= 160:
-                            chunk_to_send = bytes(audio_buffer[:160])
-                            audio_buffer = audio_buffer[160:]
+                        if data['event'] == 'start':
+                            # Extract stream data from start event
+                            start_data = data.get('start', {})
+                            stream_sid = start_data.get('streamSid')
                             
-                            if active_streams[call_sid].get('interruption_requested', False):
-                                break
+                            # Extract custom parameters
+                            custom_params = start_data.get('customParameters', {})
+                            call_sid = custom_params.get('call_sid')
+                            from_number = custom_params.get('from_number')
+                            minutes_left = float(custom_params.get('minutes_left', FREE_CALL_MINUTES))
+                            correlation_id = custom_params.get('correlation_id')
                             
-                            payload = base64.b64encode(chunk_to_send).decode('utf-8')
-                            media_message = {
+                            logger.info(f"Stream started - CallSid: {call_sid}, StreamSid: {stream_sid}", 
+                                       extra={'correlation_id': correlation_id})
+                            
+                            with state_lock:
+                                active_streams[call_sid] = {
+                                    'stream_sid': stream_sid,
+                                    'from_number': from_number,
+                                    'minutes_left': minutes_left,
+                                    'last_activity': time.time(),
+                                    'correlation_id': correlation_id,
+                                    'openai_ws': openai_ws,
+                                    'twilio_ws': websocket
+                                }
+                                
+                            # Send initial greeting
+                            await send_initial_conversation_item(openai_ws, call_sid)
+                        
+                        elif data['event'] == 'media' and openai_ws.open:
+                            latest_media_timestamp = int(data['media']['timestamp'])
+                            
+                            # Update activity
+                            if call_sid in active_streams:
+                                active_streams[call_sid]['last_activity'] = time.time()
+                            
+                            # Forward audio to OpenAI with memory optimization
+                            audio_append = {
+                                "type": "input_audio_buffer.append",
+                                "audio": data['media']['payload']
+                            }
+                            await openai_ws.send(json.dumps(audio_append))
+                            
+                            # Periodic garbage collection for memory optimization
+                            if latest_media_timestamp % 30000 == 0:  # Every 30 seconds
+                                gc.collect()
+                        
+                        elif data['event'] == 'mark':
+                            # Mark event from Twilio
+                            if mark_queue:
+                                mark_queue.pop(0)
+                        
+                        elif data['event'] == 'dtmf':
+                            # Handle DTMF tones
+                            dtmf_data = data.get('dtmf', {})
+                            digit = dtmf_data.get('digit')
+                            logger.info(f"DTMF received: {digit}", 
+                                       extra={'correlation_id': correlation_id})
+                            
+                            if digit == '#':
+                                # Reset conversation
+                                await handle_reset(openai_ws, call_sid)
+                            elif digit == '*':
+                                # Repeat last response
+                                await repeat_last_response(openai_ws, call_sid)
+                        
+                        elif data['event'] == 'stop':
+                            logger.info(f"Stream stopped - CallSid: {call_sid}", 
+                                       extra={'correlation_id': correlation_id})
+                            break
+                            
+                except WebSocketDisconnect:
+                    logger.info("Client disconnected")
+                    # Send any pending SMS/email from transcript
+                    send_sms_via_twilio()
+                    send_email_via_twilio_sms()
+                    # Clean up transcript CSV
+                    if os.path.exists(CONVERSATION_TRANSCRIPT_CSV):
+                        os.remove(CONVERSATION_TRANSCRIPT_CSV)
+                except Exception as e:
+                    logger.error(f"Error in receive_from_twilio: {e}", exc_info=True)
+                finally:
+                    # Always try to send SMS/email on disconnect
+                    logger.info("Connection closed. Checking for SMS/email instructions.")
+                    send_sms_via_twilio()
+                    send_email_via_twilio_sms()
+                    if os.path.exists(CONVERSATION_TRANSCRIPT_CSV):
+                        os.remove(CONVERSATION_TRANSCRIPT_CSV)
+            
+            async def send_to_twilio():
+                """Receive from OpenAI and forward to Twilio"""
+                nonlocal response_start_timestamp_twilio, last_assistant_item
+                
+                try:
+                    async for openai_message in openai_ws:
+                        response = json.loads(openai_message)
+                        
+                        # Log important events (matching working implementation)
+                        if response.get('type') in ['response.content.done', 'rate_limits.updated', 
+                                                    'response.done', 'input_audio_buffer.committed',
+                                                    'input_audio_buffer.speech_stopped', 
+                                                    'input_audio_buffer.speech_started',
+                                                    'response.create', 'session.created']:
+                            logger.info(f"Received event: {response['type']}")
+                        
+                        # Handle session created
+                        if response.get('type') == 'session.created':
+                            logger.info(f"Session created successfully", 
+                                      extra={'correlation_id': correlation_id})
+                        
+                        # Handle audio delta
+                        elif response.get('type') == 'response.audio.delta' and 'delta' in response:
+                            # Forward audio to Twilio - ensure proper base64 encoding
+                            audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
+                            audio_delta = {
                                 "event": "media",
                                 "streamSid": stream_sid,
                                 "media": {
-                                    "payload": payload
+                                    "payload": audio_payload
                                 }
                             }
-                            ws.send(json.dumps(media_message))
-                            chunk_count += 1
+                            await websocket.send_json(audio_delta)
                             
-                            if chunk_count % 10 == 0:
-                                await asyncio.sleep(0.001)
-                
-                if audio_buffer and not active_streams[call_sid].get('interruption_requested', False):
-                    payload = base64.b64encode(bytes(audio_buffer)).decode('utf-8')
-                    media_message = {
-                        "event": "media",
-                        "streamSid": stream_sid,
-                        "media": {
-                            "payload": payload
-                        }
+                            if response_start_timestamp_twilio is None:
+                                response_start_timestamp_twilio = latest_media_timestamp
+                            
+                            # Update last assistant item
+                            if response.get('item_id'):
+                                last_assistant_item = response['item_id']
+                            
+                            await send_mark(websocket, stream_sid)
+                        
+                        # Handle rate limits
+                        elif response.get('type') == 'rate_limits.updated':
+                            rate_limits = response.get('rate_limits', [])
+                            for limit in rate_limits:
+                                logger.warning(f"Rate limit update - Name: {limit.get('name')}, "
+                                             f"Remaining: {limit.get('remaining')}, "
+                                             f"Reset: {limit.get('reset_seconds')}")
+                        
+                        # Handle response done - log transcripts
+                        elif response.get('type') == 'response.done':
+                            # Parse and log transcripts
+                            if 'response' in response and 'output' in response['response']:
+                                for item in response['response']['output']:
+                                    role = item.get('role')
+                                    content = item.get('content', [])
+                                    
+                                    for c in content:
+                                        if c.get('type') == 'audio' and 'transcript' in c:
+                                            # Append to CSV
+                                            append_transcript_to_csv(role, c['transcript'], 
+                                                                   stream_sid or "unknownSID")
+                                            
+                                            # Also store in memory (with limit for memory optimization)
+                                            if call_sid in conversation_transcripts:
+                                                conversation_transcripts[call_sid].append({
+                                                    'role': role,
+                                                    'content': c['transcript'],
+                                                    'timestamp': datetime.now().isoformat()
+                                                })
+                                                
+                                                # Limit conversation history to last 50 messages
+                                                if len(conversation_transcripts[call_sid]) > 50:
+                                                    conversation_transcripts[call_sid] = conversation_transcripts[call_sid][-50:]
+                                                
+                                                # Cache assistant response for repeat functionality
+                                                if role == 'assistant':
+                                                    with state_lock:
+                                                        last_response_cache[call_sid] = c['transcript']
+                            
+                            response_start_timestamp_twilio = None
+                            
+                            # Check for interview mode to advance questions
+                            mode = mode_lock.get(call_sid, "cold_call")
+                            if mode == "interview" and call_sid in interview_question_index:
+                                # Advance to next question
+                                interview_question_index[call_sid] = (
+                                    interview_question_index.get(call_sid, 0) + 1
+                                ) % len(interview_questions)
+                                
+                                # Update session with next question
+                                voice, base_prompt, _ = get_personality_for_mode(call_sid, "interview")
+                                current_q_idx = interview_question_index[call_sid]
+                                if current_q_idx < len(interview_questions):
+                                    system_prompt = base_prompt + f"\n\nAsk this question next: {interview_questions[current_q_idx]}"
+                                    
+                                    update_event = {
+                                        "type": "session.update",
+                                        "event_id": f"interview_q{current_q_idx}_{call_sid[:8]}",
+                                        "session": {
+                                            "voice": voice,
+                                            "instructions": system_prompt
+                                        }
+                                    }
+                                    await openai_ws.send(json.dumps(update_event))
+                        
+                        # Handle user speech transcription
+                        elif response.get('type') == 'conversation.item.input_audio_transcription.completed':
+                            transcript = response.get('transcript', '')
+                            if transcript and call_sid:
+                                # Log to CSV
+                                append_transcript_to_csv('user', transcript, stream_sid or "unknownSID")
+                                
+                                # Store in memory (with limit for memory optimization)
+                                if call_sid in conversation_transcripts:
+                                    conversation_transcripts[call_sid].append({
+                                        'role': 'user',
+                                        'content': transcript,
+                                        'timestamp': datetime.now().isoformat()
+                                    })
+                                    
+                                    # Limit conversation history to last 50 messages
+                                    if len(conversation_transcripts[call_sid]) > 50:
+                                        conversation_transcripts[call_sid] = conversation_transcripts[call_sid][-50:]
+                                
+                                # Detect mode if not set
+                                if call_sid not in mode_lock:
+                                    detected_mode = detect_intent(transcript)
+                                    mode_lock[call_sid] = detected_mode
+                                    
+                                    # Check for bad news and update prompt accordingly
+                                    voice, system_prompt, _ = get_personality_for_mode(call_sid, detected_mode)
+                                    
+                                    if detect_bad_news(transcript):
+                                        system_prompt = add_bad_news_context(system_prompt, transcript)
+                                    
+                                    # Initialize interview question index if interview mode
+                                    if detected_mode == "interview" and call_sid not in interview_question_index:
+                                        interview_question_index[call_sid] = 0
+                                    
+                                    # Update session if mode changed
+                                    if detected_mode != "cold_call":
+                                        # For interview mode, include current question in prompt
+                                        if detected_mode == "interview":
+                                            current_q_idx = interview_question_index.get(call_sid, 0)
+                                            if current_q_idx < len(interview_questions):
+                                                system_prompt += f"\n\nAsk this question next: {interview_questions[current_q_idx]}"
+                                        
+                                        await update_session_for_mode(openai_ws, voice, system_prompt)
+                                else:
+                                    # Check for bad news in ongoing conversation
+                                    if detect_bad_news(transcript):
+                                        mode = mode_lock.get(call_sid, "cold_call")
+                                        voice, system_prompt, _ = get_personality_for_mode(call_sid, mode)
+                                        system_prompt = add_bad_news_context(system_prompt, transcript)
+                                        await update_session_for_mode(openai_ws, voice, system_prompt)
+                        
+                        # Handle speech started - interruption
+                        elif response.get('type') == 'input_audio_buffer.speech_started':
+                            logger.info("Speech started detected")
+                            if last_assistant_item:
+                                logger.info(f"Interrupting response with id: {last_assistant_item}")
+                                new_timestamp, new_item = await handle_speech_started_event(
+                                    openai_ws, websocket, stream_sid, 
+                                    response_start_timestamp_twilio, latest_media_timestamp,
+                                    last_assistant_item, mark_queue
+                                )
+                                response_start_timestamp_twilio = new_timestamp
+                                last_assistant_item = new_item
+                        
+                        # Handle function calls - check both events per OpenAI docs
+                        elif response.get('type') in ['response.function_call_arguments.done', 'response.done']:
+                            # Check if this is a function call response
+                            if response.get('type') == 'response.done':
+                                # Check response.output for function calls
+                                outputs = response.get('response', {}).get('output', [])
+                                for output in outputs:
+                                    if output.get('type') == 'function_call':
+                                        await handle_function_call_from_response(
+                                            output, openai_ws, call_sid,
+                                            call_start_times.get(call_sid), minutes_left
+                                        )
+                            else:
+                                # Direct function_call_arguments.done event
+                                await handle_function_call(response, openai_ws, call_sid, 
+                                                         call_start_times.get(call_sid), minutes_left)
+                        
+                        elif response.get('type') == 'error':
+                            error_code = response.get('code')
+                            error_message = response.get('message')
+                            error_event_id = response.get('event_id')
+                            
+                            logger.error(f"OpenAI error - Code: {error_code}, Message: {error_message}, Event ID: {error_event_id}")
+                            
+                            # Log which event caused the error
+                            if error_event_id:
+                                logger.error(f"Error caused by event: {error_event_id}")
+                            
+                            with metrics_lock:
+                                metrics['api_errors'] += 1
+                                
+                except WebSocketDisconnect:
+                    logger.info("WebSocket to Twilio closed")
+                except Exception as e:
+                    logger.error(f"Error in send_to_twilio: {e}", exc_info=True)
+            
+            async def send_mark(connection, sid):
+                """Send mark event to track audio chunks"""
+                if sid:
+                    mark_event = {
+                        "event": "mark",
+                        "streamSid": sid,
+                        "mark": {"name": "responsePart"}
                     }
-                    ws.send(json.dumps(media_message))
-                
-                mark_message = {
-                    "event": "mark",
-                    "streamSid": stream_sid,
-                    "mark": {
-                        "name": f"sentence_{i}"
+                    await connection.send_json(mark_event)
+                    mark_queue.append('responsePart')
+                    
+                    # Limit mark queue size for memory optimization
+                    if len(mark_queue) > 100:
+                        mark_queue[:50] = []  # Keep last 50 marks
+            
+            # Run both tasks concurrently
+            await asyncio.gather(receive_from_twilio(), send_to_twilio())
+            
+    except Exception as e:
+        logger.error(f"WebSocket handler error: {e}", exc_info=True)
+    finally:
+        if call_sid:
+            cleanup_call_resources(call_sid)
+        await websocket.close()
+
+async def send_session_update(openai_ws):
+    """Send session configuration to OpenAI"""
+    # Default to cold call personality
+    voice, system_prompt, _ = get_personality_for_mode("", "cold_call")
+    
+    session_update = {
+        "type": "session.update",
+        "event_id": f"session_update_{uuid.uuid4().hex[:8]}",
+        "session": {
+            "turn_detection": {"type": "server_vad"},
+            "input_audio_format": "g711_ulaw",
+            "output_audio_format": "g711_ulaw",
+            "voice": voice,
+            "instructions": system_prompt,
+            "modalities": ["text", "audio"],
+            "temperature": 0.8,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "check_remaining_time",
+                    "description": "Check how many minutes the user has left in their free call",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
                     }
                 }
-                ws.send(json.dumps(mark_message))
-                
-                logger.info(f"Sent {chunk_count} audio chunks for sentence {i}", 
-                           extra={'correlation_id': correlation_id})
-                
-                del audio_stream
-                gc.collect()
-                
-            except Exception as e:
-                logger.error(f"TTS streaming error: {e}", 
-                            extra={'correlation_id': correlation_id},
-                            exc_info=True)
-                with metrics_lock:
-                    metrics['api_errors']['elevenlabs'] += 1
-    
-    await asyncio.sleep(0.1)
-    end_mark = {
-        "event": "mark",
-        "streamSid": stream_sid,
-        "mark": {
-            "name": "response_end"
+            ],
+            "tool_choice": "auto"
         }
     }
-    ws.send(json.dumps(end_mark))
-
-def convert_mulaw_to_pcm(mulaw_data: bytes) -> bytes:
-    """Convert mulaw to PCM with proper validation and error handling"""
-    try:
-        if not mulaw_data or not isinstance(mulaw_data, bytes):
-            return b''
-        
-        if len(mulaw_data) > 100000:
-            logger.warning(f"Audio chunk too large: {len(mulaw_data)} bytes, truncating")
-            mulaw_data = mulaw_data[:100000]
-            
-        if AUDIOOP_AVAILABLE and audioop:
-            try:
-                # Convert μ-law to 16-bit linear PCM
-                pcm_8khz = audioop.ulaw2lin(mulaw_data, 2)
-                # Resample from 8kHz to 16kHz using proper ratecv
-                pcm_16khz, _ = audioop.ratecv(pcm_8khz, 2, 1, 8000, 16000, None)
-                return pcm_16khz
-            except audioop.error as e:
-                logger.warning(f"audioop conversion error: {e}, falling back to pydub")
-        
-        # Fallback to pydub - create proper audio segment
-        mulaw_buffer = io.BytesIO(mulaw_data)
-        audio = AudioSegment(
-            data=mulaw_data,
-            sample_width=1,  # μ-law is 1 byte per sample
-            frame_rate=8000,
-            channels=1
-        )
-        
-        # Convert to 16-bit PCM
-        audio = audio.set_sample_width(2)
-        # Resample to 16kHz
-        audio = audio.set_frame_rate(16000)
-        
-        return audio.raw_data
-            
-    except Exception as e:
-        logger.error(f"Audio conversion error: {e}", exc_info=True)
-        return b''
-
-async def transcribe_audio(audio_pcm: bytes) -> str:
-    """Transcribe audio using OpenAI's new streaming API with gpt-4o-mini-transcribe"""
-    if not audio_pcm or len(audio_pcm) < 1600:
-        return ""
     
-    retry_count = 0
-    max_retries = 3
+    logger.info(f"Sending session update with voice: {voice}")
+    await openai_ws.send(json.dumps(session_update))
+
+async def send_initial_conversation_item(openai_ws, call_sid: str):
+    """Send initial greeting to start conversation"""
+    # Get appropriate greeting based on mode
+    mode = mode_lock.get(call_sid, "cold_call")
+    _, _, greeting = get_personality_for_mode(call_sid, mode)
     
-    while retry_count < max_retries:
-        try:
-            # Create WAV format in memory
-            audio_buffer = io.BytesIO()
-            
-            # Create audio segment for proper WAV export
-            audio = AudioSegment(
-                data=audio_pcm,
-                sample_width=2,
-                frame_rate=16000,
-                channels=1
-            )
-            
-            # Export as WAV with proper headers
-            audio.export(
-                audio_buffer, 
-                format="wav",
-                parameters=["-ac", "1", "-ar", "16000"]
-            )
-            audio_buffer.seek(0)
-            audio_buffer.name = "audio.wav"
-            
-            del audio
-            
-            # Try streaming transcription with new model
-            try:
-                # Use streaming with gpt-4o-mini-transcribe for better performance
-                stream = await async_openai.audio.transcriptions.create(
-                    model="gpt-4o-mini-transcribe",  # New faster model
-                    file=audio_buffer,
-                    language="en",
-                    stream=True,
-                    temperature=0.0,
-                    response_format="text",
-                    chunking_strategy="auto"  # Let OpenAI handle VAD
-                )
-                
-                # Collect streaming response
-                transcript = ""
-                async for event in stream:
-                    if hasattr(event, 'type'):
-                        if event.type == "transcript.text.delta":
-                            transcript += event.delta
-                        elif event.type == "transcript.text.done":
-                            transcript = event.text
-                            break
-                
-                return transcript.strip()
-                
-            except Exception as streaming_error:
-                logger.warning(f"Streaming transcription failed, trying non-streaming: {streaming_error}")
-                
-                # Fallback to non-streaming with whisper-1
-                audio_buffer.seek(0)
-                result = await async_openai.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_buffer,
-                    language="en",
-                    response_format="text",
-                    temperature=0.0
-                )
-                
-                return result.strip()
-                
-        except Exception as e:
-            retry_count += 1
-            if retry_count >= max_retries:
-                logger.error(f"Transcription error after {max_retries} retries: {e}", exc_info=True)
-                with metrics_lock:
-                    metrics['api_errors']['openai'] += 1
-                return ""
-            await asyncio.sleep(2 ** retry_count)
-
-@app.route("/sms", methods=["POST"])
-def sms_webhook():
-    """Handle incoming SMS with validation"""
-    correlation_id = str(uuid.uuid4())
+    initial_conversation_item = {
+        "type": "conversation.item.create",
+        "event_id": f"initial_greeting_{call_sid[:8]}",
+        "item": {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": f"Greet the user with: '{greeting}'"
+                }
+            ]
+        }
+    }
+    await openai_ws.send(json.dumps(initial_conversation_item))
     
-    try:
-        # Security validation
-        if os.getenv("TWILIO_AUTH_TOKEN"):
-            url = request.url
-            params = request.values
-            signature = request.headers.get('X-Twilio-Signature', '')
+    response_create = {
+        "type": "response.create",
+        "event_id": f"initial_response_{call_sid[:8]}"
+    }
+    await openai_ws.send(json.dumps(response_create))
+
+async def update_session_for_mode(openai_ws, voice: str, system_prompt: str):
+    """Update session with new voice and instructions"""
+    session_update = {
+        "type": "session.update",
+        "event_id": f"mode_update_{uuid.uuid4().hex[:8]}",
+        "session": {
+            "voice": voice,
+            "instructions": system_prompt
+        }
+    }
+    await openai_ws.send(json.dumps(session_update))
+
+async def handle_speech_started_event(openai_ws, twilio_ws, stream_sid: str, 
+                                    response_start_timestamp: int, latest_timestamp: int,
+                                    last_assistant_item: str, mark_queue: list):
+    """Handle interruption when user starts speaking"""
+    logger.info("Handling speech started event")
+    
+    if mark_queue and response_start_timestamp is not None:
+        elapsed_time = latest_timestamp - response_start_timestamp
+        logger.info(f"Calculating elapsed time for truncation: {latest_timestamp} - {response_start_timestamp} = {elapsed_time}ms")
+        
+        if last_assistant_item:
+            logger.info(f"Truncating item with ID: {last_assistant_item}, Truncated at: {elapsed_time}ms")
             
-            if not twilio_validator.validate(url, params, signature):
-                logger.warning("Invalid Twilio signature for SMS", 
-                             extra={'correlation_id': correlation_id})
-                return "", 403
+            # Truncate the assistant's response
+            truncate_event = {
+                "type": "conversation.item.truncate",
+                "item_id": last_assistant_item,
+                "content_index": 0,
+                "audio_end_ms": elapsed_time
+            }
+            await openai_ws.send(json.dumps(truncate_event))
         
-        from_number = request.values.get('From')
-        to_number = request.values.get('To')
-        body = request.values.get('Body', '').strip().lower()
+        # Clear Twilio's audio buffer
+        await twilio_ws.send_json({
+            "event": "clear",
+            "streamSid": stream_sid
+        })
         
-        logger.info(f"Incoming SMS from {from_number}: {body}", 
-                   extra={'correlation_id': correlation_id})
+        mark_queue.clear()
         
-        response = VoiceResponse()
-        
-        # Handle keywords
-        if any(keyword in body for keyword in ['help', 'info', 'start', 'practice']):
-            response.message(
-                "Welcome to ConvoReps! Call this number to practice conversations. "
-                "Get 30 minutes for $6.99 at convoreps.com"
-            )
-        elif any(keyword in body for keyword in ['stop', 'unsubscribe', 'cancel']):
-            response.message(
-                "You've been unsubscribed from ConvoReps SMS. "
-                "Reply START to resubscribe."
-            )
-        else:
-            response.message(
-                "Thanks for your message! Call this number to practice with ConvoReps. "
-                "Visit convoreps.com for more info."
-            )
-        
-        return str(response)
-        
-    except Exception as e:
-        logger.error(f"SMS webhook error: {e}", 
-                    extra={'correlation_id': correlation_id})
-        return "", 200
+        # Reset timestamps
+        return None, None
+    
+    return response_start_timestamp, last_assistant_item
 
-# Legacy endpoints for compatibility
-@app.route("/partial_speech", methods=["POST"])
-def partial_speech():
-    """Legacy endpoint - not used with bidirectional streams"""
-    return "", 204
+async def handle_function_call(response: dict, openai_ws, call_sid: str, 
+                             call_start_time: float, minutes_left: float):
+    """Handle function call from OpenAI (function_call_arguments.done event)"""
+    function_name = response.get('name')
+    call_id = response.get('call_id')
+    
+    await process_function_call(function_name, call_id, None, openai_ws, 
+                              call_sid, call_start_time, minutes_left)
 
-@app.route("/process_speech", methods=["POST"])
-def process_speech():
-    """Legacy endpoint - redirect to voice"""
-    response = VoiceResponse()
-    response.redirect("/voice")
-    return str(response)
+async def handle_function_call_from_response(output: dict, openai_ws, call_sid: str,
+                                           call_start_time: float, minutes_left: float):
+    """Handle function call from response.done event output"""
+    function_name = output.get('name')
+    call_id = output.get('call_id')
+    arguments_str = output.get('arguments', '{}')
+    
+    await process_function_call(function_name, call_id, arguments_str, openai_ws,
+                              call_sid, call_start_time, minutes_left)
 
-# Static file serving
-@app.route("/static/<path:filename>")
-def static_files(filename):
-    """Serve static files securely"""
-    # Validate filename
-    if '..' in filename or filename.startswith('/'):
-        return "Invalid filename", 400
-    return send_from_directory("static", filename)
+async def process_function_call(function_name: str, call_id: str, arguments_str: str,
+                              openai_ws, call_sid: str, call_start_time: float, 
+                              minutes_left: float):
+    """Process function call and send result back to model"""
+    if function_name == 'check_remaining_time' and call_start_time:
+        # Calculate remaining time
+        elapsed_minutes = (time.time() - call_start_time) / 60.0
+        remaining = max(0, minutes_left - elapsed_minutes)
+        
+        # Create function output matching OpenAI documentation format
+        function_output = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": json.dumps({
+                    "minutes_remaining": round(remaining, 1)
+                })
+            }
+        }
+        
+        # Send with event_id for error tracking
+        function_output["event_id"] = f"func_output_{call_id}"
+        
+        await openai_ws.send(json.dumps(function_output))
+        
+        # Trigger response
+        response_event = {
+            "type": "response.create",
+            "event_id": f"func_response_{call_id}"
+        }
+        await openai_ws.send(json.dumps(response_event))
+        
+        with metrics_lock:
+            metrics['tool_calls_made'] += 1
+            
+        # Check if time is exhausted
+        if remaining <= MIN_CALL_DURATION:
+            logger.info(f"Tool detected time exhausted for {call_sid}")
+            if call_sid in call_timers:
+                call_timers[call_sid].cancel()
+                call_timers.pop(call_sid, None)
+            
+            # Update usage immediately
+            update_user_usage(active_streams[call_sid].get('from_number'), elapsed_minutes)
+            
+            # Trigger end flow
+            from_number = active_streams[call_sid].get('from_number')
+            if from_number:
+                asyncio.create_task(send_time_limit_message(openai_ws, call_sid, from_number))
 
-# Enhanced health and monitoring endpoints
-@app.route("/health", methods=["GET"])
-def health_check():
-    """Enhanced health check"""
+async def handle_reset(openai_ws, call_sid: str):
+    """Handle conversation reset via DTMF #"""
+    logger.info("Reset triggered by user")
+    
+    with state_lock:
+        conversation_transcripts.pop(call_sid, None)
+        personality_memory.pop(call_sid, None)
+        mode_lock.pop(call_sid, None)
+        turn_count[call_sid] = 0
+        interview_question_index.pop(call_sid, None)
+        last_response_cache.pop(call_sid, None)
+    
+    reset_message = "Alright, let's start fresh. What would you like to practice?"
+    
+    reset_item = {
+        "type": "conversation.item.create",
+        "event_id": f"reset_{call_sid[:8]}",
+        "item": {
+            "type": "message",
+            "role": "system",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": f"Reset the conversation and say: {reset_message}"
+                }
+            ]
+        }
+    }
+    await openai_ws.send(json.dumps(reset_item))
+    
+    response_event = {
+        "type": "response.create",
+        "event_id": f"reset_response_{call_sid[:8]}"
+    }
+    await openai_ws.send(json.dumps(response_event))
+
+async def repeat_last_response(openai_ws, call_sid: str):
+    """Repeat the last assistant response via DTMF *"""
+    # Check cache first
+    with state_lock:
+        cached_response = last_response_cache.get(call_sid)
+    
+    if cached_response:
+        repeat_item = {
+            "type": "conversation.item.create",
+            "event_id": f"repeat_{call_sid[:8]}",
+            "item": {
+                "type": "message",
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": f"Repeat exactly: {cached_response}"
+                    }
+                ]
+            }
+        }
+        await openai_ws.send(json.dumps(repeat_item))
+        
+        response_event = {
+            "type": "response.create",
+            "event_id": f"repeat_response_{call_sid[:8]}"
+        }
+        await openai_ws.send(json.dumps(response_event))
+        return
+    
+    # Fall back to conversation history
+    if call_sid in conversation_transcripts:
+        messages = conversation_transcripts[call_sid]
+        for message in reversed(messages):
+            if message['role'] == 'assistant':
+                repeat_item = {
+                    "type": "conversation.item.create",
+                    "event_id": f"repeat_history_{call_sid[:8]}",
+                    "item": {
+                        "type": "message",
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": f"Repeat exactly: {message['content']}"
+                            }
+                        ]
+                    }
+                }
+                await openai_ws.send(json.dumps(repeat_item))
+                
+                response_event = {
+                    "type": "response.create",
+                    "event_id": f"repeat_history_response_{call_sid[:8]}"
+                }
+                await openai_ws.send(json.dumps(response_event))
+                return
+    
+    # No previous response found
+    no_response_item = {
+        "type": "conversation.item.create",
+        "event_id": f"no_repeat_{call_sid[:8]}",
+        "item": {
+            "type": "message",
+            "role": "system",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "Say: I don't have a previous response to repeat."
+                }
+            ]
+        }
+    }
+    await openai_ws.send(json.dumps(no_response_item))
+    
+    response_event = {
+        "type": "response.create",
+        "event_id": f"no_repeat_response_{call_sid[:8]}"
+    }
+    await openai_ws.send(json.dumps(response_event))
+
+# Health and monitoring endpoints
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
     with state_lock:
         active_count = len(active_streams)
-        ws_health = "healthy" if active_count < MAX_WEBSOCKET_CONNECTIONS * 0.9 else "warning"
     
     with metrics_lock:
-        error_rate = sum(metrics['api_errors'].values()) / max(metrics['total_calls'], 1)
+        error_rate = metrics['api_errors'] / max(metrics['total_calls'], 1)
         api_health = "healthy" if error_rate < 0.1 else "degraded"
     
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "active_streams": active_count,
-        "websocket_health": ws_health,
         "api_health": api_health,
         "memory_usage_mb": get_memory_usage(),
-        "websocket_enabled": {
-            "elevenlabs": ELEVENLABS_WEBSOCKET_ENABLED,
-            "openai_streaming": OPENAI_STREAMING_ENABLED
-        },
-        "version": "4.2"
+        "version": "1.0-realtime",
+        "realtime_model": OPENAI_REALTIME_MODEL
     }
 
-@app.route("/metrics", methods=["GET"])
-def metrics_endpoint():
-    """Detailed metrics"""
+@app.get("/metrics")
+async def metrics_endpoint():
+    """Detailed metrics endpoint"""
     with state_lock:
         active_count = len(active_streams)
-        mode_breakdown = {
-            "cold_call": sum(1 for m in mode_lock.values() if m == "cold_call"),
-            "interview": sum(1 for m in mode_lock.values() if m == "interview"),
-            "small_talk": sum(1 for m in mode_lock.values() if m == "small_talk")
-        }
-        active_timers = len(call_timers)
+        mode_breakdown = {}
+        for mode in ["cold_call", "interview", "small_talk"]:
+            mode_breakdown[mode] = sum(1 for m in mode_lock.values() if m == mode)
     
     with metrics_lock:
-        avg_ws_duration = (
-            metrics['websocket_duration_sum'] / max(metrics['websocket_count'], 1)
-            if metrics['websocket_count'] > 0 else 0
-        )
-        
-        metrics_data = {
+        return {
             "active_streams": active_count,
             "total_calls": metrics['total_calls'],
             "failed_calls": metrics['failed_calls'],
             "conversation_modes": mode_breakdown,
-            "memory_usage_mb": get_memory_usage(),
-            "websocket_connections": {
-                "twilio": active_count,
-                "elevenlabs": len(elevenlabs_websockets)
-            },
-            "websocket_metrics": {
-                "average_duration_seconds": avg_ws_duration,
-                "total_connections": metrics['websocket_count']
-            },
-            "timer_stats": {
-                "active_timers": active_timers,
-                "free_minutes_per_user": FREE_CALL_MINUTES
-            },
             "sms_stats": {
                 "sent": metrics['sms_sent'],
-                "failed": metrics['sms_failed'],
-                "success_rate": metrics['sms_sent'] / max(metrics['sms_sent'] + metrics['sms_failed'], 1)
+                "failed": metrics['sms_failed']
             },
             "tool_calls": metrics['tool_calls_made'],
             "api_errors": metrics['api_errors'],
+            "free_minutes_per_user": FREE_CALL_MINUTES,
             "csv_stats": get_csv_statistics()
         }
-    
-    return metrics_data
+
+def get_memory_usage() -> float:
+    """Get memory usage"""
+    try:
+        import psutil
+        process = psutil.Process()
+        return process.memory_info().rss / 1024 / 1024
+    except:
+        return 0.0
 
 def get_csv_statistics() -> Dict[str, Any]:
     """Get CSV statistics"""
@@ -2375,40 +1830,94 @@ def get_csv_statistics() -> Dict[str, Any]:
     except Exception as e:
         return {"error": str(e)}
 
-def get_memory_usage() -> float:
-    """Get memory usage"""
-    try:
-        import psutil
-        process = psutil.Process()
-        return process.memory_info().rss / 1024 / 1024
-    except:
-        return 0.0
+# Static file serving
+@app.get("/static/{filename:path}")
+async def serve_static(filename: str):
+    """Serve static files securely"""
+    if '..' in filename or filename.startswith('/'):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    
+    file_path = os.path.join("static", filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Determine content type
+    content_type = "application/octet-stream"
+    if filename.endswith('.mp3'):
+        content_type = "audio/mpeg"
+    elif filename.endswith('.wav'):
+        content_type = "audio/wav"
+    
+    with open(file_path, 'rb') as f:
+        content = f.read()
+    
+    return Response(content=content, media_type=content_type)
 
-@app.route("/ws-test", methods=["GET"])
-def ws_test():
-    """WebSocket test endpoint"""
-    return {
-        "websocket_support": True,
-        "active_streams": len(active_streams),
-        "flask_sock_version": "0.7.0",
-        "streaming_enabled": {
-            "elevenlabs_websocket": ELEVENLABS_WEBSOCKET_ENABLED,
-            "openai_streaming": OPENAI_STREAMING_ENABLED
-        },
-        "max_connections": MAX_WEBSOCKET_CONNECTIONS,
-        "ready": True
-    }
+@app.api_route("/sms", methods=["GET", "POST"])
+async def sms_webhook(request: Request):
+    """Handle incoming SMS messages from Twilio"""
+    correlation_id = str(uuid.uuid4())
+    
+    try:
+        # Get form data
+        form_data = await request.form()
+        params = dict(form_data)
+        
+        # Security validation
+        if TWILIO_AUTH_TOKEN:
+            url = str(request.url)
+            signature = request.headers.get('X-Twilio-Signature', '')
+            
+            if not twilio_validator.validate(url, params, signature):
+                logger.warning("Invalid Twilio signature for SMS", 
+                             extra={'correlation_id': correlation_id})
+                raise HTTPException(status_code=403, detail="Invalid signature")
+        
+        from_number = params.get('From')
+        to_number = params.get('To')
+        body = params.get('Body', '').strip().lower()
+        
+        logger.info(f"Incoming SMS from {from_number}: {body}", 
+                   extra={'correlation_id': correlation_id})
+        
+        response = VoiceResponse()
+        
+        # Handle keywords
+        if any(keyword in body for keyword in ['help', 'info', 'start', 'practice']):
+            response.message(
+                "Welcome to ConvoReps! Call this number to practice conversations. "
+                "Get 30 minutes for $6.99 at convoreps.com"
+            )
+        elif any(keyword in body for keyword in ['stop', 'unsubscribe', 'cancel']):
+            response.message(
+                "You've been unsubscribed from ConvoReps SMS. "
+                "Reply START to resubscribe."
+            )
+        else:
+            response.message(
+                "Thanks for your message! Call this number to practice with ConvoReps. "
+                "Visit convoreps.com for more info."
+            )
+        
+        return HTMLResponse(content=str(response), media_type="application/xml")
+        
+    except Exception as e:
+        logger.error(f"SMS webhook error: {e}", 
+                    extra={'correlation_id': correlation_id},
+                    exc_info=True)
+        return HTMLResponse(content="", status_code=200)
 
 if __name__ == "__main__":
+    import uvicorn
+    
     # Ensure directories exist
     os.makedirs("static", exist_ok=True)
     os.makedirs(os.path.dirname(USAGE_CSV_PATH) or ".", exist_ok=True)
     
-    # Generate required static files if missing
-    if not os.path.exists("static/beep.mp3"):
+    # Generate beep sound if missing
+    if not os.path.exists("static/beep.mp3") and PYDUB_AVAILABLE:
         logger.warning("beep.mp3 not found - generating")
         try:
-            from pydub.generators import Sine
             # Generate a 1000Hz sine wave beep, 300ms duration
             beep = Sine(1000).to_audio_segment(duration=300).apply_gain(-6)
             beep.export("static/beep.mp3", format="mp3")
@@ -2427,38 +1936,19 @@ if __name__ == "__main__":
     # Initial garbage collection
     gc.collect()
     
-    logger.info("\n🚀 ConvoReps WebSocket Streaming Edition v4.2 FINAL - PRODUCTION READY")
-    logger.info("   ✅ Non-streaming tool calling for reliability")
-    logger.info("   ✅ SMS deduplication with atomic operations")
-    logger.info("   ✅ CSV atomic writes with temp files")
-    logger.info("   ✅ Comprehensive input validation")
-    logger.info("   ✅ WebSocket security validation")
-    logger.info("   ✅ Enhanced error recovery and retries")
-    logger.info("   ✅ Backup mechanisms for critical data")
-    logger.info("   ✅ Advanced health checks")
-    logger.info("   ✅ Detailed monitoring metrics")
-    logger.info("   ✅ Structured logging with correlation IDs")
-    logger.info("   ✅ Graceful shutdown handling")
-    logger.info("   ✅ All original features retained")
+    logger.info("\n🚀 ConvoReps OpenAI Realtime Edition v1.0")
+    logger.info("   ✅ OpenAI Realtime API for end-to-end audio")
+    logger.info("   ✅ Twilio Media Streams integration")
+    logger.info("   ✅ User tracking and time limits")
+    logger.info("   ✅ Function calling for time checking")
+    logger.info("   ✅ SMS sending with deduplication")
+    logger.info("   ✅ Email notifications via SMS")
+    logger.info("   ✅ Multiple conversation modes")
+    logger.info("   ✅ Production-ready error handling")
     logger.info(f"\n   Configuration:")
-    logger.info(f"   - ElevenLabs WebSocket: {'✅ Enabled' if ELEVENLABS_WEBSOCKET_ENABLED else '❌ Disabled'}")
-    logger.info(f"   - OpenAI Streaming: {'✅ Enabled' if OPENAI_STREAMING_ENABLED else '❌ Disabled'}")
-    logger.info(f"   - Max Connections: {MAX_WEBSOCKET_CONNECTIONS}")
-    logger.info(f"   - Free Call Minutes: {FREE_CALL_MINUTES}")
-    logger.info(f"   - Min Call Duration: {MIN_CALL_DURATION}")
-    logger.info(f"   - Usage CSV: {USAGE_CSV_PATH}")
-    logger.info(f"   - ConvoReps URL: {CONVOREPS_URL}")
+    logger.info(f"   - Model: {OPENAI_REALTIME_MODEL}")
+    logger.info(f"   - Free Minutes: {FREE_CALL_MINUTES}")
+    logger.info(f"   - Port: {PORT}")
     logger.info("\n")
     
-    # Run with production settings
-    app.run(
-        host="0.0.0.0",
-        port=5050,
-        debug=False,
-        threaded=True,
-        use_reloader=False
-    )
-
-# FINAL VERSION 4.2 - Production Ready with All Fixes
-# v4.1: Fixed logging error where correlation_id was missing
-# v4.2: Fixed websockets parameter from extra_headers to additional_headers
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

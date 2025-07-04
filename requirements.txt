@@ -1,35 +1,33 @@
-# Core Flask and WebSocket support
-Flask
-flask-cors
-flask-sock
-gevent
-gevent-websocket
+# Core dependencies
+fastapi==0.109.2
+uvicorn[standard]==0.27.0.post1
+websockets==12.0
+python-multipart==0.0.6
 
 # Twilio
-twilio
+twilio==8.11.0
 
 # OpenAI
-openai==1.72.0
+openai==1.12.0
 
-# ElevenLabs
-elevenlabs==2.3.0
+# Audio processing (optional but recommended)
+pydub==0.25.1
 
-# Audio processing
-pydub
-numpy
-pandas
+# Environment variables
+python-dotenv==1.0.0
 
 # Async support
-aiofiles
-websockets
+asyncio==3.4.3
+aiofiles==23.2.1
 
-# Environment and utilities
-python-dotenv
-requests
+# For CSV operations
+pandas==2.1.4
+
+# Memory monitoring (optional)
+psutil==5.9.8
+
+# CORS support
+fastapi-cors==0.0.6
 
 # Production server
-gunicorn
-
-# For better WebSocket performance
-websocket-client
-simple-websocket
+gunicorn==21.2.0

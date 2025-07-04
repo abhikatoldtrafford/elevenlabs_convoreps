@@ -621,7 +621,7 @@ def cleanup_call_resources(call_sid: str):
 async def index_page():
     return "<html><body><h1>ConvoReps Realtime Server is running!</h1></body></html>"
 
-@app.api_route("/incoming-call", methods=["GET", "POST"])
+@app.api_route("/voice", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     """Handle incoming call and return TwiML response to connect to Media Stream."""
     logger.info("Received incoming call request from: %s", request.client.host)

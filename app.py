@@ -1,9 +1,11 @@
 """
-ConvoReps FastAPI OpenAI Realtime Edition - Production Ready v3.2
-Complete implementation with helpful personalities and accurate minute tracking
+ConvoReps FastAPI OpenAI Realtime Edition - Production Ready v3.3
+Complete implementation with smart intent detection and helpful personalities
 
 Key Features:
 - Fixed minute calculation to track actual call duration
+- Smart intent detection - asks users what they want to practice first
+- Smooth transitions from greeting to practice scenarios
 - Encouraging and constructive personalities for better practice
 - 6 diverse cold call scenarios with realistic but supportive prospects
 - Warm interview practice with helpful feedback
@@ -16,7 +18,7 @@ IMPORTANT NOTE ON VOICES:
 - All message scripts are implemented with EXACT wording as specified
 
 Author: ConvoReps Team
-Version: 3.2 (Helpful Personalities Edition)
+Version: 3.3 (Smart Intent Detection)
 """
 
 import os
@@ -121,6 +123,12 @@ app = FastAPI()
 executor = ThreadPoolExecutor(max_workers=5)
 
 # Global state management
+# Call flow: 
+# 1. User calls -> hears greeting mp3 + beep
+# 2. AI assistant asks what they want to practice
+# 3. User responds (e.g., "I want to practice cold calling")
+# 4. System detects intent and transitions to appropriate personality
+# 5. Practice session begins with the selected scenario
 state_lock = threading.Lock()
 active_streams: Dict[str, Dict[str, Any]] = {}
 call_start_times: Dict[str, float] = {}
@@ -577,32 +585,40 @@ async def send_convoreps_sms_link(phone_number: str, is_first_call: bool = True)
         with state_lock:
             sms_sent_flags[phone_number] = False
 
-# Mode detection
+# Mode detection - Enhanced for better accuracy
 def detect_intent(text: str) -> str:
     """Detect conversation mode from text"""
     lowered = text.lower()
     
+    # Expanded patterns for better detection
     cold_call_patterns = [
         r"cold\s*call", r"customer\s*call", r"sales\s*call", 
-        r"business\s*call", r"practice\s*calling", r"pitch", r"sales"
+        r"business\s*call", r"practice\s*calling", r"pitch", r"sales",
+        r"selling", r"customer", r"client", r"prospect", r"close\s*deal"
     ]
     interview_patterns = [
         r"interview", r"job\s*interview", r"interview\s*prep",
-        r"practice\s*interview", r"mock\s*interview", r"job\s*search"
+        r"practice\s*interview", r"mock\s*interview", r"job\s*search",
+        r"hiring", r"recruiter", r"hr", r"job", r"career", r"position"
     ]
     small_talk_patterns = [
         r"small\s*talk", r"chat", r"casual\s*talk",
-        r"conversation", r"just\s*talk", r"networking", r"social"
+        r"conversation", r"just\s*talk", r"networking", r"social",
+        r"friendly", r"casual", r"chit\s*chat", r"water\s*cooler"
     ]
     
-    if any(re.search(pattern, lowered) for pattern in cold_call_patterns):
-        return "cold_call"
-    elif any(re.search(pattern, lowered) for pattern in interview_patterns):
-        return "interview"
-    elif any(re.search(pattern, lowered) for pattern in small_talk_patterns):
-        return "small_talk"
+    # Count matches for each category
+    cold_call_score = sum(1 for pattern in cold_call_patterns if re.search(pattern, lowered))
+    interview_score = sum(1 for pattern in interview_patterns if re.search(pattern, lowered))
+    small_talk_score = sum(1 for pattern in small_talk_patterns if re.search(pattern, lowered))
     
-    return "cold_call"
+    # Return the category with the highest score
+    if interview_score > cold_call_score and interview_score > small_talk_score:
+        return "interview"
+    elif small_talk_score > cold_call_score and small_talk_score > interview_score:
+        return "small_talk"
+    else:
+        return "cold_call"  # Default to cold call if tied or no clear winner
 
 def get_personality_for_mode(call_sid: str, mode: str) -> Tuple[str, str, str]:
     """Get personality configuration for mode"""
@@ -850,6 +866,7 @@ async def handle_incoming_call(request: Request):
     response = VoiceResponse()
     
     # Play greeting with beep - FROM ORIGINAL APP.PY
+    # Note: After the beep, the AI assistant will ask what they want to practice
     if turn_count.get(call_sid, 0) == 0:
         if not is_repeat_caller:
             greeting_file = "first_time_greeting.mp3"
@@ -1072,29 +1089,71 @@ async def handle_media_stream(websocket: WebSocket):
                             if call_sid not in mode_lock:
                                 detected_mode = detect_intent(transcript)
                                 mode_lock[call_sid] = detected_mode
+                                logger.info(f"Detected intent: {detected_mode} for call {call_sid}")
                                 
-                                # Update session for mode
-                                voice, system_prompt, _ = get_personality_for_mode(call_sid, detected_mode)
+                                # Update session for the detected mode
+                                voice, system_prompt, greeting = get_personality_for_mode(call_sid, detected_mode)
                                 
-                                # Initialize interview question index
+                                # Initialize interview question index if needed
                                 if detected_mode == "interview" and call_sid not in interview_question_index:
                                     interview_question_index[call_sid] = 0
+                                    current_q_idx = 0
+                                    if current_q_idx < len(interview_questions):
+                                        system_prompt += f"\n\nAsk this question next: {interview_questions[current_q_idx]}"
                                 
-                                # Update session
-                                if detected_mode != "cold_call":
-                                    if detected_mode == "interview":
-                                        current_q_idx = interview_question_index.get(call_sid, 0)
-                                        if current_q_idx < len(interview_questions):
-                                            system_prompt += f"\n\nAsk this question next: {interview_questions[current_q_idx]}"
-                                    
-                                    session_update = {
-                                        "type": "session.update",
-                                        "session": {
-                                            "voice": voice,
-                                            "instructions": system_prompt
-                                        }
+                                # Send transition message and update session
+                                transition_messages = {
+                                    "cold_call": "Great! Let me connect you with someone to practice your sales pitch. One moment...",
+                                    "interview": "Perfect! Let me connect you with our HR manager Rachel for interview practice. One moment...",
+                                    "small_talk": "Sounds good! Let me connect you with someone for casual conversation practice. One moment..."
+                                }
+                                
+                                # Create transition message
+                                transition_item = {
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": transition_messages.get(detected_mode, "Let me connect you with someone to practice.")
+                                            }
+                                        ]
                                     }
-                                    await openai_ws.send(json.dumps(session_update))
+                                }
+                                
+                                await openai_ws.send(json.dumps(transition_item))
+                                await openai_ws.send(json.dumps({"type": "response.create"}))
+                                
+                                # Brief pause for transition
+                                await asyncio.sleep(1.5)
+                                
+                                # Update session with the actual personality
+                                session_update = {
+                                    "type": "session.update",
+                                    "session": {
+                                        "voice": voice,
+                                        "instructions": system_prompt,
+                                        "tools": [
+                                            {
+                                                "type": "function",
+                                                "name": "check_remaining_time",
+                                                "description": "Check how many minutes the user has left in their free call",
+                                                "parameters": {
+                                                    "type": "object",
+                                                    "properties": {},
+                                                    "required": []
+                                                }
+                                            }
+                                        ],
+                                        "tool_choice": "auto"
+                                    }
+                                }
+                                await openai_ws.send(json.dumps(session_update))
+                                
+                                # Send the personality's greeting
+                                await send_initial_conversation_item(openai_ws, greeting)
 
                     # If user speech starts, we can interrupt the assistant
                     if response.get('type') == 'input_audio_buffer.speech_started':
@@ -1273,7 +1332,52 @@ async def send_initial_conversation_item(openai_ws, greeting: str = None):
 
 async def send_session_update(openai_ws, call_sid: str = None):
     """Send session update to OpenAI WebSocket."""
-    # Get personality for mode
+    # Check if this is a new call without mode set
+    if call_sid and call_sid not in mode_lock:
+        # Start with a neutral assistant that asks what they want to practice
+        initial_voice = "alloy"
+        initial_prompt = (
+            "You are a friendly ConvoReps practice assistant. Your job is to help users "
+            "choose what they want to practice and then connect them with the right scenario.\n\n"
+            
+            "When the user first connects, warmly greet them and ask what they'd like to practice today. "
+            "Listen for keywords:\n"
+            "- 'cold call', 'sales', 'pitch', 'customer' → Cold calling practice\n"
+            "- 'interview', 'job', 'hiring' → Interview practice\n"
+            "- 'small talk', 'chat', 'networking', 'social' → Small talk practice\n\n"
+            
+            "Once you understand what they want, respond with enthusiasm like:\n"
+            "- 'Great! Let me connect you with someone to practice cold calling.'\n"
+            "- 'Perfect! Let's get you ready for that interview.'\n"
+            "- 'Sounds good! Let's practice some casual conversation.'\n\n"
+            
+            "Keep it brief and friendly. Your goal is to quickly understand their needs and transition them."
+        )
+        
+        initial_greeting = (
+            "Welcome to ConvoReps! I'm here to help you practice. "
+            "What would you like to work on today - cold calling, job interviews, or small talk?"
+        )
+        
+        session_update = {
+            "type": "session.update",
+            "session": {
+                "turn_detection": {"type": "server_vad"},
+                "input_audio_format": "g711_ulaw",
+                "output_audio_format": "g711_ulaw",
+                "voice": initial_voice,
+                "instructions": initial_prompt,
+                "modalities": ["text", "audio"],
+                "temperature": 0.8
+            }
+        }
+        
+        print('Sending initial session update for mode selection')
+        await openai_ws.send(json.dumps(session_update))
+        await send_initial_conversation_item(openai_ws, initial_greeting)
+        return
+    
+    # Normal flow - mode already detected
     mode = mode_lock.get(call_sid, "cold_call") if call_sid else "cold_call"
     voice, system_prompt, greeting = get_personality_for_mode(call_sid or "", mode)
     
@@ -1282,9 +1386,6 @@ async def send_session_update(openai_ws, call_sid: str = None):
         current_q_idx = interview_question_index.get(call_sid, 0)
         if current_q_idx < len(interview_questions):
             system_prompt += f"\n\nAsk this question next: {interview_questions[current_q_idx]}"
-    
-    # Note: For time limit messages, we would use ElevenLabs voice "21m00Tcm4TlvDq8ikWAM"
-    # but since we're using OpenAI Realtime API, we use 'alloy' which is professional and clear
     
     session_update = {
         "type": "session.update",
@@ -1311,10 +1412,12 @@ async def send_session_update(openai_ws, call_sid: str = None):
             "tool_choice": "auto"
         }
     }
-    print('Sending session update:', json.dumps(session_update))
+    print(f'Sending session update for {mode} mode with voice {voice}')
     await openai_ws.send(json.dumps(session_update))
 
-    await send_initial_conversation_item(openai_ws, greeting)
+    # Only send personality greeting if we're switching to a detected mode
+    if call_sid in mode_lock:
+        await send_initial_conversation_item(openai_ws, greeting)
 
 # Health and monitoring endpoints
 @app.get("/health")
@@ -1359,14 +1462,15 @@ if __name__ == "__main__":
     # Initialize CSV
     init_csv()
     
-    logger.info("\n🚀 ConvoReps FastAPI OpenAI Realtime Edition v3.2")
+    logger.info("\n🚀 ConvoReps FastAPI OpenAI Realtime Edition v3.3")
     logger.info("   ✅ Fixed minute calculation - tracks actual call duration")
+    logger.info("   ✅ Improved intent detection - asks users what they want to practice")
+    logger.info("   ✅ Smooth transitions between initial greeting and practice scenarios")
     logger.info("   ✅ Helpful and encouraging personalities for better practice")
     logger.info("   ✅ 6 diverse cold call personalities (Sarah, David, Maria, James, Lisa, Robert)")
     logger.info("   ✅ Warm and supportive interview practice with Rachel")
     logger.info("   ✅ Natural small talk practice with Alex")
-    logger.info("   ✅ Original mode detection and features preserved")
-    logger.info("   ✅ Official message scripts implemented")
+    logger.info("   ✅ All message scripts implemented with exact wording")
     logger.info(f"   Model: {OPENAI_REALTIME_MODEL}")
     logger.info(f"   Free Minutes: {FREE_CALL_MINUTES}")
     logger.info(f"   Port: {PORT}")

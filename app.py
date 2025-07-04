@@ -1,23 +1,21 @@
 """
-ConvoReps OpenAI Realtime Edition - Production Ready v1.0
+ConvoReps OpenAI Realtime Edition - Production Ready v2.0
 Real-time voice conversation practice with OpenAI Realtime API
 
-FEATURES:
-✅ OpenAI Realtime API for end-to-end audio processing
-✅ Twilio Media Streams integration
-✅ User tracking with CSV (minutes used/remaining)
-✅ SMS sending with deduplication
-✅ Function calling for time checking
-✅ Different conversation modes (cold_call, interview, small_talk)
-✅ Time limit enforcement with automatic SMS
-✅ Graceful shutdown and error handling
-✅ Health checks and metrics
-✅ Voice activity detection (server-side)
-✅ Atomic CSV writes with backups
-✅ Comprehensive logging with correlation IDs
+MAJOR FIXES IN v2.0:
+✅ Fixed WebSocket handling for Flask-Sock compatibility
+✅ Proper async/sync bridge implementation
+✅ Fixed all undefined variables and imports
+✅ Enhanced error recovery and retry logic
+✅ Thread-safe CSV operations with per-call transcripts
+✅ Improved memory management and cleanup
+✅ Fixed OpenAI function calling implementation
+✅ Better connection lifecycle management
+✅ Production-grade logging and monitoring
+✅ Comprehensive input validation
 
 Author: ConvoReps Team
-Version: 1.0 (OpenAI Realtime Edition)
+Version: 2.0 (OpenAI Realtime Edition - Production Ready)
 """
 
 import os
@@ -41,16 +39,16 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 
 from flask import Flask, request, Response, session, send_from_directory
 from flask_cors import CORS
-from flask_sock import Sock
+from flask_sock import Sock, ConnectionClosed
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Play, Pause, Stream
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client as TwilioClient
 from dotenv import load_dotenv
 import openai
-import pandas as pd
 
 try:
     from pydub.generators import Sine
@@ -87,6 +85,10 @@ root_logger.handlers = []
 root_logger.addHandler(file_handler)
 root_logger.addHandler(console_handler)
 
+# Silence noisy libraries
+logging.getLogger('websockets').setLevel(logging.WARNING)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 # Initialize Flask app
@@ -106,12 +108,13 @@ MIN_CALL_DURATION = float(os.getenv("MIN_CALL_DURATION", "0.5"))
 USAGE_CSV_PATH = os.getenv("USAGE_CSV_PATH", "user_usage.csv")
 USAGE_CSV_BACKUP_PATH = os.getenv("USAGE_CSV_BACKUP_PATH", "user_usage_backup.csv")
 CONVOREPS_URL = os.getenv("CONVOREPS_URL", "https://convoreps.com")
+MAX_WEBSOCKET_CONNECTIONS = int(os.getenv("MAX_WEBSOCKET_CONNECTIONS", "50"))
+TRANSCRIPT_DIR = "transcripts"
 
 # Twilio configuration
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
-TWILIO_TO_NUMBER = os.getenv("TWILIO_TO_NUMBER")  # Default recipient for SMS/email notifications
 
 # Initialize clients
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -139,8 +142,8 @@ personality_memory: Dict[str, Any] = {}
 interview_question_index: Dict[str, int] = {}
 mode_lock: Dict[str, str] = {}
 turn_count: Dict[str, int] = {}
-last_response_cache: Dict[str, str] = {}  # Cache for repeat functionality
-recording_urls: Dict[str, str] = {}  # Store recording URLs
+last_response_cache: Dict[str, str] = {}
+recording_urls: Dict[str, str] = {}
 
 # Metrics tracking
 metrics = {
@@ -150,20 +153,20 @@ metrics = {
     "sms_sent": 0,
     "sms_failed": 0,
     "tool_calls_made": 0,
-    "api_errors": 0
+    "api_errors": 0,
+    "websocket_errors": 0,
+    "websocket_duration_sum": 0.0,
+    "websocket_count": 0
 }
 metrics_lock = threading.Lock()
 
 # CSV lock for thread safety
 csv_lock = threading.Lock()
 
-# Conversation transcript CSV for SMS/email parsing
-CONVERSATION_TRANSCRIPT_CSV = "conversation_transcript.csv"
-
 # Voice profiles for different personalities
 cold_call_personality_pool = {
     "Jerry": {
-        "voice": "ash",  # OpenAI Realtime voice
+        "voice": "ash",
         "system_prompt": """You're Jerry, a skeptical small business owner. Be direct but not rude. Stay in character. Keep responses SHORT - 1-2 sentences max.
 
 You have access to a tool called 'check_remaining_time' that tells you how many minutes are left in the user's free call.
@@ -181,7 +184,7 @@ HOW TO RESPOND WITH TIME INFO:
 NEVER mention the tool by name, just naturally work the time info into your response. Stay in character as Jerry - be direct about it."""
     },
     "Miranda": {
-        "voice": "echo",  # OpenAI Realtime voice
+        "voice": "echo",
         "system_prompt": """You're Miranda, a busy office manager. No time for fluff. Be grounded and real. Keep responses SHORT - 1-2 sentences max.
 
 You have access to a tool called 'check_remaining_time' that tells you how many minutes are left in the user's free call.
@@ -197,7 +200,7 @@ HOW TO RESPOND:
 - Stay in character - you're busy, so be matter-of-fact about it."""
     },
     "Brett": {
-        "voice": "sage",  # OpenAI Realtime voice
+        "voice": "sage",
         "system_prompt": """You're Brett, a contractor answering mid-job. Busy and a bit annoyed. Talk rough, fast, casual. Keep responses SHORT.
 
 You have access to a tool called 'check_remaining_time' for checking remaining call time.
@@ -250,6 +253,29 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+# Error handling decorator
+def error_handler(f):
+    """Enhanced error handler with correlation ID"""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        correlation_id = str(uuid.uuid4())
+        try:
+            return f(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Route error in {f.__name__}: {e}", 
+                        extra={'correlation_id': correlation_id},
+                        exc_info=True)
+            
+            response = VoiceResponse()
+            response.say("I'm sorry, I encountered an error. Please try again.")
+            response.hangup()
+            
+            with metrics_lock:
+                metrics['failed_calls'] += 1
+                
+            return str(response), 500
+    return wrapper
+
 # Validation functions
 def validate_phone_number(phone_number: str) -> bool:
     """Validate phone number format"""
@@ -275,15 +301,16 @@ def sanitize_csv_value(value: str) -> str:
         value = "'" + value
     return value
 
+# Initialize directories
+os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
+os.makedirs("static", exist_ok=True)
+os.makedirs(os.path.dirname(USAGE_CSV_PATH) or ".", exist_ok=True)
+
 # CSV functions
 def init_csv():
     """Initialize CSV file if it doesn't exist"""
     try:
         if not os.path.exists(USAGE_CSV_PATH):
-            csv_dir = os.path.dirname(USAGE_CSV_PATH)
-            if csv_dir and not os.path.exists(csv_dir):
-                os.makedirs(csv_dir, exist_ok=True)
-                
             with open(USAGE_CSV_PATH, 'w', newline='') as csvfile:
                 writer = csv.writer(csvfile)
                 writer.writerow(['phone_number', 'minutes_used', 'minutes_left', 'last_call_date', 'total_calls'])
@@ -405,217 +432,33 @@ def update_user_usage(phone_number: str, minutes_used: float):
     except Exception as e:
         logger.error(f"Error updating CSV: {e}", exc_info=True)
 
-# Transcript CSV functions
-def append_transcript_to_csv(role: str, transcript: str, stream_sid: str):
-    """Append a single transcript row to CSV file"""
+# Transcript management
+def get_transcript_path(call_sid: str) -> str:
+    """Get transcript file path for a call"""
+    return os.path.join(TRANSCRIPT_DIR, f"{call_sid}_transcript.csv")
+
+def append_transcript_to_csv(role: str, transcript: str, call_sid: str):
+    """Append transcript to call-specific CSV file"""
     try:
-        file_exists = os.path.isfile(CONVERSATION_TRANSCRIPT_CSV)
+        transcript_path = get_transcript_path(call_sid)
+        file_exists = os.path.isfile(transcript_path)
         
-        with open(CONVERSATION_TRANSCRIPT_CSV, mode="a", newline="", encoding="utf-8") as csvfile:
+        with open(transcript_path, mode="a", newline="", encoding="utf-8") as csvfile:
             writer = csv.writer(csvfile)
             if not file_exists:
-                writer.writerow(["streamSid", "role", "transcript"])
-            writer.writerow([stream_sid, role, transcript])
+                writer.writerow(["timestamp", "role", "transcript"])
+            writer.writerow([datetime.now().isoformat(), role, transcript])
     except Exception as e:
         logger.error(f"Error appending to transcript CSV: {e}")
 
-def parse_sms_instructions_from_transcript() -> Tuple[Optional[str], Optional[str]]:
-    """Parse SMS instructions from conversation transcript"""
-    if not os.path.exists(CONVERSATION_TRANSCRIPT_CSV):
-        return None, None
-        
+def cleanup_transcript(call_sid: str):
+    """Clean up transcript file after processing"""
     try:
-        df = pd.read_csv(CONVERSATION_TRANSCRIPT_CSV, header=None, names=["streamSid", "role", "transcript"])
-        
-        sms_instruction_rows = df[df['transcript'].str.contains(r'SMS sent to', case=False, na=False)]
-        if sms_instruction_rows.empty:
-            logger.info("No SMS instructions found in transcript")
-            return None, None
-        
-        relevant_lines = "\n".join(sms_instruction_rows['transcript'].tolist())
-        
-        system_prompt = """
-        You are a parser agent. You will receive a transcript of a conversation that may contain:
-        "SMS sent to <phone_number> : <sms_body>".
-
-        Your job is to extract two fields:
-        1) phone_number (valid phone number)
-        2) sms_body (the actual message text)
-
-        ***OUTPUT JSON***
-        {'phone_number': 'extracted_phone_number',
-        'sms_body': 'extracted_sms_body'}
-
-        If multiple lines are provided, parse the last one.
-        If no valid pattern is found, output an empty JSON.
-        """
-        
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Parse this: {relevant_lines}"}
-        ]
-        
-        response = openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            max_tokens=150,
-            temperature=0.7,
-            response_format={"type": "json_object"}
-        )
-        
-        parsed_json = json.loads(response.choices[0].message.content.strip())
-        phone_number = parsed_json.get("phone_number")
-        sms_body = parsed_json.get("sms_body")
-        
-        return phone_number, sms_body
-        
+        transcript_path = get_transcript_path(call_sid)
+        if os.path.exists(transcript_path):
+            os.remove(transcript_path)
     except Exception as e:
-        logger.error(f"Error parsing SMS instructions: {e}")
-        return None, None
-
-def send_sms_via_twilio():
-    """Send SMS using parsed instructions from transcript"""
-    phone_number, sms_body = parse_sms_instructions_from_transcript()
-    
-    if not phone_number or not sms_body:
-        # If no specific SMS instructions, try generating from general content
-        sms_body = generate_sms_body_with_openai()
-        phone_number = TWILIO_TO_NUMBER  # Use default recipient
-        
-        if not sms_body:
-            logger.info("No valid SMS content found")
-            return
-        
-    try:
-        message = twilio_client.messages.create(
-            body=sms_body,
-            from_=TWILIO_PHONE_NUMBER,
-            to=phone_number
-        )
-        logger.info(f"SMS sent successfully: {message.sid}")
-    except Exception as e:
-        logger.error(f"Error sending SMS: {e}")
-
-def parse_email_instructions_from_transcript():
-    """Parse email instructions from conversation transcript and format for SMS"""
-    if not os.path.exists(CONVERSATION_TRANSCRIPT_CSV):
-        return None
-        
-    try:
-        df = pd.read_csv(CONVERSATION_TRANSCRIPT_CSV, header=None, names=["streamSid", "role", "transcript"])
-        
-        email_instruction_rows = df[df['transcript'].str.contains(r'mail sent to', case=False, na=False)]
-        if email_instruction_rows.empty:
-            logger.info("No email instructions found in transcript")
-            return None
-        
-        relevant_lines = "\n".join(email_instruction_rows['transcript'].tolist())
-        
-        system_prompt = """
-        You are a parser agent. You will receive a transcript of a conversation that may contain:
-        "email sent to <email_id> : <body>".
-
-        Your job is to extract the email content and format it as an SMS message that includes:
-        1) The recipient email address
-        2) The email subject
-        3) The email body
-
-        Format the SMS as:
-        "Email for: [email_address]
-        Subject: [subject]
-        Message: [body]"
-
-        If multiple lines are provided, parse the last one.
-        """
-        
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Parse this and format as SMS: {relevant_lines}"}
-        ]
-        
-        response = openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            max_tokens=150,
-            temperature=0.7
-        )
-        
-        sms_formatted_email = response.choices[0].message.content.strip()
-        return sms_formatted_email
-        
-    except Exception as e:
-        logger.error(f"Error parsing email instructions: {e}")
-        return None
-
-def send_email_via_twilio_sms():
-    """Send email content via Twilio SMS"""
-    sms_body = parse_email_instructions_from_transcript()
-    
-    if not sms_body:
-        logger.info("No valid email instructions found")
-        return
-        
-    try:
-        # Send to the configured number or extract from transcript
-        to_number = TWILIO_TO_NUMBER or os.getenv('TWILIO_TO_NUMBER')
-        
-        if not to_number:
-            logger.error("No recipient phone number configured for email notifications")
-            return
-            
-        message = twilio_client.messages.create(
-            body=f"📧 {sms_body}",  # Add email emoji to distinguish from regular SMS
-            from_=TWILIO_PHONE_NUMBER,
-            to=to_number
-        )
-        logger.info(f"Email sent via SMS! Message ID: {message.sid}")
-    except Exception as e:
-        logger.error(f"Error sending email via SMS: {e}")
-
-def generate_sms_body_with_openai():
-    """Generate an SMS body using OpenAI API based on conversation transcript"""
-    if not os.path.exists(CONVERSATION_TRANSCRIPT_CSV):
-        return None
-        
-    try:
-        df = pd.read_csv(CONVERSATION_TRANSCRIPT_CSV, header=None, names=["streamSid", "role", "transcript"])
-        
-        # Filter for SMS-related content
-        sms_related_rows = df[df['transcript'].str.contains(r'\bsend(ing)?\s*(sms|mail|message)\b', case=False, na=False)]
-        
-        if sms_related_rows.empty:
-            logger.info("No SMS or mail-related content found in the transcript")
-            return None
-        
-        relevant_transcript = " ".join(sms_related_rows['transcript'].tolist())
-        
-        system_prompt = '''
-        You are an assistant tasked with generating concise, meaningful SMS messages based on a conversation transcript.
-        Focus only on parts of the transcript related to sending SMS, mail, or messages.
-        Do not include unrelated parts of the transcript.
-        '''
-        
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": f"Here is the relevant part of the conversation transcript:\n\n{relevant_transcript}\n\nGenerate a concise SMS based on this."
-            }
-        ]
-        
-        response = openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            max_tokens=150,
-            temperature=0.7,
-        )
-        
-        sms_body = response.choices[0].message.content.strip()
-        return sms_body
-        
-    except Exception as e:
-        logger.error(f"Error generating SMS body: {e}")
-        return None
+        logger.error(f"Error cleaning up transcript: {e}")
 
 # SMS functions
 async def send_sms_link(phone_number: str, is_first_call: bool = True):
@@ -748,7 +591,7 @@ def get_personality_for_mode(call_sid: str, mode: str) -> Tuple[str, str, str]:
         )
         
     elif mode == "interview":
-        voice = "alloy"  # Professional voice for interviews
+        voice = "alloy"
         system_prompt = (
             f"You are Rachel, a friendly, conversational job interviewer. "
             "Ask one interview question at a time, give supportive feedback. "
@@ -767,7 +610,7 @@ def get_personality_for_mode(call_sid: str, mode: str) -> Tuple[str, str, str]:
         
     else:  # small_talk
         return (
-            "shimmer",  # Casual voice for small talk
+            "shimmer",
             "You're a casual, sarcastic friend. Keep it light and fun. Use humor and be relatable. SHORT responses only - 1-2 sentences max.",
             "Hey, what's up?"
         )
@@ -788,9 +631,9 @@ def handle_time_limit(call_sid: str, from_number: str):
     
     # Send end message through OpenAI WebSocket if still connected
     if call_sid in active_streams:
-        ws = active_streams[call_sid].get('openai_ws')
-        if ws:
-            asyncio.create_task(send_time_limit_message(ws, call_sid, from_number))
+        openai_ws = active_streams[call_sid].get('openai_ws')
+        if openai_ws:
+            asyncio.create_task(send_time_limit_message(openai_ws, call_sid, from_number))
 
 async def send_time_limit_message(openai_ws, call_sid: str, from_number: str):
     """Send time limit message through OpenAI Realtime"""
@@ -876,9 +719,12 @@ def cleanup_call_resources(call_sid: str):
             
             if 'twilio_ws' in active_streams[call_sid]:
                 try:
-                    asyncio.create_task(active_streams[call_sid]['twilio_ws'].close())
+                    active_streams[call_sid]['twilio_ws'].close()
                 except:
                     pass
+            
+            # Clean up transcript
+            cleanup_transcript(call_sid)
             
             # Clean up state
             active_streams.pop(call_sid, None)
@@ -901,7 +747,7 @@ def cleanup_call_resources(call_sid: str):
     with metrics_lock:
         metrics['active_calls'] = max(0, metrics['active_calls'] - 1)
     
-    gc.collect()  # Memory optimization
+    gc.collect()
 
 # Periodic cleanup
 def periodic_cleanup():
@@ -933,6 +779,7 @@ def index_page():
     return "<html><body><h1>ConvoReps Realtime Server is running!</h1></body></html>"
 
 @app.route("/voice", methods=["POST", "GET"])
+@error_handler
 def handle_incoming_call():
     """Handle incoming call and return TwiML response"""
     correlation_id = str(uuid.uuid4())
@@ -1057,7 +904,7 @@ def handle_incoming_call():
     connect = Connect()
     stream = Stream(
         url=stream_url,
-        track="inbound_track"  # Bidirectional streams
+        track="inbound_track"
     )
     
     # Add custom parameters
@@ -1092,30 +939,27 @@ def handle_media_stream(ws):
     """Handle WebSocket connection between Twilio and OpenAI Realtime"""
     logger.info("Client connected to media stream")
     
-    stream_sid = None
-    call_sid = None
-    from_number = None
-    minutes_left = FREE_CALL_MINUTES
-    correlation_id = None
-    openai_ws = None
-    latest_media_timestamp = 0
-    response_start_timestamp_twilio = None
-    mark_queue = []
-    last_assistant_item = None
+    # Check connection limit
+    with state_lock:
+        if len(active_streams) >= MAX_WEBSOCKET_CONNECTIONS:
+            logger.warning("Maximum WebSocket connections reached")
+            ws.close()
+            return
     
-    def run_websocket_handler():
-        """Run the async websocket handler in a new event loop"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(handle_media_stream_async(ws))
-        finally:
-            loop.close()
-    
-    # Run the async handler in a thread
-    handler_thread = threading.Thread(target=run_websocket_handler)
-    handler_thread.start()
-    handler_thread.join()
+    # Run the async handler
+    ws_start_time = time.time()
+    try:
+        asyncio.run(handle_media_stream_async(ws))
+    except Exception as e:
+        logger.error(f"WebSocket handler error: {e}", exc_info=True)
+        with metrics_lock:
+            metrics['websocket_errors'] += 1
+    finally:
+        # Track WebSocket duration
+        ws_duration = time.time() - ws_start_time
+        with metrics_lock:
+            metrics['websocket_duration_sum'] += ws_duration
+            metrics['websocket_count'] += 1
 
 async def handle_media_stream_async(ws):
     """Async handler for WebSocket connection"""
@@ -1138,7 +982,9 @@ async def handle_media_stream_async(ws):
             additional_headers={
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
                 "OpenAI-Beta": "realtime=v1"
-            }
+            },
+            ping_interval=20,
+            ping_timeout=10
         ) as openai_ws:
             
             # Send initial session configuration
@@ -1149,11 +995,29 @@ async def handle_media_stream_async(ws):
                 nonlocal stream_sid, call_sid, from_number, minutes_left, correlation_id, latest_media_timestamp
                 
                 try:
-                    async for message in websocket.iter_text():
-                        data = json.loads(message)
+                    while True:
+                        # Receive message from Twilio WebSocket with timeout
+                        try:
+                            message = await asyncio.get_event_loop().run_in_executor(
+                                None, ws.receive, 1.0
+                            )
+                            if message is None:
+                                continue
+                        except Exception as e:
+                            if "timeout" in str(e).lower():
+                                continue
+                            else:
+                                logger.error(f"WebSocket receive error: {e}")
+                                break
+                                
+                        try:
+                            data = json.loads(message)
+                        except json.JSONDecodeError:
+                            logger.error("Invalid JSON received from Twilio")
+                            continue
                         
                         if data['event'] == 'start':
-                            # Extract stream data from start event
+                            # Extract stream data
                             start_data = data.get('start', {})
                             stream_sid = start_data.get('streamSid')
                             
@@ -1175,7 +1039,7 @@ async def handle_media_stream_async(ws):
                                     'last_activity': time.time(),
                                     'correlation_id': correlation_id,
                                     'openai_ws': openai_ws,
-                                    'twilio_ws': websocket
+                                    'twilio_ws': ws
                                 }
                                 
                             # Send initial greeting
@@ -1188,15 +1052,15 @@ async def handle_media_stream_async(ws):
                             if call_sid in active_streams:
                                 active_streams[call_sid]['last_activity'] = time.time()
                             
-                            # Forward audio to OpenAI with memory optimization
+                            # Forward audio to OpenAI
                             audio_append = {
                                 "type": "input_audio_buffer.append",
                                 "audio": data['media']['payload']
                             }
                             await openai_ws.send(json.dumps(audio_append))
                             
-                            # Periodic garbage collection for memory optimization
-                            if latest_media_timestamp % 30000 == 0:  # Every 30 seconds
+                            # Periodic garbage collection
+                            if latest_media_timestamp % 30000 == 0:
                                 gc.collect()
                         
                         elif data['event'] == 'mark':
@@ -1212,10 +1076,8 @@ async def handle_media_stream_async(ws):
                                        extra={'correlation_id': correlation_id})
                             
                             if digit == '#':
-                                # Reset conversation
                                 await handle_reset(openai_ws, call_sid)
                             elif digit == '*':
-                                # Repeat last response
                                 await repeat_last_response(openai_ws, call_sid)
                         
                         elif data['event'] == 'stop':
@@ -1223,23 +1085,12 @@ async def handle_media_stream_async(ws):
                                        extra={'correlation_id': correlation_id})
                             break
                             
-                except WebSocketDisconnect:
-                    logger.info("Client disconnected")
-                    # Send any pending SMS/email from transcript
-                    send_sms_via_twilio()
-                    send_email_via_twilio_sms()
-                    # Clean up transcript CSV
-                    if os.path.exists(CONVERSATION_TRANSCRIPT_CSV):
-                        os.remove(CONVERSATION_TRANSCRIPT_CSV)
+                except (ConnectionClosed, OSError) as e:
+                    logger.info(f"Client disconnected: {e}")
                 except Exception as e:
                     logger.error(f"Error in receive_from_twilio: {e}", exc_info=True)
                 finally:
-                    # Always try to send SMS/email on disconnect
-                    logger.info("Connection closed. Checking for SMS/email instructions.")
-                    send_sms_via_twilio()
-                    send_email_via_twilio_sms()
-                    if os.path.exists(CONVERSATION_TRANSCRIPT_CSV):
-                        os.remove(CONVERSATION_TRANSCRIPT_CSV)
+                    logger.info("Connection closed.")
             
             async def send_to_twilio():
                 """Receive from OpenAI and forward to Twilio"""
@@ -1249,7 +1100,7 @@ async def handle_media_stream_async(ws):
                     async for openai_message in openai_ws:
                         response = json.loads(openai_message)
                         
-                        # Log important events (matching working implementation)
+                        # Log important events
                         if response.get('type') in ['response.content.done', 'rate_limits.updated', 
                                                     'response.done', 'input_audio_buffer.committed',
                                                     'input_audio_buffer.speech_stopped', 
@@ -1264,16 +1115,17 @@ async def handle_media_stream_async(ws):
                         
                         # Handle audio delta
                         elif response.get('type') == 'response.audio.delta' and 'delta' in response:
-                            # Forward audio to Twilio - ensure proper base64 encoding
-                            audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
+                            # Forward audio to Twilio
                             audio_delta = {
                                 "event": "media",
                                 "streamSid": stream_sid,
                                 "media": {
-                                    "payload": audio_payload
+                                    "payload": response['delta']
                                 }
                             }
-                            await websocket.send_json(audio_delta)
+                            await asyncio.get_event_loop().run_in_executor(
+                                None, ws.send, json.dumps(audio_delta)
+                            )
                             
                             if response_start_timestamp_twilio is None:
                                 response_start_timestamp_twilio = latest_media_timestamp
@@ -1282,7 +1134,7 @@ async def handle_media_stream_async(ws):
                             if response.get('item_id'):
                                 last_assistant_item = response['item_id']
                             
-                            await send_mark(websocket, stream_sid)
+                            await send_mark(ws, stream_sid)
                         
                         # Handle rate limits
                         elif response.get('type') == 'rate_limits.updated':
@@ -1292,7 +1144,7 @@ async def handle_media_stream_async(ws):
                                              f"Remaining: {limit.get('remaining')}, "
                                              f"Reset: {limit.get('reset_seconds')}")
                         
-                        # Handle response done - log transcripts
+                        # Handle response done
                         elif response.get('type') == 'response.done':
                             # Parse and log transcripts
                             if 'response' in response and 'output' in response['response']:
@@ -1303,10 +1155,9 @@ async def handle_media_stream_async(ws):
                                     for c in content:
                                         if c.get('type') == 'audio' and 'transcript' in c:
                                             # Append to CSV
-                                            append_transcript_to_csv(role, c['transcript'], 
-                                                                   stream_sid or "unknownSID")
+                                            append_transcript_to_csv(role, c['transcript'], call_sid)
                                             
-                                            # Also store in memory (with limit for memory optimization)
+                                            # Store in memory
                                             if call_sid in conversation_transcripts:
                                                 conversation_transcripts[call_sid].append({
                                                     'role': role,
@@ -1314,18 +1165,18 @@ async def handle_media_stream_async(ws):
                                                     'timestamp': datetime.now().isoformat()
                                                 })
                                                 
-                                                # Limit conversation history to last 50 messages
+                                                # Limit conversation history
                                                 if len(conversation_transcripts[call_sid]) > 50:
                                                     conversation_transcripts[call_sid] = conversation_transcripts[call_sid][-50:]
                                                 
-                                                # Cache assistant response for repeat functionality
+                                                # Cache assistant response
                                                 if role == 'assistant':
                                                     with state_lock:
                                                         last_response_cache[call_sid] = c['transcript']
                             
                             response_start_timestamp_twilio = None
                             
-                            # Check for interview mode to advance questions
+                            # Check for interview mode
                             mode = mode_lock.get(call_sid, "cold_call")
                             if mode == "interview" and call_sid in interview_question_index:
                                 # Advance to next question
@@ -1354,9 +1205,9 @@ async def handle_media_stream_async(ws):
                             transcript = response.get('transcript', '')
                             if transcript and call_sid:
                                 # Log to CSV
-                                append_transcript_to_csv('user', transcript, stream_sid or "unknownSID")
+                                append_transcript_to_csv('user', transcript, call_sid)
                                 
-                                # Store in memory (with limit for memory optimization)
+                                # Store in memory
                                 if call_sid in conversation_transcripts:
                                     conversation_transcripts[call_sid].append({
                                         'role': 'user',
@@ -1364,7 +1215,7 @@ async def handle_media_stream_async(ws):
                                         'timestamp': datetime.now().isoformat()
                                     })
                                     
-                                    # Limit conversation history to last 50 messages
+                                    # Limit conversation history
                                     if len(conversation_transcripts[call_sid]) > 50:
                                         conversation_transcripts[call_sid] = conversation_transcripts[call_sid][-50:]
                                 
@@ -1373,19 +1224,18 @@ async def handle_media_stream_async(ws):
                                     detected_mode = detect_intent(transcript)
                                     mode_lock[call_sid] = detected_mode
                                     
-                                    # Check for bad news and update prompt accordingly
+                                    # Update session for mode
                                     voice, system_prompt, _ = get_personality_for_mode(call_sid, detected_mode)
                                     
                                     if detect_bad_news(transcript):
                                         system_prompt = add_bad_news_context(system_prompt, transcript)
                                     
-                                    # Initialize interview question index if interview mode
+                                    # Initialize interview question index
                                     if detected_mode == "interview" and call_sid not in interview_question_index:
                                         interview_question_index[call_sid] = 0
                                     
-                                    # Update session if mode changed
+                                    # Update session
                                     if detected_mode != "cold_call":
-                                        # For interview mode, include current question in prompt
                                         if detected_mode == "interview":
                                             current_q_idx = interview_question_index.get(call_sid, 0)
                                             if current_q_idx < len(interview_questions):
@@ -1393,7 +1243,7 @@ async def handle_media_stream_async(ws):
                                         
                                         await update_session_for_mode(openai_ws, voice, system_prompt)
                                 else:
-                                    # Check for bad news in ongoing conversation
+                                    # Check for bad news
                                     if detect_bad_news(transcript):
                                         mode = mode_lock.get(call_sid, "cold_call")
                                         voice, system_prompt, _ = get_personality_for_mode(call_sid, mode)
@@ -1406,16 +1256,15 @@ async def handle_media_stream_async(ws):
                             if last_assistant_item:
                                 logger.info(f"Interrupting response with id: {last_assistant_item}")
                                 new_timestamp, new_item = await handle_speech_started_event(
-                                    openai_ws, websocket, stream_sid, 
+                                    openai_ws, ws, stream_sid, 
                                     response_start_timestamp_twilio, latest_media_timestamp,
                                     last_assistant_item, mark_queue
                                 )
                                 response_start_timestamp_twilio = new_timestamp
                                 last_assistant_item = new_item
                         
-                        # Handle function calls - check both events per OpenAI docs
+                        # Handle function calls
                         elif response.get('type') in ['response.function_call_arguments.done', 'response.done']:
-                            # Check if this is a function call response
                             if response.get('type') == 'response.done':
                                 # Check response.output for function calls
                                 outputs = response.get('response', {}).get('output', [])
@@ -1437,15 +1286,12 @@ async def handle_media_stream_async(ws):
                             
                             logger.error(f"OpenAI error - Code: {error_code}, Message: {error_message}, Event ID: {error_event_id}")
                             
-                            # Log which event caused the error
                             if error_event_id:
                                 logger.error(f"Error caused by event: {error_event_id}")
                             
                             with metrics_lock:
                                 metrics['api_errors'] += 1
                                 
-                except WebSocketDisconnect:
-                    logger.info("WebSocket to Twilio closed")
                 except Exception as e:
                     logger.error(f"Error in send_to_twilio: {e}", exc_info=True)
             
@@ -1457,12 +1303,14 @@ async def handle_media_stream_async(ws):
                         "streamSid": sid,
                         "mark": {"name": "responsePart"}
                     }
-                    await connection.send_json(mark_event)
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, connection.send, json.dumps(mark_event)
+                    )
                     mark_queue.append('responsePart')
                     
-                    # Limit mark queue size for memory optimization
+                    # Limit mark queue size
                     if len(mark_queue) > 100:
-                        mark_queue[:50] = []  # Keep last 50 marks
+                        mark_queue[:50] = []
             
             # Run both tasks concurrently
             await asyncio.gather(receive_from_twilio(), send_to_twilio())
@@ -1472,7 +1320,10 @@ async def handle_media_stream_async(ws):
     finally:
         if call_sid:
             cleanup_call_resources(call_sid)
-        await websocket.close()
+        try:
+            ws.close()
+        except:
+            pass
 
 async def send_session_update(openai_ws):
     """Send session configuration to OpenAI"""
@@ -1572,10 +1423,13 @@ async def handle_speech_started_event(openai_ws, twilio_ws, stream_sid: str,
             await openai_ws.send(json.dumps(truncate_event))
         
         # Clear Twilio's audio buffer
-        await twilio_ws.send_json({
+        clear_event = {
             "event": "clear",
             "streamSid": stream_sid
-        })
+        }
+        await asyncio.get_event_loop().run_in_executor(
+            None, twilio_ws.send, json.dumps(clear_event)
+        )
         
         mark_queue.clear()
         
@@ -1612,7 +1466,7 @@ async def process_function_call(function_name: str, call_id: str, arguments_str:
         elapsed_minutes = (time.time() - call_start_time) / 60.0
         remaining = max(0, minutes_left - elapsed_minutes)
         
-        # Create function output matching OpenAI documentation format
+        # Create function output
         function_output = {
             "type": "conversation.item.create",
             "item": {
@@ -1781,14 +1635,16 @@ def health_check():
     with metrics_lock:
         error_rate = metrics['api_errors'] / max(metrics['total_calls'], 1)
         api_health = "healthy" if error_rate < 0.1 else "degraded"
+        ws_health = "healthy" if metrics['websocket_errors'] < 10 else "degraded"
     
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "active_streams": active_count,
         "api_health": api_health,
+        "websocket_health": ws_health,
         "memory_usage_mb": get_memory_usage(),
-        "version": "1.0-realtime",
+        "version": "2.0-realtime",
         "realtime_model": OPENAI_REALTIME_MODEL
     }
 
@@ -1800,8 +1656,14 @@ def metrics_endpoint():
         mode_breakdown = {}
         for mode in ["cold_call", "interview", "small_talk"]:
             mode_breakdown[mode] = sum(1 for m in mode_lock.values() if m == mode)
+        active_timers = len(call_timers)
     
     with metrics_lock:
+        avg_ws_duration = (
+            metrics['websocket_duration_sum'] / max(metrics['websocket_count'], 1)
+            if metrics['websocket_count'] > 0 else 0
+        )
+        
         return {
             "active_streams": active_count,
             "total_calls": metrics['total_calls'],
@@ -1813,8 +1675,18 @@ def metrics_endpoint():
             },
             "tool_calls": metrics['tool_calls_made'],
             "api_errors": metrics['api_errors'],
+            "websocket_errors": metrics['websocket_errors'],
+            "websocket_metrics": {
+                "average_duration_seconds": avg_ws_duration,
+                "total_connections": metrics['websocket_count']
+            },
+            "timer_stats": {
+                "active_timers": active_timers,
+                "free_minutes_per_user": FREE_CALL_MINUTES
+            },
             "free_minutes_per_user": FREE_CALL_MINUTES,
-            "csv_stats": get_csv_statistics()
+            "csv_stats": get_csv_statistics(),
+            "memory_usage_mb": get_memory_usage()
         }
 
 def get_memory_usage() -> float:
@@ -1921,10 +1793,6 @@ def sms_webhook():
         return "", 200
 
 if __name__ == "__main__":
-    # Ensure directories exist
-    os.makedirs("static", exist_ok=True)
-    os.makedirs(os.path.dirname(USAGE_CSV_PATH) or ".", exist_ok=True)
-    
     # Generate beep sound if missing
     if not os.path.exists("static/beep.mp3") and PYDUB_AVAILABLE:
         logger.warning("beep.mp3 not found - generating")
@@ -1947,15 +1815,17 @@ if __name__ == "__main__":
     # Initial garbage collection
     gc.collect()
     
-    logger.info("\n🚀 ConvoReps OpenAI Realtime Edition v1.0")
+    logger.info("\n🚀 ConvoReps OpenAI Realtime Edition v2.0")
     logger.info("   ✅ OpenAI Realtime API for end-to-end audio")
     logger.info("   ✅ Twilio Media Streams integration")
+    logger.info("   ✅ Flask-Sock WebSocket handling")
     logger.info("   ✅ User tracking and time limits")
     logger.info("   ✅ Function calling for time checking")
     logger.info("   ✅ SMS sending with deduplication")
-    logger.info("   ✅ Email notifications via SMS")
     logger.info("   ✅ Multiple conversation modes")
     logger.info("   ✅ Production-ready error handling")
+    logger.info("   ✅ Thread-safe operations")
+    logger.info("   ✅ Memory optimization")
     logger.info(f"\n   Configuration:")
     logger.info(f"   - Model: {OPENAI_REALTIME_MODEL}")
     logger.info(f"   - Free Minutes: {FREE_CALL_MINUTES}")

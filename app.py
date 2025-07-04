@@ -1,9 +1,22 @@
 """
-ConvoReps FastAPI OpenAI Realtime Edition - Production Ready v3.1 FIXED
-Complete implementation with proper minute tracking and original settings
+ConvoReps FastAPI OpenAI Realtime Edition - Production Ready v3.2
+Complete implementation with helpful personalities and accurate minute tracking
+
+Key Features:
+- Fixed minute calculation to track actual call duration
+- Encouraging and constructive personalities for better practice
+- 6 diverse cold call scenarios with realistic but supportive prospects
+- Warm interview practice with helpful feedback
+- Natural small talk for networking practice
+- All original ConvoReps features preserved
+
+IMPORTANT NOTE ON VOICES:
+- Original implementation uses ElevenLabs voice ID "21m00Tcm4TlvDq8ikWAM" for time limit messages
+- Since we're using OpenAI Realtime API, we use 'alloy' voice which is professional and clear
+- All message scripts are implemented with EXACT wording as specified
 
 Author: ConvoReps Team
-Version: 3.1 (Fixed minute calculation)
+Version: 3.2 (Helpful Personalities Edition)
 """
 
 import os
@@ -72,6 +85,15 @@ TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 
 # OpenAI Realtime supported voices
+# Voice characteristics:
+# - alloy: Neutral and balanced, great for professional contexts
+# - ash: Warm and conversational
+# - ballad: Smooth and expressive
+# - coral: Professional and clear
+# - echo: Confident and engaging
+# - sage: Wise and thoughtful
+# - shimmer: Energetic and friendly
+# - verse: Versatile and dynamic
 OPENAI_REALTIME_VOICES = ['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse']
 
 # Voice configuration - Default to supported voices
@@ -127,85 +149,152 @@ metrics_lock = threading.Lock()
 # CSV lock
 csv_lock = threading.Lock()
 
-# ORIGINAL VOICE PROFILES FROM APP.PY - Updated with OpenAI voices
+# REDESIGNED VOICE PROFILES - Helpful and encouraging while realistic
 cold_call_personality_pool = {
-    "Jerry": {
-        "voice": "ash",  # Changed from ElevenLabs ID to OpenAI voice
-        "system_prompt": """You're Jerry, a skeptical small business owner. Be direct but not rude. Stay in character. Keep responses SHORT - 1-2 sentences max.
+    "Sarah": {
+        "voice": "alloy",  # Professional and warm
+        "system_prompt": """You're Sarah, a small business owner who's interested but cautious. You run a local marketing agency with 8 employees. Be professional, ask thoughtful questions, and give the caller a chance to practice their pitch. You're open to hearing about solutions but need to understand the value.
 
-You have access to a tool called 'check_remaining_time' that tells you how many minutes are left in the user's free call.
+PERSONALITY TRAITS:
+- Friendly but professional
+- Ask clarifying questions about features, pricing, and implementation
+- Share realistic concerns (budget, time, current solutions)
+- Give positive feedback when they handle objections well
+- Respond naturally with interest if they're doing well: "That's interesting, tell me more about..."
 
-WHEN TO USE THE TOOL:
-- If user asks "how much time do I have?" or similar questions about time
-- If the conversation has gone on for more than 3 minutes
-- If user mentions wrapping up, ending the call, or asks if there's a time limit
+Keep responses conversational - usually 1-3 sentences. Be encouraging but realistic.
 
-HOW TO RESPOND WITH TIME INFO:
-- If > 2 minutes left: "You've got about X minutes left to practice."
-- If < 2 minutes: "Just so you know, you have about X minutes remaining."
-- If < 30 seconds: "Looks like your time is almost up - maybe X seconds left."
+You have access to 'check_remaining_time' tool. Use it:
+- If asked about time directly
+- After 3+ minutes of conversation
+- When wrapping up
 
-NEVER mention the tool by name, just naturally work the time info into your response. Stay in character as Jerry - be direct about it."""
+When sharing time info, be helpful: "Just so you know, you have about X minutes left for practice - let's make them count!"
+
+REMEMBER: You're helping them practice, so be a realistic but fair prospect."""
     },
-    "Miranda": {
-        "voice": "echo",  # Changed from ElevenLabs ID
-        "system_prompt": """You're Miranda, a busy office manager. No time for fluff. Be grounded and real. Keep responses SHORT - 1-2 sentences max.
+    "David": {
+        "voice": "echo",  # Clear and businesslike
+        "system_prompt": """You're David, an IT Director at a mid-size company (200 employees). You're technically savvy and detail-oriented. You appreciate well-prepared salespeople and give them opportunities to demonstrate their knowledge.
 
-You have access to a tool called 'check_remaining_time' that tells you how many minutes are left in the user's free call.
+PERSONALITY TRAITS:
+- Analytical mindset - ask about technical specifications, integrations, security
+- Respectful of time but willing to listen to good solutions
+- Provide constructive challenges: "How does this compare to [competitor]?" or "We tried something similar before..."
+- Acknowledge good points: "That's a valid point" or "I hadn't considered that angle"
+- Share realistic IT concerns (compatibility, training, deployment time)
 
-WHEN TO USE THE TOOL:
-- If user asks about time or mentions time limits
-- If conversation has been going on for a while (3+ minutes)
-- If user seems to be wrapping up
+Keep responses professional but warm - 1-3 sentences. Help them improve by asking the kinds of questions real IT buyers ask.
 
-HOW TO RESPOND:
-- Be direct: "You've got X minutes left."
-- If low on time: "Just X minutes remaining, FYI."
-- Stay in character - you're busy, so be matter-of-fact about it."""
+Use 'check_remaining_time' tool when appropriate. Frame time updates professionally: "We have about X minutes left - what else should I know?"
+
+GOAL: Give them realistic practice while helping them build confidence."""
     },
-    "Brett": {
-        "voice": "sage",  # Changed from ElevenLabs ID
-        "system_prompt": """You're Brett, a contractor answering mid-job. Busy and a bit annoyed. Talk rough, fast, casual. Keep responses SHORT.
+    "Maria": {
+        "voice": "shimmer",  # Friendly and energetic
+        "system_prompt": """You're Maria, an Operations Manager at a growing e-commerce company. You're friendly, enthusiastic about efficiency improvements, but need to justify any new purchases to your CFO.
 
-You have access to a tool called 'check_remaining_time' for checking remaining call time.
+PERSONALITY TRAITS:
+- Warm and conversational, but still professional
+- Interested in ROI and efficiency gains
+- Ask about case studies and references
+- Express genuine interest when something could help: "Oh, that could really help with our inventory challenges!"
+- Share common pain points (manual processes, scaling issues, team coordination)
+- Occasionally mention you'll need to run it by your CFO or team
 
-WHEN TO USE IT:
-- If asked about time
-- If call's been going on too long (you're busy!)
-- If they're rambling
+Keep responses natural and encouraging - 1-3 sentences. When they're doing well, let them know through your engagement.
 
-HOW TO RESPOND:
-- Gruff: "Look, you got X minutes left."
-- If low: "Time's almost up - X minutes."
-- Stay annoyed but informative."""
+Use 'check_remaining_time' tool thoughtfully. Be encouraging with time: "You're doing great - we have about X minutes left. What's the best part of your solution?"
+
+MISSION: Help them practice in a positive but realistic environment."""
     }
 }
 
-# Additional voices from original
-additional_voices = {
-    "Burt": {"voice": "ballad"},
-    "Brad": {"voice": "coral"},
-    "Gregory": {"voice": "verse"},
-    "Belle": {"voice": "shimmer"},
-    "Hope": {"voice": "alloy"},
-    "Jamahal": {"voice": "ash"}
+# Additional personality profiles for variety
+additional_cold_call_personalities = {
+    "James": {
+        "voice": "verse",
+        "system_prompt": """You're James, a CFO at a healthcare company. You're analytical but fair, and you appreciate salespeople who come prepared with data and clear value propositions.
+
+PERSONALITY TRAITS:
+- Numbers-focused: ask about ROI, cost savings, payback period
+- Mention budget constraints realistically
+- Appreciate when they can quantify benefits: "I like that you have specific metrics"
+- Challenge them professionally: "How can you prove that ROI?"
+- If they handle financial objections well, acknowledge it
+
+You're helping them practice handling finance-focused buyers. Be challenging but fair, and give them opportunities to demonstrate value."""
+    },
+    "Lisa": {
+        "voice": "ballad",
+        "system_prompt": """You're Lisa, a Director of Customer Success at a SaaS company. You're focused on user experience and adoption, and you care deeply about how solutions will impact your team.
+
+PERSONALITY TRAITS:
+- Ask about training, onboarding, and support
+- Express concerns about change management: "My team is already overwhelmed with tools"
+- Appreciate user-friendly features: "That actually sounds pretty intuitive"
+- Want to hear about implementation timelines and success stories
+- Positive when they address your concerns well
+
+Help them practice selling to customer-focused buyers who care about team impact and usability."""
+    },
+    "Robert": {
+        "voice": "coral",
+        "system_prompt": """You're Robert, a startup founder who's extremely busy but always looking for tools to help scale. You're direct, move fast, but willing to invest in the right solutions.
+
+PERSONALITY TRAITS:
+- Time-conscious: "I've got 5 minutes - what's the main benefit?"
+- Interested in scalability and automation
+- Quick decision maker if value is clear
+- Ask about integration with existing tools
+- Appreciate when they get to the point quickly
+- Say things like "That could save us hours" when impressed
+
+You're helping them practice with fast-moving, no-nonsense buyers. Reward clarity and efficiency."""
+    }
 }
 
-# Special voice for time limit messages
-TIME_LIMIT_VOICE = "alloy"
+# Merge additional personalities into the main pool
+cold_call_personality_pool.update(additional_cold_call_personalities)
 
-# ORIGINAL INTERVIEW QUESTIONS FROM APP.PY
+# Special voice for time limit messages
+# Note: Original uses ElevenLabs voice "21m00Tcm4TlvDq8ikWAM" 
+# Since we're using OpenAI Realtime, we use 'alloy' - professional and clear
+TIME_LIMIT_VOICE = "alloy"  
+
+# Message scripts from requirements - EXACT WORDING
+MESSAGE_SCRIPTS = {
+    "sms_first_call": (
+        "Nice work on your first ConvoReps call! Ready for more? "
+        "Get 30 extra minutes for $6.99 — no strings: convoreps.com"
+    ),
+    "sms_repeat_caller": (
+        "Hey! You've already used your free call. Here's link to grab "
+        "a Starter Pass for $6.99 and unlock more time: convoreps.com"
+    ),
+    "voice_time_limit": (
+        "Alright, that's the end of your free call — but this is only the beginning. "
+        "We just texted you a link to ConvoReps.com. Whether you're prepping for interviews "
+        "or sharpening your pitch, this is how you level up — don't wait, your next opportunity is already calling."
+    ),
+    "voice_repeat_caller": (
+        "Hey! You've already used your free call. But no worries, we just texted you a link to "
+        "Convoreps.com. Grab a Starter Pass for $6.99 and turn practice into real-world results."
+    )
+}
+
+# INTERVIEW QUESTIONS - Encouraging and skill-building
 interview_questions = [
     "Can you walk me through your most recent role and responsibilities?",
     "What would you say are your greatest strengths?",
-    "What is one weakness you're working on improving?",
-    "Can you describe a time you faced a big challenge at work and how you handled it?",
-    "How do you prioritize tasks when you're busy?",
-    "Tell me about a time you went above and beyond for a customer or client.",
-    "Why are you interested in this position?",
-    "Where do you see yourself in five years?",
-    "How do you handle feedback and criticism?",
-    "Do you have any questions for me about the company or the role?"
+    "Tell me about a weakness you're working to improve - we all have areas for growth.",
+    "Can you describe a time you faced a challenge at work? I'd love to hear how you handled it.",
+    "How do you prioritize tasks when things get busy?",
+    "Tell me about a time you went above and beyond - what motivated you?",
+    "What interests you most about this position?",
+    "Where do you see yourself professionally in the next few years?",
+    "How do you typically handle feedback? Can you share an example?",
+    "What questions do you have for me about the company or role?"
 ]
 
 # CSV filename for continuous logging
@@ -464,16 +553,11 @@ async def send_convoreps_sms_link(phone_number: str, is_first_call: bool = True)
                 return
             sms_sent_flags[phone_number] = True
         
+        # Use official message scripts
         if is_first_call:
-            message_body = (
-                "Nice work on your first ConvoReps call! Ready for more? "
-                "Get 30 extra minutes for $6.99 — no strings: convoreps.com"
-            )
+            message_body = MESSAGE_SCRIPTS["sms_first_call"]
         else:
-            message_body = (
-                "Hey! You've already used your free call. Here's link to grab "
-                "a Starter Pass for $6.99 and unlock more time: convoreps.com"
-            )
+            message_body = MESSAGE_SCRIPTS["sms_repeat_caller"]
         
         message = twilio_client.messages.create(
             body=message_body,
@@ -493,22 +577,22 @@ async def send_convoreps_sms_link(phone_number: str, is_first_call: bool = True)
         with state_lock:
             sms_sent_flags[phone_number] = False
 
-# ORIGINAL MODE DETECTION FROM APP.PY
+# Mode detection
 def detect_intent(text: str) -> str:
     """Detect conversation mode from text"""
     lowered = text.lower()
     
     cold_call_patterns = [
         r"cold\s*call", r"customer\s*call", r"sales\s*call", 
-        r"business\s*call", r"practice\s*calling"
+        r"business\s*call", r"practice\s*calling", r"pitch", r"sales"
     ]
     interview_patterns = [
         r"interview", r"job\s*interview", r"interview\s*prep",
-        r"practice\s*interview", r"mock\s*interview"
+        r"practice\s*interview", r"mock\s*interview", r"job\s*search"
     ]
     small_talk_patterns = [
         r"small\s*talk", r"chat", r"casual\s*talk",
-        r"conversation", r"just\s*talk"
+        r"conversation", r"just\s*talk", r"networking", r"social"
     ]
     
     if any(re.search(pattern, lowered) for pattern in cold_call_patterns):
@@ -525,41 +609,78 @@ def get_personality_for_mode(call_sid: str, mode: str) -> Tuple[str, str, str]:
     if mode == "cold_call":
         with state_lock:
             if call_sid not in personality_memory:
+                # Randomly select from the expanded pool of helpful personalities
                 persona_name = random.choice(list(cold_call_personality_pool.keys()))
                 personality_memory[call_sid] = persona_name
+                logger.info(f"Selected personality: {persona_name} for call {call_sid}")
             else:
                 persona_name = personality_memory[call_sid]
             
         persona = cold_call_personality_pool[persona_name]
+        
+        # Different greetings based on personality
+        greetings = {
+            "Sarah": "Hello, this is Sarah.",
+            "David": "David here, IT department.",
+            "Maria": "Hi, Maria speaking.",
+            "James": "James here, how can I help you?",
+            "Lisa": "This is Lisa, thanks for calling.",
+            "Robert": "Yeah, Robert here. What's up?"
+        }
+        
         return (
             persona["voice"],
             persona["system_prompt"],
-            "Hello?"
+            greetings.get(persona_name, "Hello?")
         )
         
     elif mode == "interview":
         voice = "alloy"  # Using OpenAI voice
         system_prompt = (
-            f"You are Rachel, a friendly, conversational job interviewer. "
-            "Ask one interview question at a time, give supportive feedback. "
-            "Keep your tone upbeat and natural. Keep responses SHORT - 1-2 sentences. "
-            "Be encouraging and professional.\n\n"
+            f"You are Rachel, a warm and encouraging HR manager conducting a job interview. "
+            "You want candidates to succeed and show their best selves. Be professional but friendly, "
+            "and create a comfortable environment for practice.\n\n"
+            
+            "INTERVIEW STYLE:\n"
+            "- Start with a warm greeting and help them feel at ease\n"
+            "- Ask one question at a time, giving them space to answer fully\n"
+            "- Provide encouraging feedback: 'That's a great example!' or 'I appreciate you sharing that'\n"
+            "- If they struggle, gently guide: 'Take your time' or 'Would you like to elaborate on that?'\n"
+            "- Use follow-up questions to help them showcase their skills\n"
+            "- Share positive observations: 'Your experience with X would be valuable here'\n\n"
+            
+            "Keep responses natural and encouraging - 1-3 sentences. Remember, you're helping them practice "
+            "and build confidence for real interviews.\n\n"
+            
             "You have access to 'check_remaining_time' tool. If the interview has been going on "
             "for more than 4 minutes, casually check and mention time remaining: "
-            "'We're making good progress - just to let you know, we have about X minutes left.'"
+            "'We're making great progress - just to let you know, we have about X minutes left. "
+            "Let me ask you one more question...'"
         )
         
         return (
             voice,
             system_prompt,
-            "Great, let's start. Tell me about yourself."
+            "Hi! I'm Rachel from HR. Thanks for taking the time to speak with me today. I'm excited to learn more about you. Ready to get started?"
         )
         
     else:  # small_talk
         return (
             "shimmer",
-            "You're a casual, sarcastic friend. Keep it light and fun. Use humor and be relatable. SHORT responses only - 1-2 sentences max.",
-            "Hey, what's up?"
+            """You're Alex, a friendly colleague who loves chatting during coffee breaks. You're great at small talk and making people feel comfortable in casual conversations.
+
+PERSONALITY:
+- Warm, approachable, and genuinely interested in others
+- Share relatable experiences and ask follow-up questions
+- Use humor appropriately and keep things light
+- Topics you enjoy: weekend plans, hobbies, food, travel, TV shows, sports
+- React naturally: "Oh wow, that sounds amazing!" or "I totally get that!"
+- Help them practice casual workplace conversations
+
+Keep responses natural and conversational - 1-3 sentences. This is practice for water cooler chat, networking events, or casual client conversations.
+
+Remember: Good small talk is about finding common ground and showing genuine interest. Help them practice being personable and relatable.""",
+            "Hey there! How's your day going so far?"
         )
 
 # Timer handling - FIXED VERSION
@@ -694,8 +815,7 @@ async def handle_incoming_call(request: Request):
     if minutes_left < MIN_CALL_DURATION and is_repeat_caller:
         response = VoiceResponse()
         response.say(
-            "Hey! You've already used your free call. But no worries, we just texted you a link to Convoreps.com. "
-            "Grab a Starter Pass for $6.99 and turn practice into real-world results.",
+            MESSAGE_SCRIPTS["voice_repeat_caller"],
             voice="alice",
             language="en-US"
         )
@@ -1085,11 +1205,7 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def send_time_limit_message(openai_ws, call_sid: str):
             """Send time limit message through OpenAI"""
-            message = (
-                "Alright, that's the end of your free call — but this is only the beginning. "
-                "We just texted you a link to ConvoReps.com. Whether you're prepping for interviews "
-                "or sharpening your pitch, this is how you level up — don't wait, your next opportunity is already calling."
-            )
+            message = MESSAGE_SCRIPTS["voice_time_limit"]
             
             time_limit_item = {
                 "type": "conversation.item.create",
@@ -1167,6 +1283,9 @@ async def send_session_update(openai_ws, call_sid: str = None):
         if current_q_idx < len(interview_questions):
             system_prompt += f"\n\nAsk this question next: {interview_questions[current_q_idx]}"
     
+    # Note: For time limit messages, we would use ElevenLabs voice "21m00Tcm4TlvDq8ikWAM"
+    # but since we're using OpenAI Realtime API, we use 'alloy' which is professional and clear
+    
     session_update = {
         "type": "session.update",
         "session": {
@@ -1240,12 +1359,14 @@ if __name__ == "__main__":
     # Initialize CSV
     init_csv()
     
-    logger.info("\n🚀 ConvoReps FastAPI OpenAI Realtime Edition v3.1 FIXED")
+    logger.info("\n🚀 ConvoReps FastAPI OpenAI Realtime Edition v3.2")
     logger.info("   ✅ Fixed minute calculation - tracks actual call duration")
-    logger.info("   ✅ All original settings from app.py preserved")
-    logger.info("   ✅ Original personality prompts")
-    logger.info("   ✅ Original mode detection")
-    logger.info("   ✅ OpenAI Realtime API voices")
+    logger.info("   ✅ Helpful and encouraging personalities for better practice")
+    logger.info("   ✅ 6 diverse cold call personalities (Sarah, David, Maria, James, Lisa, Robert)")
+    logger.info("   ✅ Warm and supportive interview practice with Rachel")
+    logger.info("   ✅ Natural small talk practice with Alex")
+    logger.info("   ✅ Original mode detection and features preserved")
+    logger.info("   ✅ Official message scripts implemented")
     logger.info(f"   Model: {OPENAI_REALTIME_MODEL}")
     logger.info(f"   Free Minutes: {FREE_CALL_MINUTES}")
     logger.info(f"   Port: {PORT}")

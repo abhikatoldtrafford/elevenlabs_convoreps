@@ -1910,5 +1910,5 @@ if __name__ == "__main__":
     logger.info(f"   - Port: {PORT}")
     logger.info("\n")
     
-    # Run with uvicorn directly
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+    # Run with uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

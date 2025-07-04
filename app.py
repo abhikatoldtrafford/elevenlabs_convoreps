@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 ConvoReps OpenAI Realtime Edition - Production Ready v1.0
 Real-time voice conversation practice with OpenAI Realtime API

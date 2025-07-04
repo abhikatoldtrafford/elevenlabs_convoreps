@@ -3,7 +3,7 @@ fastapi
 uvicorn[standard]
 websockets
 python-dotenv
-
+gunicorn
 # Twilio for telephony
 twilio
 

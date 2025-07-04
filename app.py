@@ -1202,4 +1202,11 @@ if __name__ == "__main__":
     logger.info(f"   Free Minutes: {FREE_CALL_MINUTES}")
     logger.info(f"   Port: {PORT}")
     
-    uvicorn.run(app, host='0.0.0.0', port=PORT)
+    logger.info(f"Binding to: 0.0.0.0:{PORT}")
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=PORT,
+        log_level="info",
+        access_log=True
+    )

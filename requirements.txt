@@ -8,7 +8,7 @@ python-multipart==0.0.6
 twilio==8.11.0
 
 # OpenAI
-openai==1.12.0
+openai==1.35.3
 
 # Audio processing (optional but recommended)
 pydub==0.25.1

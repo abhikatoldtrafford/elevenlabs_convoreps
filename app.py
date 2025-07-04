@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 ConvoReps OpenAI Realtime Edition - Production Ready v1.0
 Real-time voice conversation practice with OpenAI Realtime API
@@ -30,7 +29,6 @@ import websockets
 import csv
 import uuid
 import logging
-import signal
 import tempfile
 import shutil
 import threading
@@ -92,12 +90,12 @@ root_logger.addHandler(console_handler)
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI
-app = FastAPI()
+app = FastAPI(title="ConvoReps Realtime API", version="1.0")
 
 # Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12-17")
-PORT = int(os.getenv("PORT", 5050))
+PORT = int(os.getenv("PORT", "5050"))  # Render sets PORT to 10000
 FREE_CALL_MINUTES = float(os.getenv("FREE_CALL_MINUTES", "5.0"))
 MIN_CALL_DURATION = float(os.getenv("MIN_CALL_DURATION", "0.5"))
 USAGE_CSV_PATH = os.getenv("USAGE_CSV_PATH", "user_usage.csv")
@@ -111,16 +109,13 @@ TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 TWILIO_TO_NUMBER = os.getenv("TWILIO_TO_NUMBER")  # Default recipient for SMS/email notifications
 
 # Initialize clients
-twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)
-openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID else None
+twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # Validate configuration
 if not OPENAI_API_KEY:
     raise ValueError('Missing the OpenAI API key. Please set it in the .env file.')
-
-if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-    raise ValueError('Missing Twilio credentials. Please set them in the .env file.')
 
 # Thread pool for async operations
 executor = ThreadPoolExecutor(max_workers=5)
@@ -226,26 +221,6 @@ interview_questions = [
 
 # Graceful shutdown
 shutdown_event = threading.Event()
-
-def signal_handler(sig, frame):
-    """Handle graceful shutdown"""
-    logger.info("Graceful shutdown initiated...")
-    shutdown_event.set()
-    
-    with state_lock:
-        for call_sid in list(active_streams.keys()):
-            cleanup_call_resources(call_sid)
-    
-    with state_lock:
-        for timer in call_timers.values():
-            timer.cancel()
-    
-    create_csv_backup()
-    logger.info("Shutdown complete")
-    exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
 
 # Validation functions
 def validate_phone_number(phone_number: str) -> bool:
@@ -899,30 +874,6 @@ def cleanup_call_resources(call_sid: str):
         metrics['active_calls'] = max(0, metrics['active_calls'] - 1)
     
     gc.collect()  # Memory optimization
-
-# Periodic cleanup
-def periodic_cleanup():
-    """Clean up stale connections periodically"""
-    while not shutdown_event.is_set():
-        try:
-            time.sleep(60)
-            current_time = time.time()
-            stale_calls = []
-            
-            with state_lock:
-                for call_sid, stream_data in list(active_streams.items()):
-                    if current_time - stream_data.get('last_activity', 0) > 300:
-                        stale_calls.append(call_sid)
-            
-            for call_sid in stale_calls:
-                logger.info(f"Cleaning up stale connection: {call_sid}")
-                cleanup_call_resources(call_sid)
-                
-        except Exception as e:
-            logger.error(f"Cleanup thread error: {e}")
-
-cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
-cleanup_thread.start()
 
 # Twilio endpoints
 @app.get("/", response_class=HTMLResponse)
@@ -1952,4 +1903,5 @@ if __name__ == "__main__":
     logger.info(f"   - Port: {PORT}")
     logger.info("\n")
     
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    # Run with uvicorn directly
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")

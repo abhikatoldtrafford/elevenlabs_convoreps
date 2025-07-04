@@ -1,32 +1,35 @@
-# Core dependencies
-fastapi
-uvicorn[standard]
-websockets
-python-dotenv
-gunicorn
-# Twilio for telephony
+# Core Flask and WebSocket support
+Flask
+flask-cors
+flask-sock
+gevent
+gevent-websocket
+
+# Twilio
 twilio
 
-# OpenAI for Realtime API
-openai
+# OpenAI
+openai==1.72.0
 
-# Data processing
-pandas
-numpy
+# ElevenLabs
+elevenlabs==2.3.0
 
-# Audio processing (optional, for beep generation)
+# Audio processing
 pydub
-
-# System monitoring (optional)
-psutil
+numpy
+pandas
 
 # Async support
-asyncio
 aiofiles
+websockets
 
-# Logging and utilities
-python-json-logger
+# Environment and utilities
+python-dotenv
+requests
 
-# For development/testing
-pytest
-pytest-asyncio
+# Production server
+gunicorn
+
+# For better WebSocket performance
+websocket-client
+simple-websocket

@@ -2,6 +2,12 @@
 ConvoReps OpenAI Realtime Edition - Production Ready v1.0
 Real-time voice conversation practice with OpenAI Realtime API
 
+To run locally:
+  python app.py
+
+To run with gunicorn (for production):
+  gunicorn app:app -w 1 -k uvicorn.workers.UvicornWorker
+
 FEATURES:
 ✅ OpenAI Realtime API for end-to-end audio processing
 ✅ Twilio Media Streams integration
@@ -1388,12 +1394,13 @@ async def handle_media_stream(websocket: WebSocket):
             # Run both tasks concurrently
             await asyncio.gather(receive_from_twilio(), send_to_twilio())
             
+    except websockets.exceptions.WebSocketException as e:
+        logger.error(f"WebSocket error: {e}", exc_info=True)
     except Exception as e:
         logger.error(f"WebSocket handler error: {e}", exc_info=True)
     finally:
         if call_sid:
             cleanup_call_resources(call_sid)
-        await websocket.close()
 
 async def send_session_update(openai_ws):
     """Send session configuration to OpenAI"""

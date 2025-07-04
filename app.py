@@ -1,25 +1,24 @@
 """
-ConvoReps OpenAI Realtime Edition - Production Ready v2.0
+ConvoReps FastAPI OpenAI Realtime Edition - Production Ready v3.0
 Real-time voice conversation practice with OpenAI Realtime API
 
-MAJOR FIXES IN v2.0:
-✅ Fixed WebSocket handling for Flask-Sock compatibility
-✅ Proper async/sync bridge implementation
-✅ Fixed all undefined variables and imports
-✅ Enhanced error recovery and retry logic
-✅ Thread-safe CSV operations with per-call transcripts
-✅ Improved memory management and cleanup
-✅ Fixed OpenAI function calling implementation
-✅ Better connection lifecycle management
-✅ Production-grade logging and monitoring
-✅ Comprehensive input validation
+Based on proven working implementation with FastAPI/uvicorn
+Includes all ConvoReps features:
+✅ OpenAI Realtime API with proper WebSocket handling
+✅ User tracking with CSV (minutes used/remaining)
+✅ SMS sending with deduplication
+✅ Function calling for time checking
+✅ Different conversation modes (cold_call, interview, small_talk)
+✅ Time limit enforcement with automatic SMS
+✅ Graceful shutdown and error handling
+✅ Health checks and metrics
+✅ Production-grade logging
 
 Author: ConvoReps Team
-Version: 2.0 (OpenAI Realtime Edition - Production Ready)
+Version: 3.0 (FastAPI OpenAI Realtime Edition)
 """
 
 import os
-import io
 import json
 import base64
 import asyncio
@@ -39,16 +38,17 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor
-from functools import wraps
 
-from flask import Flask, request, Response, session, send_from_directory
-from flask_cors import CORS
-from flask_sock import Sock, ConnectionClosed
+from fastapi import FastAPI, WebSocket, Request, HTTPException
+from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+from fastapi.websockets import WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Play, Pause, Stream
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client as TwilioClient
 from dotenv import load_dotenv
 import openai
+import uvicorn
 
 try:
     from pydub.generators import Sine
@@ -61,43 +61,22 @@ except ImportError:
 # Load environment variables
 load_dotenv()
 
-# Custom formatter for correlation IDs
-class CorrelationFormatter(logging.Formatter):
-    def format(self, record):
-        if not hasattr(record, 'correlation_id'):
-            record.correlation_id = getattr(record, 'correlation_id', 'NO-ID')
-        return super().format(record)
-
-# Initialize structured logging
-formatter = CorrelationFormatter(
-    '%(asctime)s - %(name)s - %(levelname)s - [%(correlation_id)s] - %(message)s'
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(correlation_id)s] - %(message)s'
 )
 
-file_handler = logging.FileHandler('convoreps_realtime.log')
-file_handler.setFormatter(formatter)
+# Custom formatter for correlation IDs
+class CorrelationLoggerAdapter(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        return '[%s] %s' % (self.extra.get('correlation_id', 'NO-ID'), msg), kwargs
 
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(formatter)
-
-root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)
-root_logger.handlers = []
-root_logger.addHandler(file_handler)
-root_logger.addHandler(console_handler)
+logger = logging.getLogger(__name__)
 
 # Silence noisy libraries
 logging.getLogger('websockets').setLevel(logging.WARNING)
 logging.getLogger('httpx').setLevel(logging.WARNING)
-
-logger = logging.getLogger(__name__)
-
-# Initialize Flask app
-app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "your-secret-key-here")
-CORS(app)
-
-# Initialize WebSocket support
-sock = Sock(app)
 
 # Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -116,6 +95,14 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 
+# Event types to log
+LOG_EVENT_TYPES = [
+    'response.content.done', 'rate_limits.updated', 'response.done',
+    'input_audio_buffer.committed', 'input_audio_buffer.speech_stopped',
+    'input_audio_buffer.speech_started', 'response.create', 'session.created',
+    'response.function_call_arguments.done', 'error'
+]
+
 # Initialize clients
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)
@@ -127,6 +114,18 @@ if not OPENAI_API_KEY:
 
 if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
     raise ValueError('Missing Twilio credentials. Please set them in the .env file.')
+
+# Initialize FastAPI app
+app = FastAPI(title="ConvoReps Realtime API", version="3.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Thread pool for async operations
 executor = ThreadPoolExecutor(max_workers=5)
@@ -144,6 +143,7 @@ mode_lock: Dict[str, str] = {}
 turn_count: Dict[str, int] = {}
 last_response_cache: Dict[str, str] = {}
 recording_urls: Dict[str, str] = {}
+active_sessions: Dict[str, bool] = {}  # Track active sessions
 
 # Metrics tracking
 metrics = {
@@ -253,28 +253,10 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# Error handling decorator
-def error_handler(f):
-    """Enhanced error handler with correlation ID"""
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        correlation_id = str(uuid.uuid4())
-        try:
-            return f(*args, **kwargs)
-        except Exception as e:
-            logger.error(f"Route error in {f.__name__}: {e}", 
-                        extra={'correlation_id': correlation_id},
-                        exc_info=True)
-            
-            response = VoiceResponse()
-            response.say("I'm sorry, I encountered an error. Please try again.")
-            response.hangup()
-            
-            with metrics_lock:
-                metrics['failed_calls'] += 1
-                
-            return str(response), 500
-    return wrapper
+# Initialize directories
+os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
+os.makedirs("static", exist_ok=True)
+os.makedirs(os.path.dirname(USAGE_CSV_PATH) or ".", exist_ok=True)
 
 # Validation functions
 def validate_phone_number(phone_number: str) -> bool:
@@ -300,11 +282,6 @@ def sanitize_csv_value(value: str) -> str:
     if value.strip().startswith(('=', '+', '-', '@')):
         value = "'" + value
     return value
-
-# Initialize directories
-os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
-os.makedirs("static", exist_ok=True)
-os.makedirs(os.path.dirname(USAGE_CSV_PATH) or ".", exist_ok=True)
 
 # CSV functions
 def init_csv():
@@ -430,7 +407,7 @@ def update_user_usage(phone_number: str, minutes_used: float):
                 create_csv_backup()
                 
     except Exception as e:
-        logger.error(f"Error updating CSV: {e}", exc_info=True)
+        logger.error(f"Error updating CSV: {e}")
 
 # Transcript management
 def get_transcript_path(call_sid: str) -> str:
@@ -471,8 +448,7 @@ async def send_sms_link(phone_number: str, is_first_call: bool = True):
         
         with state_lock:
             if sms_sent_flags.get(phone_number, False):
-                logger.info(f"SMS already sent to {phone_number}", 
-                          extra={'correlation_id': correlation_id})
+                logger.info(f"SMS already sent to {phone_number}")
                 return
             sms_sent_flags[phone_number] = True
         
@@ -493,29 +469,17 @@ async def send_sms_link(phone_number: str, is_first_call: bool = True):
             to=phone_number
         )
         
-        logger.info(f"SMS sent successfully to {phone_number}: {message.sid}", 
-                   extra={'correlation_id': correlation_id})
+        logger.info(f"SMS sent successfully to {phone_number}: {message.sid}")
         
         with metrics_lock:
             metrics['sms_sent'] += 1
             
     except Exception as e:
-        logger.error(f"SMS error: {e}", extra={'correlation_id': correlation_id})
+        logger.error(f"SMS error: {e}")
         with metrics_lock:
             metrics['sms_failed'] += 1
         with state_lock:
             sms_sent_flags[phone_number] = False
-
-def run_async_task(coro):
-    """Run async coroutine"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(coro)
-    except Exception as e:
-        logger.error(f"Async task error: {e}", exc_info=True)
-    finally:
-        loop.close()
 
 # Mode detection
 def detect_intent(text: str) -> str:
@@ -577,7 +541,6 @@ def get_personality_for_mode(call_sid: str, mode: str) -> Tuple[str, str, str]:
     if mode == "cold_call":
         with state_lock:
             if call_sid not in personality_memory:
-                import random
                 persona_name = random.choice(list(cold_call_personality_pool.keys()))
                 personality_memory[call_sid] = persona_name
             else:
@@ -618,68 +581,18 @@ def get_personality_for_mode(call_sid: str, mode: str) -> Tuple[str, str, str]:
 # Timer handling
 def handle_time_limit(call_sid: str, from_number: str):
     """Handle when free time limit is reached"""
-    correlation_id = str(uuid.uuid4())
-    logger.info(f"Time limit reached for {call_sid}", 
-               extra={'correlation_id': correlation_id})
+    logger.info(f"Time limit reached for {call_sid}")
     
-    # Update CSV immediately before playing message
+    # Update CSV immediately
     if call_sid in call_start_times:
         elapsed_minutes = (time.time() - call_start_times[call_sid]) / 60.0
         update_user_usage(from_number, elapsed_minutes)
-        logger.info(f"Updated usage for {from_number}: {elapsed_minutes:.2f} minutes", 
-                   extra={'correlation_id': correlation_id})
+        logger.info(f"Updated usage for {from_number}: {elapsed_minutes:.2f} minutes")
     
-    # Send end message through OpenAI WebSocket if still connected
-    if call_sid in active_streams:
-        openai_ws = active_streams[call_sid].get('openai_ws')
-        if openai_ws:
-            asyncio.create_task(send_time_limit_message(openai_ws, call_sid, from_number))
-
-async def send_time_limit_message(openai_ws, call_sid: str, from_number: str):
-    """Send time limit message through OpenAI Realtime"""
-    try:
-        # Create a conversation item with the time limit message
-        message = (
-            "Alright, that's the end of your free call — but this is only the beginning. "
-            "We just texted you a link to ConvoReps.com. Whether you're prepping for interviews "
-            "or sharpening your pitch, this is how you level up — don't wait, your next opportunity is already calling."
-        )
-        
-        time_limit_item = {
-            "type": "conversation.item.create",
-            "event_id": f"time_limit_{call_sid[:8]}",
-            "item": {
-                "type": "message",
-                "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": f"Say exactly this to end the call: {message}"
-                    }
-                ]
-            }
-        }
-        
-        await openai_ws.send(json.dumps(time_limit_item))
-        
-        response_event = {
-            "type": "response.create",
-            "event_id": f"time_limit_response_{call_sid[:8]}"
-        }
-        await openai_ws.send(json.dumps(response_event))
-        
-        # Send SMS
-        usage_data = read_user_usage(from_number)
-        is_first_call = usage_data['total_calls'] <= 1
-        await send_sms_link(from_number, is_first_call=is_first_call)
-        
-        # Close connection after a delay
-        await asyncio.sleep(5)
-        if call_sid in active_streams:
-            cleanup_call_resources(call_sid)
-            
-    except Exception as e:
-        logger.error(f"Error sending time limit message: {e}")
+    # Mark session for time limit message
+    with state_lock:
+        if call_sid in active_sessions:
+            active_sessions[call_sid] = False
 
 def cleanup_call_resources(call_sid: str):
     """Clean up call resources"""
@@ -700,8 +613,7 @@ def cleanup_call_resources(call_sid: str):
                     usage_after = read_user_usage(from_number)
                     if usage_after['minutes_left'] <= 0.5:
                         is_first_call = usage_after['total_calls'] <= 1
-                        executor.submit(run_async_task, 
-                                      send_sms_link(from_number, is_first_call=is_first_call))
+                        asyncio.create_task(send_sms_link(from_number, is_first_call=is_first_call))
                 
                 call_start_times.pop(call_sid, None)
             
@@ -710,24 +622,12 @@ def cleanup_call_resources(call_sid: str):
                 call_timers[call_sid].cancel()
                 call_timers.pop(call_sid, None)
             
-            # Close WebSockets
-            if 'openai_ws' in active_streams[call_sid]:
-                try:
-                    asyncio.create_task(active_streams[call_sid]['openai_ws'].close())
-                except:
-                    pass
-            
-            if 'twilio_ws' in active_streams[call_sid]:
-                try:
-                    active_streams[call_sid]['twilio_ws'].close()
-                except:
-                    pass
-            
             # Clean up transcript
             cleanup_transcript(call_sid)
             
             # Clean up state
             active_streams.pop(call_sid, None)
+            active_sessions.pop(call_sid, None)
             turn_count.pop(call_sid, None)
             conversation_transcripts.pop(call_sid, None)
             personality_memory.pop(call_sid, None)
@@ -773,45 +673,45 @@ def periodic_cleanup():
 cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
 cleanup_thread.start()
 
-# Twilio endpoints
-@app.route("/", methods=["GET"])
-def index_page():
+# HTTP endpoints
+@app.get("/", response_class=HTMLResponse)
+async def index_page():
     return "<html><body><h1>ConvoReps Realtime Server is running!</h1></body></html>"
 
-@app.route("/voice", methods=["POST", "GET"])
-@error_handler
-def handle_incoming_call():
-    """Handle incoming call and return TwiML response"""
+@app.api_route("/incoming-call", methods=["GET", "POST"])
+async def handle_incoming_call(request: Request):
+    """Handle incoming call and return TwiML response to connect to Media Stream."""
     correlation_id = str(uuid.uuid4())
+    logger.info(f"Received incoming call request from: {request.client.host}")
+    
+    # Get form data
+    form_data = await request.form()
     
     # Security validation
     if TWILIO_AUTH_TOKEN:
-        url = request.url
-        params = request.values
+        url = str(request.url)
+        params = dict(form_data)
         signature = request.headers.get('X-Twilio-Signature', '')
         
         if not twilio_validator.validate(url, params, signature):
-            logger.warning("Invalid Twilio signature", 
-                         extra={'correlation_id': correlation_id})
+            logger.warning("Invalid Twilio signature")
             response = VoiceResponse()
             response.reject()
-            return str(response), 403
+            return PlainTextResponse(content=str(response), media_type="application/xml")
     
     # Get parameters
-    call_sid = request.values.get("CallSid")
-    from_number = request.values.get("From", "+10000000000")
-    recording_url = request.values.get("RecordingUrl")
+    call_sid = form_data.get("CallSid")
+    from_number = form_data.get("From", "+10000000000")
+    recording_url = form_data.get("RecordingUrl")
     
     if not validate_call_sid(call_sid):
-        logger.error(f"Invalid CallSid: {call_sid}", 
-                    extra={'correlation_id': correlation_id})
+        logger.error(f"Invalid CallSid: {call_sid}")
         response = VoiceResponse()
         response.say("Sorry, there was an error processing your call.")
         response.hangup()
-        return str(response)
+        return PlainTextResponse(content=str(response), media_type="application/xml")
     
-    logger.info(f"New call: {call_sid} from {from_number}", 
-               extra={'correlation_id': correlation_id})
+    logger.info(f"New call: {call_sid} from {from_number}")
     
     # Store recording URL if provided
     if recording_url:
@@ -820,12 +720,11 @@ def handle_incoming_call():
             
     # Validate phone number
     if not validate_phone_number(from_number):
-        logger.error(f"Invalid phone number: {from_number}", 
-                    extra={'correlation_id': correlation_id})
+        logger.error(f"Invalid phone number: {from_number}")
         response = VoiceResponse()
         response.say("Sorry, we couldn't validate your phone number.")
         response.hangup()
-        return str(response)
+        return PlainTextResponse(content=str(response), media_type="application/xml")
     
     # Check free minutes
     usage_data = read_user_usage(from_number)
@@ -843,9 +742,9 @@ def handle_incoming_call():
         )
         response.hangup()
         
-        executor.submit(run_async_task, send_sms_link(from_number, is_first_call=False))
+        asyncio.create_task(send_sms_link(from_number, is_first_call=False))
         
-        return str(response)
+        return PlainTextResponse(content=str(response), media_type="application/xml")
     
     # Initialize call state
     with state_lock:
@@ -853,8 +752,16 @@ def handle_incoming_call():
             turn_count[call_sid] = 0
             call_start_times[call_sid] = time.time()
             conversation_transcripts[call_sid] = []
-            logger.info(f"User has {minutes_left:.2f} minutes remaining", 
-                       extra={'correlation_id': correlation_id})
+            active_sessions[call_sid] = True
+            logger.info(f"User has {minutes_left:.2f} minutes remaining")
+            
+            # Store call data for WebSocket
+            active_streams[call_sid] = {
+                'from_number': from_number,
+                'minutes_left': minutes_left,
+                'last_activity': time.time(),
+                'correlation_id': correlation_id
+            }
         else:
             turn_count[call_sid] += 1
             
@@ -866,22 +773,16 @@ def handle_incoming_call():
     
     # Play greeting with beep
     if turn_count.get(call_sid, 0) == 0:
-        # Check session for first-time caller status
-        has_called_session = session.get("has_called_before", False)
-        
-        if not has_called_session and not is_repeat_caller:
-            session["has_called_before"] = True
+        if not is_repeat_caller:
             greeting_file = "first_time_greeting.mp3"
-            logger.info("New caller detected — playing first-time greeting", 
-                       extra={'correlation_id': correlation_id})
+            logger.info("New caller detected — playing first-time greeting")
         else:
             greeting_file = "returning_user_greeting.mp3"
-            logger.info("Returning caller — playing returning greeting", 
-                       extra={'correlation_id': correlation_id})
+            logger.info("Returning caller — playing returning greeting")
         
         # Play greeting if file exists
         if os.path.exists(f"static/{greeting_file}"):
-            response.play(f"{request.url_root}static/{greeting_file}")
+            response.play(f"/static/{greeting_file}")
         else:
             # Fallback TTS greeting
             if greeting_file == "first_time_greeting.mp3":
@@ -891,29 +792,16 @@ def handle_incoming_call():
         
         # Play beep sound
         if os.path.exists("static/beep.mp3"):
-            response.play(f"{request.url_root}static/beep.mp3")
+            response.play("/static/beep.mp3")
         response.pause(length=1)
     
     # Connect to WebSocket stream
-    host = request.headers.get('X-Forwarded-Host', request.headers.get('Host', request.url_root.replace('http://', '').replace('https://', '').rstrip('/')))
-    ws_scheme = "wss" if request.is_secure else "ws"
-    stream_url = f"{ws_scheme}://{host}/media-stream"
-    
-    logger.info(f"Stream URL: {stream_url}", extra={'correlation_id': correlation_id})
+    host = request.url.hostname
+    ws_scheme = "wss" if request.url.scheme == "https" else "ws"
     
     connect = Connect()
-    stream = Stream(
-        url=stream_url,
-        track="inbound_track"
-    )
-    
-    # Add custom parameters
+    stream = connect.stream(url=f'{ws_scheme}://{host}/media-stream')
     stream.parameter(name="call_sid", value=call_sid)
-    stream.parameter(name="from_number", value=from_number)
-    stream.parameter(name="minutes_left", value=str(minutes_left))
-    stream.parameter(name="correlation_id", value=correlation_id)
-    
-    connect.append(stream)
     response.append(connect)
     
     # Fallback TwiML
@@ -923,8 +811,7 @@ def handle_incoming_call():
     
     # Set up timer
     timer_duration = minutes_left * 60 if minutes_left < FREE_CALL_MINUTES else FREE_CALL_MINUTES * 60
-    logger.info(f"Setting timer for {timer_duration:.0f} seconds", 
-               extra={'correlation_id': correlation_id})
+    logger.info(f"Setting timer for {timer_duration:.0f} seconds")
     
     timer = threading.Timer(timer_duration, lambda: handle_time_limit(call_sid, from_number))
     timer.start()
@@ -932,219 +819,130 @@ def handle_incoming_call():
     with state_lock:
         call_timers[call_sid] = timer
     
-    return str(response)
+    logger.info("Successfully created the TwiML response")
+    return PlainTextResponse(content=str(response), media_type="application/xml")
 
-@sock.route('/media-stream')
-def handle_media_stream(ws):
-    """Handle WebSocket connection between Twilio and OpenAI Realtime"""
+@app.websocket("/media-stream")
+async def handle_media_stream(websocket: WebSocket):
+    """Handle WebSocket connections between Twilio and OpenAI."""
+    await websocket.accept()
     logger.info("Client connected to media stream")
     
-    # Check connection limit
-    with state_lock:
-        if len(active_streams) >= MAX_WEBSOCKET_CONNECTIONS:
-            logger.warning("Maximum WebSocket connections reached")
-            ws.close()
-            return
-    
-    # Run the async handler
-    ws_start_time = time.time()
-    try:
-        asyncio.run(handle_media_stream_async(ws))
-    except Exception as e:
-        logger.error(f"WebSocket handler error: {e}", exc_info=True)
-        with metrics_lock:
-            metrics['websocket_errors'] += 1
-    finally:
-        # Track WebSocket duration
-        ws_duration = time.time() - ws_start_time
-        with metrics_lock:
-            metrics['websocket_duration_sum'] += ws_duration
-            metrics['websocket_count'] += 1
-
-async def handle_media_stream_async(ws):
-    """Async handler for WebSocket connection"""
+    # Connection-specific state
     stream_sid = None
     call_sid = None
-    from_number = None
-    minutes_left = FREE_CALL_MINUTES
-    correlation_id = None
     openai_ws = None
     latest_media_timestamp = 0
-    response_start_timestamp_twilio = None
-    mark_queue = []
     last_assistant_item = None
+    mark_queue = []
+    response_start_timestamp_twilio = None
     
     try:
         # Connect to OpenAI Realtime API
-        openai_url = f'wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}'
         async with websockets.connect(
-            openai_url,
-            additional_headers={
+            f'wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}',
+            extra_headers={
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
                 "OpenAI-Beta": "realtime=v1"
-            },
-            ping_interval=20,
-            ping_timeout=10
+            }
         ) as openai_ws:
             
-            # Send initial session configuration
-            await send_session_update(openai_ws)
-            
             async def receive_from_twilio():
-                """Receive audio from Twilio and forward to OpenAI"""
-                nonlocal stream_sid, call_sid, from_number, minutes_left, correlation_id, latest_media_timestamp
-                
+                """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
+                nonlocal stream_sid, latest_media_timestamp, call_sid
                 try:
-                    while True:
-                        # Receive message from Twilio WebSocket with timeout
-                        try:
-                            message = await asyncio.get_event_loop().run_in_executor(
-                                None, ws.receive, 1.0
-                            )
-                            if message is None:
-                                continue
-                        except Exception as e:
-                            if "timeout" in str(e).lower():
-                                continue
-                            else:
-                                logger.error(f"WebSocket receive error: {e}")
-                                break
-                                
-                        try:
-                            data = json.loads(message)
-                        except json.JSONDecodeError:
-                            logger.error("Invalid JSON received from Twilio")
-                            continue
+                    async for message in websocket.iter_text():
+                        data = json.loads(message)
                         
                         if data['event'] == 'start':
-                            # Extract stream data
-                            start_data = data.get('start', {})
-                            stream_sid = start_data.get('streamSid')
+                            stream_sid = data['start']['streamSid']
+                            # Get call_sid from custom parameters
+                            call_sid = data['start'].get('customParameters', {}).get('call_sid')
                             
-                            # Extract custom parameters
-                            custom_params = start_data.get('customParameters', {})
-                            call_sid = custom_params.get('call_sid')
-                            from_number = custom_params.get('from_number')
-                            minutes_left = float(custom_params.get('minutes_left', FREE_CALL_MINUTES))
-                            correlation_id = custom_params.get('correlation_id')
+                            logger.info(f"Incoming stream started: {stream_sid}, Call: {call_sid}")
                             
-                            logger.info(f"Stream started - CallSid: {call_sid}, StreamSid: {stream_sid}", 
-                                       extra={'correlation_id': correlation_id})
+                            # Send session update with appropriate personality
+                            await send_session_update(openai_ws, call_sid)
                             
-                            with state_lock:
-                                active_streams[call_sid] = {
-                                    'stream_sid': stream_sid,
-                                    'from_number': from_number,
-                                    'minutes_left': minutes_left,
-                                    'last_activity': time.time(),
-                                    'correlation_id': correlation_id,
-                                    'openai_ws': openai_ws,
-                                    'twilio_ws': ws
-                                }
-                                
-                            # Send initial greeting
-                            await send_initial_conversation_item(openai_ws, call_sid)
-                        
+                            # Update stream data
+                            if call_sid and call_sid in active_streams:
+                                active_streams[call_sid]['stream_sid'] = stream_sid
+                                active_streams[call_sid]['last_activity'] = time.time()
+                            
+                            latest_media_timestamp = 0
+                            
                         elif data['event'] == 'media' and openai_ws.open:
                             latest_media_timestamp = int(data['media']['timestamp'])
                             
                             # Update activity
-                            if call_sid in active_streams:
+                            if call_sid and call_sid in active_streams:
                                 active_streams[call_sid]['last_activity'] = time.time()
                             
-                            # Forward audio to OpenAI
+                            # Check if time limit reached
+                            if call_sid and call_sid in active_sessions and not active_sessions[call_sid]:
+                                # Time limit reached, send final message
+                                await send_time_limit_message(openai_ws, call_sid)
+                                active_sessions[call_sid] = None  # Mark as handled
+                                return
+                            
                             audio_append = {
                                 "type": "input_audio_buffer.append",
                                 "audio": data['media']['payload']
                             }
                             await openai_ws.send(json.dumps(audio_append))
                             
-                            # Periodic garbage collection
-                            if latest_media_timestamp % 30000 == 0:
-                                gc.collect()
-                        
                         elif data['event'] == 'mark':
                             # Mark event from Twilio
                             if mark_queue:
                                 mark_queue.pop(0)
-                        
-                        elif data['event'] == 'dtmf':
-                            # Handle DTMF tones
-                            dtmf_data = data.get('dtmf', {})
-                            digit = dtmf_data.get('digit')
-                            logger.info(f"DTMF received: {digit}", 
-                                       extra={'correlation_id': correlation_id})
-                            
-                            if digit == '#':
-                                await handle_reset(openai_ws, call_sid)
-                            elif digit == '*':
-                                await repeat_last_response(openai_ws, call_sid)
-                        
+                                
                         elif data['event'] == 'stop':
-                            logger.info(f"Stream stopped - CallSid: {call_sid}", 
-                                       extra={'correlation_id': correlation_id})
+                            logger.info(f"Stream stopped: {stream_sid}")
                             break
-                            
-                except (ConnectionClosed, OSError) as e:
-                    logger.info(f"Client disconnected: {e}")
+
+                except WebSocketDisconnect:
+                    logger.info("Client disconnected.")
+                    if openai_ws.open:
+                        await openai_ws.close()
                 except Exception as e:
-                    logger.error(f"Error in receive_from_twilio: {e}", exc_info=True)
-                finally:
-                    logger.info("Connection closed.")
-            
+                    logger.error(f"Error in receive_from_twilio: {e}")
+                    
             async def send_to_twilio():
-                """Receive from OpenAI and forward to Twilio"""
-                nonlocal response_start_timestamp_twilio, last_assistant_item
-                
+                """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
+                nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio, call_sid
                 try:
                     async for openai_message in openai_ws:
                         response = json.loads(openai_message)
-                        
-                        # Log important events
-                        if response.get('type') in ['response.content.done', 'rate_limits.updated', 
-                                                    'response.done', 'input_audio_buffer.committed',
-                                                    'input_audio_buffer.speech_stopped', 
-                                                    'input_audio_buffer.speech_started',
-                                                    'response.create', 'session.created']:
+
+                        if response['type'] in LOG_EVENT_TYPES:
                             logger.info(f"Received event: {response['type']}")
-                        
+
                         # Handle session created
                         if response.get('type') == 'session.created':
-                            logger.info(f"Session created successfully", 
-                                      extra={'correlation_id': correlation_id})
-                        
-                        # Handle audio delta
+                            logger.info("Session created successfully")
+                            
+                        # When we get audio from the assistant
                         elif response.get('type') == 'response.audio.delta' and 'delta' in response:
-                            # Forward audio to Twilio
+                            audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
                             audio_delta = {
                                 "event": "media",
                                 "streamSid": stream_sid,
                                 "media": {
-                                    "payload": response['delta']
+                                    "payload": audio_payload
                                 }
                             }
-                            await asyncio.get_event_loop().run_in_executor(
-                                None, ws.send, json.dumps(audio_delta)
-                            )
-                            
+                            await websocket.send_json(audio_delta)
+
                             if response_start_timestamp_twilio is None:
                                 response_start_timestamp_twilio = latest_media_timestamp
-                            
-                            # Update last assistant item
+
+                            # Update last_assistant_item
                             if response.get('item_id'):
                                 last_assistant_item = response['item_id']
-                            
-                            await send_mark(ws, stream_sid)
-                        
-                        # Handle rate limits
-                        elif response.get('type') == 'rate_limits.updated':
-                            rate_limits = response.get('rate_limits', [])
-                            for limit in rate_limits:
-                                logger.warning(f"Rate limit update - Name: {limit.get('name')}, "
-                                             f"Remaining: {limit.get('remaining')}, "
-                                             f"Reset: {limit.get('reset_seconds')}")
-                        
-                        # Handle response done
+
+                            await send_mark(websocket, stream_sid)
+
+                        # Handle response done - log transcripts
                         elif response.get('type') == 'response.done':
                             # Parse and log transcripts
                             if 'response' in response and 'output' in response['response']:
@@ -1155,10 +953,11 @@ async def handle_media_stream_async(ws):
                                     for c in content:
                                         if c.get('type') == 'audio' and 'transcript' in c:
                                             # Append to CSV
-                                            append_transcript_to_csv(role, c['transcript'], call_sid)
+                                            if call_sid:
+                                                append_transcript_to_csv(role, c['transcript'], call_sid)
                                             
                                             # Store in memory
-                                            if call_sid in conversation_transcripts:
+                                            if call_sid and call_sid in conversation_transcripts:
                                                 conversation_transcripts[call_sid].append({
                                                     'role': role,
                                                     'content': c['transcript'],
@@ -1177,29 +976,29 @@ async def handle_media_stream_async(ws):
                             response_start_timestamp_twilio = None
                             
                             # Check for interview mode
-                            mode = mode_lock.get(call_sid, "cold_call")
-                            if mode == "interview" and call_sid in interview_question_index:
-                                # Advance to next question
-                                interview_question_index[call_sid] = (
-                                    interview_question_index.get(call_sid, 0) + 1
-                                ) % len(interview_questions)
-                                
-                                # Update session with next question
-                                voice, base_prompt, _ = get_personality_for_mode(call_sid, "interview")
-                                current_q_idx = interview_question_index[call_sid]
-                                if current_q_idx < len(interview_questions):
-                                    system_prompt = base_prompt + f"\n\nAsk this question next: {interview_questions[current_q_idx]}"
+                            if call_sid:
+                                mode = mode_lock.get(call_sid, "cold_call")
+                                if mode == "interview" and call_sid in interview_question_index:
+                                    # Advance to next question
+                                    interview_question_index[call_sid] = (
+                                        interview_question_index.get(call_sid, 0) + 1
+                                    ) % len(interview_questions)
                                     
-                                    update_event = {
-                                        "type": "session.update",
-                                        "event_id": f"interview_q{current_q_idx}_{call_sid[:8]}",
-                                        "session": {
-                                            "voice": voice,
-                                            "instructions": system_prompt
+                                    # Update session with next question
+                                    voice, base_prompt, _ = get_personality_for_mode(call_sid, "interview")
+                                    current_q_idx = interview_question_index[call_sid]
+                                    if current_q_idx < len(interview_questions):
+                                        system_prompt = base_prompt + f"\n\nAsk this question next: {interview_questions[current_q_idx]}"
+                                        
+                                        update_event = {
+                                            "type": "session.update",
+                                            "session": {
+                                                "voice": voice,
+                                                "instructions": system_prompt
+                                            }
                                         }
-                                    }
-                                    await openai_ws.send(json.dumps(update_event))
-                        
+                                        await openai_ws.send(json.dumps(update_event))
+
                         # Handle user speech transcription
                         elif response.get('type') == 'conversation.item.input_audio_transcription.completed':
                             transcript = response.get('transcript', '')
@@ -1249,20 +1048,14 @@ async def handle_media_stream_async(ws):
                                         voice, system_prompt, _ = get_personality_for_mode(call_sid, mode)
                                         system_prompt = add_bad_news_context(system_prompt, transcript)
                                         await update_session_for_mode(openai_ws, voice, system_prompt)
-                        
-                        # Handle speech started - interruption
+
+                        # If user speech starts, we can interrupt the assistant
                         elif response.get('type') == 'input_audio_buffer.speech_started':
-                            logger.info("Speech started detected")
+                            logger.info("Speech started detected.")
                             if last_assistant_item:
                                 logger.info(f"Interrupting response with id: {last_assistant_item}")
-                                new_timestamp, new_item = await handle_speech_started_event(
-                                    openai_ws, ws, stream_sid, 
-                                    response_start_timestamp_twilio, latest_media_timestamp,
-                                    last_assistant_item, mark_queue
-                                )
-                                response_start_timestamp_twilio = new_timestamp
-                                last_assistant_item = new_item
-                        
+                                await handle_speech_started_event()
+                                
                         # Handle function calls
                         elif response.get('type') in ['response.function_call_arguments.done', 'response.done']:
                             if response.get('type') == 'response.done':
@@ -1271,68 +1064,162 @@ async def handle_media_stream_async(ws):
                                 for output in outputs:
                                     if output.get('type') == 'function_call':
                                         await handle_function_call_from_response(
-                                            output, openai_ws, call_sid,
-                                            call_start_times.get(call_sid), minutes_left
+                                            output, openai_ws, call_sid
                                         )
                             else:
                                 # Direct function_call_arguments.done event
-                                await handle_function_call(response, openai_ws, call_sid, 
-                                                         call_start_times.get(call_sid), minutes_left)
-                        
+                                await handle_function_call(response, openai_ws, call_sid)
+                                
+                        # Handle errors
                         elif response.get('type') == 'error':
-                            error_code = response.get('code')
-                            error_message = response.get('message')
-                            error_event_id = response.get('event_id')
-                            
-                            logger.error(f"OpenAI error - Code: {error_code}, Message: {error_message}, Event ID: {error_event_id}")
-                            
-                            if error_event_id:
-                                logger.error(f"Error caused by event: {error_event_id}")
-                            
+                            error_msg = response.get('error', {}).get('message', 'Unknown error')
+                            logger.error(f"OpenAI error: {error_msg}")
                             with metrics_lock:
                                 metrics['api_errors'] += 1
-                                
+
+                except WebSocketDisconnect:
+                    logger.info("WebSocket to Twilio closed.")
                 except Exception as e:
-                    logger.error(f"Error in send_to_twilio: {e}", exc_info=True)
-            
+                    logger.error(f"Error in send_to_twilio: {e}")
+
+            async def handle_speech_started_event():
+                """Handle interruption when the caller's speech starts."""
+                nonlocal response_start_timestamp_twilio, last_assistant_item
+                logger.info("Handling speech started event.")
+                if mark_queue and response_start_timestamp_twilio is not None:
+                    elapsed_time = latest_media_timestamp - response_start_timestamp_twilio
+                    logger.info(f"Truncating at {elapsed_time}ms")
+
+                    if last_assistant_item:
+                        truncate_event = {
+                            "type": "conversation.item.truncate",
+                            "item_id": last_assistant_item,
+                            "content_index": 0,
+                            "audio_end_ms": elapsed_time
+                        }
+                        await openai_ws.send(json.dumps(truncate_event))
+
+                    await websocket.send_json({
+                        "event": "clear",
+                        "streamSid": stream_sid
+                    })
+
+                    mark_queue.clear()
+                    last_assistant_item = None
+                    response_start_timestamp_twilio = None
+
             async def send_mark(connection, sid):
-                """Send mark event to track audio chunks"""
                 if sid:
                     mark_event = {
                         "event": "mark",
                         "streamSid": sid,
                         "mark": {"name": "responsePart"}
                     }
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, connection.send, json.dumps(mark_event)
-                    )
+                    await connection.send_json(mark_event)
                     mark_queue.append('responsePart')
-                    
-                    # Limit mark queue size
-                    if len(mark_queue) > 100:
-                        mark_queue[:50] = []
-            
+
+            async def handle_function_call(response: dict, openai_ws, call_sid: str):
+                """Handle function call from OpenAI"""
+                function_name = response.get('name')
+                call_id = response.get('call_id')
+                
+                if function_name == 'check_remaining_time' and call_sid:
+                    # Calculate remaining time
+                    if call_sid in call_start_times:
+                        elapsed_minutes = (time.time() - call_start_times[call_sid]) / 60.0
+                        minutes_left = active_streams[call_sid].get('minutes_left', FREE_CALL_MINUTES)
+                        remaining = max(0, minutes_left - elapsed_minutes)
+                        
+                        # Create function output
+                        function_output = {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": json.dumps({
+                                    "minutes_remaining": round(remaining, 1)
+                                })
+                            }
+                        }
+                        
+                        await openai_ws.send(json.dumps(function_output))
+                        
+                        # Trigger response
+                        await openai_ws.send(json.dumps({"type": "response.create"}))
+                        
+                        with metrics_lock:
+                            metrics['tool_calls_made'] += 1
+                            
+                        # Check if time is exhausted
+                        if remaining <= MIN_CALL_DURATION:
+                            logger.info(f"Tool detected time exhausted for {call_sid}")
+                            handle_time_limit(call_sid, active_streams[call_sid].get('from_number'))
+
+            async def handle_function_call_from_response(output: dict, openai_ws, call_sid: str):
+                """Handle function call from response.done event output"""
+                function_name = output.get('name')
+                call_id = output.get('call_id')
+                
+                if function_name == 'check_remaining_time' and call_sid:
+                    await handle_function_call({'name': function_name, 'call_id': call_id}, openai_ws, call_sid)
+
+            async def send_time_limit_message(openai_ws, call_sid: str):
+                """Send time limit message through OpenAI"""
+                message = (
+                    "Alright, that's the end of your free call — but this is only the beginning. "
+                    "We just texted you a link to ConvoReps.com. Whether you're prepping for interviews "
+                    "or sharpening your pitch, this is how you level up — don't wait, your next opportunity is already calling."
+                )
+                
+                time_limit_item = {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": f"Say exactly this to end the call: {message}"
+                            }
+                        ]
+                    }
+                }
+                
+                await openai_ws.send(json.dumps(time_limit_item))
+                await openai_ws.send(json.dumps({"type": "response.create"}))
+                
+                # Send SMS
+                if call_sid in active_streams:
+                    from_number = active_streams[call_sid].get('from_number')
+                    if from_number:
+                        usage_data = read_user_usage(from_number)
+                        is_first_call = usage_data['total_calls'] <= 1
+                        await send_sms_link(from_number, is_first_call=is_first_call)
+                
+                # Schedule cleanup
+                await asyncio.sleep(5)
+                cleanup_call_resources(call_sid)
+
             # Run both tasks concurrently
             await asyncio.gather(receive_from_twilio(), send_to_twilio())
-            
+
     except Exception as e:
-        logger.error(f"WebSocket handler error: {e}", exc_info=True)
+        logger.error(f"WebSocket error: {e}")
+        with metrics_lock:
+            metrics['websocket_errors'] += 1
     finally:
         if call_sid:
             cleanup_call_resources(call_sid)
-        try:
-            ws.close()
-        except:
-            pass
+        logger.info("WebSocket connection closed")
 
-async def send_session_update(openai_ws):
-    """Send session configuration to OpenAI"""
-    # Default to cold call personality
-    voice, system_prompt, _ = get_personality_for_mode("", "cold_call")
+async def send_session_update(openai_ws, call_sid: str = None):
+    """Send session update to OpenAI WebSocket."""
+    # Get personality for mode
+    mode = mode_lock.get(call_sid, "cold_call") if call_sid else "cold_call"
+    voice, system_prompt, greeting = get_personality_for_mode(call_sid or "", mode)
     
     session_update = {
         "type": "session.update",
-        "event_id": f"session_update_{uuid.uuid4().hex[:8]}",
         "session": {
             "turn_detection": {"type": "server_vad"},
             "input_audio_format": "g711_ulaw",
@@ -1356,19 +1243,16 @@ async def send_session_update(openai_ws):
             "tool_choice": "auto"
         }
     }
-    
-    logger.info(f"Sending session update with voice: {voice}")
+    logger.info(f'Sending session update with voice: {voice}')
     await openai_ws.send(json.dumps(session_update))
-
-async def send_initial_conversation_item(openai_ws, call_sid: str):
-    """Send initial greeting to start conversation"""
-    # Get appropriate greeting based on mode
-    mode = mode_lock.get(call_sid, "cold_call")
-    _, _, greeting = get_personality_for_mode(call_sid, mode)
     
+    # Send initial greeting
+    await send_initial_conversation_item(openai_ws, greeting)
+
+async def send_initial_conversation_item(openai_ws, greeting: str):
+    """Send initial conversation item to start the conversation."""
     initial_conversation_item = {
         "type": "conversation.item.create",
-        "event_id": f"initial_greeting_{call_sid[:8]}",
         "item": {
             "type": "message",
             "role": "user",
@@ -1381,18 +1265,12 @@ async def send_initial_conversation_item(openai_ws, call_sid: str):
         }
     }
     await openai_ws.send(json.dumps(initial_conversation_item))
-    
-    response_create = {
-        "type": "response.create",
-        "event_id": f"initial_response_{call_sid[:8]}"
-    }
-    await openai_ws.send(json.dumps(response_create))
+    await openai_ws.send(json.dumps({"type": "response.create"}))
 
 async def update_session_for_mode(openai_ws, voice: str, system_prompt: str):
     """Update session with new voice and instructions"""
     session_update = {
         "type": "session.update",
-        "event_id": f"mode_update_{uuid.uuid4().hex[:8]}",
         "session": {
             "voice": voice,
             "instructions": system_prompt
@@ -1400,234 +1278,9 @@ async def update_session_for_mode(openai_ws, voice: str, system_prompt: str):
     }
     await openai_ws.send(json.dumps(session_update))
 
-async def handle_speech_started_event(openai_ws, twilio_ws, stream_sid: str, 
-                                    response_start_timestamp: int, latest_timestamp: int,
-                                    last_assistant_item: str, mark_queue: list):
-    """Handle interruption when user starts speaking"""
-    logger.info("Handling speech started event")
-    
-    if mark_queue and response_start_timestamp is not None:
-        elapsed_time = latest_timestamp - response_start_timestamp
-        logger.info(f"Calculating elapsed time for truncation: {latest_timestamp} - {response_start_timestamp} = {elapsed_time}ms")
-        
-        if last_assistant_item:
-            logger.info(f"Truncating item with ID: {last_assistant_item}, Truncated at: {elapsed_time}ms")
-            
-            # Truncate the assistant's response
-            truncate_event = {
-                "type": "conversation.item.truncate",
-                "item_id": last_assistant_item,
-                "content_index": 0,
-                "audio_end_ms": elapsed_time
-            }
-            await openai_ws.send(json.dumps(truncate_event))
-        
-        # Clear Twilio's audio buffer
-        clear_event = {
-            "event": "clear",
-            "streamSid": stream_sid
-        }
-        await asyncio.get_event_loop().run_in_executor(
-            None, twilio_ws.send, json.dumps(clear_event)
-        )
-        
-        mark_queue.clear()
-        
-        # Reset timestamps
-        return None, None
-    
-    return response_start_timestamp, last_assistant_item
-
-async def handle_function_call(response: dict, openai_ws, call_sid: str, 
-                             call_start_time: float, minutes_left: float):
-    """Handle function call from OpenAI (function_call_arguments.done event)"""
-    function_name = response.get('name')
-    call_id = response.get('call_id')
-    
-    await process_function_call(function_name, call_id, None, openai_ws, 
-                              call_sid, call_start_time, minutes_left)
-
-async def handle_function_call_from_response(output: dict, openai_ws, call_sid: str,
-                                           call_start_time: float, minutes_left: float):
-    """Handle function call from response.done event output"""
-    function_name = output.get('name')
-    call_id = output.get('call_id')
-    arguments_str = output.get('arguments', '{}')
-    
-    await process_function_call(function_name, call_id, arguments_str, openai_ws,
-                              call_sid, call_start_time, minutes_left)
-
-async def process_function_call(function_name: str, call_id: str, arguments_str: str,
-                              openai_ws, call_sid: str, call_start_time: float, 
-                              minutes_left: float):
-    """Process function call and send result back to model"""
-    if function_name == 'check_remaining_time' and call_start_time:
-        # Calculate remaining time
-        elapsed_minutes = (time.time() - call_start_time) / 60.0
-        remaining = max(0, minutes_left - elapsed_minutes)
-        
-        # Create function output
-        function_output = {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": json.dumps({
-                    "minutes_remaining": round(remaining, 1)
-                })
-            }
-        }
-        
-        # Send with event_id for error tracking
-        function_output["event_id"] = f"func_output_{call_id}"
-        
-        await openai_ws.send(json.dumps(function_output))
-        
-        # Trigger response
-        response_event = {
-            "type": "response.create",
-            "event_id": f"func_response_{call_id}"
-        }
-        await openai_ws.send(json.dumps(response_event))
-        
-        with metrics_lock:
-            metrics['tool_calls_made'] += 1
-            
-        # Check if time is exhausted
-        if remaining <= MIN_CALL_DURATION:
-            logger.info(f"Tool detected time exhausted for {call_sid}")
-            if call_sid in call_timers:
-                call_timers[call_sid].cancel()
-                call_timers.pop(call_sid, None)
-            
-            # Update usage immediately
-            update_user_usage(active_streams[call_sid].get('from_number'), elapsed_minutes)
-            
-            # Trigger end flow
-            from_number = active_streams[call_sid].get('from_number')
-            if from_number:
-                asyncio.create_task(send_time_limit_message(openai_ws, call_sid, from_number))
-
-async def handle_reset(openai_ws, call_sid: str):
-    """Handle conversation reset via DTMF #"""
-    logger.info("Reset triggered by user")
-    
-    with state_lock:
-        conversation_transcripts.pop(call_sid, None)
-        personality_memory.pop(call_sid, None)
-        mode_lock.pop(call_sid, None)
-        turn_count[call_sid] = 0
-        interview_question_index.pop(call_sid, None)
-        last_response_cache.pop(call_sid, None)
-    
-    reset_message = "Alright, let's start fresh. What would you like to practice?"
-    
-    reset_item = {
-        "type": "conversation.item.create",
-        "event_id": f"reset_{call_sid[:8]}",
-        "item": {
-            "type": "message",
-            "role": "system",
-            "content": [
-                {
-                    "type": "input_text",
-                    "text": f"Reset the conversation and say: {reset_message}"
-                }
-            ]
-        }
-    }
-    await openai_ws.send(json.dumps(reset_item))
-    
-    response_event = {
-        "type": "response.create",
-        "event_id": f"reset_response_{call_sid[:8]}"
-    }
-    await openai_ws.send(json.dumps(response_event))
-
-async def repeat_last_response(openai_ws, call_sid: str):
-    """Repeat the last assistant response via DTMF *"""
-    # Check cache first
-    with state_lock:
-        cached_response = last_response_cache.get(call_sid)
-    
-    if cached_response:
-        repeat_item = {
-            "type": "conversation.item.create",
-            "event_id": f"repeat_{call_sid[:8]}",
-            "item": {
-                "type": "message",
-                "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": f"Repeat exactly: {cached_response}"
-                    }
-                ]
-            }
-        }
-        await openai_ws.send(json.dumps(repeat_item))
-        
-        response_event = {
-            "type": "response.create",
-            "event_id": f"repeat_response_{call_sid[:8]}"
-        }
-        await openai_ws.send(json.dumps(response_event))
-        return
-    
-    # Fall back to conversation history
-    if call_sid in conversation_transcripts:
-        messages = conversation_transcripts[call_sid]
-        for message in reversed(messages):
-            if message['role'] == 'assistant':
-                repeat_item = {
-                    "type": "conversation.item.create",
-                    "event_id": f"repeat_history_{call_sid[:8]}",
-                    "item": {
-                        "type": "message",
-                        "role": "system",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": f"Repeat exactly: {message['content']}"
-                            }
-                        ]
-                    }
-                }
-                await openai_ws.send(json.dumps(repeat_item))
-                
-                response_event = {
-                    "type": "response.create",
-                    "event_id": f"repeat_history_response_{call_sid[:8]}"
-                }
-                await openai_ws.send(json.dumps(response_event))
-                return
-    
-    # No previous response found
-    no_response_item = {
-        "type": "conversation.item.create",
-        "event_id": f"no_repeat_{call_sid[:8]}",
-        "item": {
-            "type": "message",
-            "role": "system",
-            "content": [
-                {
-                    "type": "input_text",
-                    "text": "Say: I don't have a previous response to repeat."
-                }
-            ]
-        }
-    }
-    await openai_ws.send(json.dumps(no_response_item))
-    
-    response_event = {
-        "type": "response.create",
-        "event_id": f"no_repeat_response_{call_sid[:8]}"
-    }
-    await openai_ws.send(json.dumps(response_event))
-
 # Health and monitoring endpoints
-@app.route("/health", methods=["GET"])
-def health_check():
+@app.get("/health")
+async def health_check():
     """Health check endpoint"""
     with state_lock:
         active_count = len(active_streams)
@@ -1644,12 +1297,12 @@ def health_check():
         "api_health": api_health,
         "websocket_health": ws_health,
         "memory_usage_mb": get_memory_usage(),
-        "version": "2.0-realtime",
+        "version": "3.0-fastapi-realtime",
         "realtime_model": OPENAI_REALTIME_MODEL
     }
 
-@app.route("/metrics", methods=["GET"])
-def metrics_endpoint():
+@app.get("/metrics")
+async def metrics_endpoint():
     """Detailed metrics endpoint"""
     with state_lock:
         active_count = len(active_streams)
@@ -1733,37 +1386,28 @@ def get_csv_statistics() -> Dict[str, Any]:
     except Exception as e:
         return {"error": str(e)}
 
-# Static file serving
-@app.route("/static/<path:filename>")
-def serve_static(filename):
-    """Serve static files securely"""
-    if '..' in filename or filename.startswith('/'):
-        return "Invalid filename", 400
-    return send_from_directory("static", filename)
-
-@app.route("/sms", methods=["GET", "POST"])
-def sms_webhook():
+@app.api_route("/sms", methods=["GET", "POST"])
+async def sms_webhook(request: Request):
     """Handle incoming SMS messages from Twilio"""
-    correlation_id = str(uuid.uuid4())
-    
     try:
+        # Get form data
+        form_data = await request.form()
+        
         # Security validation
         if TWILIO_AUTH_TOKEN:
-            url = request.url
-            params = request.values
+            url = str(request.url)
+            params = dict(form_data)
             signature = request.headers.get('X-Twilio-Signature', '')
             
             if not twilio_validator.validate(url, params, signature):
-                logger.warning("Invalid Twilio signature for SMS", 
-                             extra={'correlation_id': correlation_id})
-                return "", 403
+                logger.warning("Invalid Twilio signature for SMS")
+                return PlainTextResponse("", status_code=403)
         
-        from_number = request.values.get('From')
-        to_number = request.values.get('To')
-        body = request.values.get('Body', '').strip().lower()
+        from_number = form_data.get('From')
+        to_number = form_data.get('To')
+        body = form_data.get('Body', '').strip().lower()
         
-        logger.info(f"Incoming SMS from {from_number}: {body}", 
-                   extra={'correlation_id': correlation_id})
+        logger.info(f"Incoming SMS from {from_number}: {body}")
         
         response = VoiceResponse()
         
@@ -1784,20 +1428,21 @@ def sms_webhook():
                 "Visit convoreps.com for more info."
             )
         
-        return str(response)
+        return PlainTextResponse(content=str(response), media_type="application/xml")
         
     except Exception as e:
-        logger.error(f"SMS webhook error: {e}", 
-                    extra={'correlation_id': correlation_id},
-                    exc_info=True)
-        return "", 200
+        logger.error(f"SMS webhook error: {e}")
+        return PlainTextResponse("", status_code=200)
+
+# Serve static files
+from fastapi.staticfiles import StaticFiles
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 if __name__ == "__main__":
     # Generate beep sound if missing
     if not os.path.exists("static/beep.mp3") and PYDUB_AVAILABLE:
         logger.warning("beep.mp3 not found - generating")
         try:
-            # Generate a 1000Hz sine wave beep, 300ms duration
             beep = Sine(1000).to_audio_segment(duration=300).apply_gain(-6)
             beep.export("static/beep.mp3", format="mp3")
             logger.info("Generated beep.mp3")
@@ -1815,10 +1460,10 @@ if __name__ == "__main__":
     # Initial garbage collection
     gc.collect()
     
-    logger.info("\n🚀 ConvoReps OpenAI Realtime Edition v2.0")
-    logger.info("   ✅ OpenAI Realtime API for end-to-end audio")
-    logger.info("   ✅ Twilio Media Streams integration")
-    logger.info("   ✅ Flask-Sock WebSocket handling")
+    logger.info("\n🚀 ConvoReps FastAPI OpenAI Realtime Edition v3.0")
+    logger.info("   ✅ Based on proven working implementation")
+    logger.info("   ✅ FastAPI with native WebSocket support")
+    logger.info("   ✅ OpenAI Realtime API integration")
     logger.info("   ✅ User tracking and time limits")
     logger.info("   ✅ Function calling for time checking")
     logger.info("   ✅ SMS sending with deduplication")
@@ -1832,4 +1477,4 @@ if __name__ == "__main__":
     logger.info(f"   - Port: {PORT}")
     logger.info("\n")
     
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    uvicorn.run(app, host='0.0.0.0', port=PORT)

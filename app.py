@@ -74,7 +74,7 @@ OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-prev
 PORT = int(os.getenv('PORT', 5050))
 
 # ConvoReps specific configuration - FROM ORIGINAL APP.PY
-FREE_CALL_MINUTES = float(os.getenv("FREE_CALL_MINUTES", "5.0"))
+FREE_CALL_MINUTES = float(os.getenv("FREE_CALL_MINUTES", "3.0"))
 MIN_CALL_DURATION = float(os.getenv("MIN_CALL_DURATION", "0.5"))  # Minimum 30 seconds
 USAGE_CSV_PATH = os.getenv("USAGE_CSV_PATH", "user_usage.csv")
 USAGE_CSV_BACKUP_PATH = os.getenv("USAGE_CSV_BACKUP_PATH", "user_usage_backup.csv")

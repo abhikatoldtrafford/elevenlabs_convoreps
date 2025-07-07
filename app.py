@@ -1282,7 +1282,7 @@ async def handle_media_stream(websocket: WebSocket):
                 if from_number:
                     usage_data = read_user_usage(from_number)
                     is_first_call = usage_data['total_calls'] <= 1
-                    await send_convoreps_sms_link(from_number, is_first_call=is_first_call)
+                    send_convoreps_sms_link(from_number, is_first_call=is_first_call)
             
             # Schedule cleanup
             await asyncio.sleep(5)

@@ -523,33 +523,8 @@ def parse_sms_instructions_from_transcript():
         print(f"Error parsing SMS: {e}")
         return None, None
 
-def send_sms_via_twilio():
-    """Send SMS using Twilio"""
-    phone_number, sms_body = parse_sms_instructions_from_transcript()
-    if not phone_number or not sms_body:
-        print("No valid SMS instructions found. Not sending SMS.")
-        return
-        
-    print(f"Attempting to send SMS to: {phone_number}")
-    print(f"SMS Body: {sms_body}")
-    
-    try:
-        message = twilio_client.messages.create(
-            body=sms_body,
-            from_=TWILIO_PHONE_NUMBER,
-            to=phone_number,
-        )
-        print("Message sent successfully:", message.sid)
-        
-        with metrics_lock:
-            metrics['sms_sent'] += 1
-            
-    except Exception as e:
-        print(f"Error sending SMS via Twilio: {e}")
-        with metrics_lock:
-            metrics['sms_failed'] += 1
 
-async def send_convoreps_sms_link(phone_number: str, is_first_call: bool = True):
+def send_convoreps_sms_link(phone_number: str, is_first_call: bool = True):
     """Send ConvoReps specific SMS"""
     try:
         if not validate_phone_number(phone_number):
@@ -561,7 +536,7 @@ async def send_convoreps_sms_link(phone_number: str, is_first_call: bool = True)
                 return
             sms_sent_flags[phone_number] = True
         
-        # Use official message scripts
+        # Use official message scripts - EXACT WORDING
         if is_first_call:
             message_body = MESSAGE_SCRIPTS["sms_first_call"]
         else:
@@ -584,7 +559,6 @@ async def send_convoreps_sms_link(phone_number: str, is_first_call: bool = True)
             metrics['sms_failed'] += 1
         with state_lock:
             sms_sent_flags[phone_number] = False
-
 # Mode detection - Enhanced for better accuracy
 def detect_intent(text: str) -> str:
     """Detect conversation mode from text"""
@@ -760,7 +734,7 @@ def cleanup_call_resources(call_sid: str):
                         usage_after = read_user_usage(from_number)
                         if usage_after['minutes_left'] <= 0.5:
                             is_first_call = usage_after['total_calls'] <= 1
-                            asyncio.create_task(send_convoreps_sms_link(from_number, is_first_call=is_first_call))
+                            send_convoreps_sms_link(from_number, is_first_call=is_first_call)
                 
                 call_start_times.pop(call_sid, None)
             
@@ -837,7 +811,7 @@ async def handle_incoming_call(request: Request):
         )
         response.hangup()
         
-        asyncio.create_task(send_convoreps_sms_link(from_number, is_first_call=False))
+        send_convoreps_sms_link(from_number, is_first_call=False)
         
         return HTMLResponse(content=str(response), media_type="application/xml")
     
@@ -990,15 +964,34 @@ async def handle_media_stream(websocket: WebSocket):
                             mark_queue.pop(0)
 
             except WebSocketDisconnect:
-                print("Client disconnected.")
-                send_sms_via_twilio()
-                if os.path.exists(CSV_FILE_NAME):
-                    os.remove(CSV_FILE_NAME)
+                logger.info("Client disconnected (WebSocket closed)")
             except Exception as e:
                 logger.error(f"Error in WebSocket handling: {e}")
             finally:
-                logger.info("Connection closed. Triggering SMS.")
-                send_sms_via_twilio()
+                # Handle SMS and cleanup in finally block only (runs regardless of exception)
+                logger.info("Connection closed.")
+                
+                # Check if limit exceeded and send SMS
+                if call_sid and call_sid in active_streams:
+                    from_number = active_streams[call_sid].get('from_number')
+                    if from_number and call_sid in call_start_times:
+                        # Calculate actual call duration
+                        if call_sid not in processed_calls:
+                            call_duration = time.time() - call_start_times[call_sid]
+                            minutes_used = call_duration / 60.0
+                            
+                            if minutes_used > 0.01:
+                                update_user_usage(from_number, minutes_used)
+                                processed_calls.add(call_sid)
+                                
+                                # Check if SMS needed
+                                usage_data = read_user_usage(from_number)
+                                if usage_data['minutes_left'] <= 0.5:
+                                    is_first_call = usage_data['total_calls'] <= 1
+                                    send_convoreps_sms_link(from_number, is_first_call=is_first_call)
+                                    logger.info(f"SMS sent - minutes exhausted for {from_number}")
+                
+                # Clean up CSV file
                 if os.path.exists(CSV_FILE_NAME):
                     os.remove(CSV_FILE_NAME)
 

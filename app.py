@@ -1064,20 +1064,27 @@ async def handle_incoming_call(request: Request):
     usage_data = read_user_usage(from_number)
     is_repeat_caller = usage_data['total_calls'] > 0
     minutes_left = usage_data['minutes_left']
-    
-    # Require minimum call duration
-    if minutes_left < MIN_CALL_DURATION and is_repeat_caller:
+    if minutes_left < MIN_CALL_DURATION:  # Remove is_repeat_caller check here
         response = VoiceResponse()
-        response.say(
-            MESSAGE_SCRIPTS["voice_repeat_caller"],
-            voice="alice",
-            language="en-US"
-        )
+        if is_repeat_caller:
+            response.say(
+                MESSAGE_SCRIPTS["voice_repeat_caller"],
+                voice="alice",
+                language="en-US"
+            )
+        else:
+            response.say(
+                "Your free minutes have been used. We just texted you a link to continue.",
+                voice="alice",
+                language="en-US"
+            )
         response.hangup()
         
-        send_convoreps_sms_link(from_number, is_first_call=False)
+        send_convoreps_sms_link(from_number, is_first_call=not is_repeat_caller)
         
         return HTMLResponse(content=str(response), media_type="application/xml")
+    # Require minimum call duration
+    
     
     # Initialize call state
     with state_lock:
@@ -1832,7 +1839,18 @@ async def health_check():
         "version": "3.1-fixed",
         "realtime_model": OPENAI_REALTIME_MODEL
     }
-
+@app.get("/usage-data")
+async def get_usage_data():
+    """Get usage data from CSV"""
+    if not os.path.exists(USAGE_CSV_PATH):
+        return {"error": "No usage data found", "csv_path": USAGE_CSV_PATH}
+    
+    try:
+        with open(USAGE_CSV_PATH, 'r') as f:
+            content = f.read()
+        return PlainTextResponse(content=content, media_type="text/csv")
+    except Exception as e:
+        return {"error": str(e)}
 # Serve static files
 from fastapi.staticfiles import StaticFiles
 app.mount("/static", StaticFiles(directory="static"), name="static")

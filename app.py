@@ -679,7 +679,7 @@ def get_personality_for_mode(call_sid: str, mode: str) -> Tuple[str, str, str]:
         
     elif mode == "interview":
         voice = "coral"  # Clear and professional for interviews
-            system_prompt = (
+        system_prompt = (
                 f"You are Rachel Chen, a Senior HR Manager conducting a job interview. You've been in talent acquisition "
                 "for 12 years and genuinely love helping people showcase their best selves. You believe every candidate "
                 "has unique value and your job is to help them express it.\n\n"
@@ -843,7 +843,7 @@ def get_personality_for_mode(call_sid: str, mode: str) -> Tuple[str, str, str]:
                 "and how to articulate it authentically in any interview situation."
             )
             
-            return (
+        return (
                 voice,
                 system_prompt,
                 "Hi! I'm Rachel from HR. Thanks so much for taking the time to speak with me today. "

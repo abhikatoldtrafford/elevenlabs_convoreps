@@ -277,7 +277,30 @@ def init_csv():
             print(f"Created usage tracking CSV: {USAGE_CSV_PATH}")
     except Exception as e:
         print(f"Error creating CSV file: {e}")
-
+def get_clean_conversation_history(call_sid):
+    """Get only valid message entries from conversation history - NO PARTIAL ENTRIES"""
+    if call_sid not in conversation_history:
+        return []
+    
+    clean_history = []
+    
+    for entry in conversation_history.get(call_sid, []):
+        # Skip partial entries completely
+        if isinstance(entry, dict) and entry.get("type") == "partial":
+            continue
+            
+        # Only include valid messages with actual content
+        if (isinstance(entry, dict) and 
+            "role" in entry and 
+            "content" in entry and
+            entry.get("content")):  # Ensure content exists and is not empty
+            
+            clean_history.append({
+                "role": entry["role"],
+                "content": entry["content"]
+            })
+    
+    return clean_history
 def read_user_usage(phone_number: str) -> Dict[str, Any]:
     """Read user usage from CSV"""
     init_csv()
@@ -914,7 +937,7 @@ def get_gpt_response_with_tools(messages: list, call_sid: str) -> str:
     """
     try:
         gpt_reply = sync_openai.chat.completions.create(
-            model="gpt-4.1-nano",
+            model=MODELS["openai"]["standard_gpt"],
             messages=messages,
             temperature=0.7,
             max_tokens=150,
@@ -952,7 +975,7 @@ def get_gpt_response_with_tools(messages: list, call_sid: str) -> str:
                 # Get final response that incorporates the tool result
                 print(f"🤖 Getting final response with tool result: {tool_result}")
                 final_completion = sync_openai.chat.completions.create(
-                    model="gpt-4.1-nano",
+                    model=MODELS["openai"]["standard_gpt"],
                     messages=tool_messages,
                     temperature=0.7,
                     max_tokens=150

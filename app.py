@@ -141,7 +141,7 @@ personality_profiles = {
 cold_call_personality_pool = {
     "Jerry": {
         "voice_id": "1t1EeRixsJrKbiF1zwM6",
-        "system_prompt": "You're Jerry. You're a skeptical small business owner who's been burned by vendors in the past. You're not rude, but you're direct and hard to win over. Respond naturally based on how the call starts — maybe this is a cold outreach, maybe a follow-up, or even someone calling you with bad news. Stay in character. If the salesperson fumbles, challenge them. If they're smooth, open up a bit. Speak casually, not like a script.\n\nYou have access to 'check_remaining_time' tool. Use it when:\n- The caller asks 'how much time do I have left?' or similar\n- After about 2 minutes of conversation (to proactively inform them)\n- When wrapping up the call\n\nExample tool usage scenarios:\n- If user says 'How much practice time do I have?' → Use the tool\n- If conversation is going well after 2 minutes → Say something like 'By the way, let me check how much time you have left for practice' then use the tool\n- When ending: 'Before we wrap up, let me see your remaining time' then use the tool\n\nWhen sharing time info, be helpful: 'You've got about X minutes left - let's make them count!' or 'Just X minutes remaining, so let's focus on the key points.'"
+        "system_prompt": "You're Jerry. You're a skeptical small business owner who's been burned by vendors in the past. You're not rude, but you're direct and hard to win over. Respond naturally based on how the call starts — maybe this is a cold outreach, maybe a follow-up, or even someone calling you with bad news. Stay in character. If the salesperson fumbles, challenge them. If they're smooth, open up a bit. Speak casually, not like a script.\n\nYou have access to 'check_remaining_time' tool. Use it when:\n- The caller asks 'how much time do I have left?' or similar\n- After about 2 minutes of conversation (to proactively inform them)\n- When wrapping up the call\n\nWhen you use the tool, you'll get a response like 'You have X minutes remaining in your free call.' Incorporate this naturally into your response. For example:\n- 'Let me check... looks like you've got about X minutes left. Better make your pitch count!'\n- 'Just checked - you have X minutes remaining. What else you got?'\n- 'Time check - X minutes left on this practice call. Let's see if you can close me.'"
     },
     "Miranda": {
         "voice_id": "Ax1GP2W4XTyAyNHuch7v",
@@ -409,11 +409,14 @@ def handle_tool_call(call_sid: str) -> str:
             
             # Format remaining time nicely
             if remaining < 1:
-                return f"You have less than a minute remaining in your free call."
+                time_message = f"You have less than a minute remaining in your free call."
             elif remaining < 2:
-                return f"You have about {round(remaining, 1)} minute remaining in your free call."
+                time_message = f"You have about {round(remaining, 1)} minute remaining in your free call."
             else:
-                return f"You have about {round(remaining, 1)} minutes remaining in your free call."
+                time_message = f"You have about {round(remaining, 1)} minutes remaining in your free call."
+            
+            print(f"📢 Tool response: {time_message}")
+            return time_message
     
     print(f"⚠️ Unable to check time for {call_sid}")
     return "Unable to check remaining time."
@@ -1124,6 +1127,13 @@ async def process_speech():
         # Build messages array with validation
         messages = [{"role": "system", "content": system_prompt}]
         
+        # Add instruction for natural tool response handling
+        tool_instruction = {
+            "role": "system",
+            "content": "IMPORTANT: When you use the check_remaining_time tool, you'll receive a response like 'You have X minutes remaining in your free call.' You must acknowledge this information and incorporate it naturally into your response to the user. Don't just ignore it or change the subject - address their time question directly."
+        }
+        messages.append(tool_instruction)
+        
         # Check for bad news
         lowered = transcript.lower()
         is_bad_news = any(x in lowered for x in [
@@ -1220,6 +1230,8 @@ async def process_speech():
                 
         # Clean up response
         reply = reply.replace("*", "").replace("_", "").replace("`", "").replace("#", "").replace("-", " ")
+        
+        # Always add final response to conversation history
         conversation_history[call_sid].append({"role": "assistant", "content": reply})
 
     # Use mode from voice_lock if available (for consistency)
@@ -1498,9 +1510,10 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                     with state_lock:
                         active_sessions[call_sid] = "ENDING"
                 
+                # Add assistant's message with tool call to messages
                 messages.append({
                     "role": "assistant",
-                    "content": full_response if full_response else None,
+                    "content": None,
                     "tool_calls": [{
                         "id": current_tool_call["id"],
                         "type": "function",
@@ -1510,13 +1523,15 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                         }
                     }]
                 })
+                
+                # Add tool response
                 messages.append({
                     "role": "tool",
                     "tool_call_id": current_tool_call["id"],
                     "content": tool_result
                 })
                 
-                # Get final response
+                # Get final response based on tool result
                 final_stream = await async_openai.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -1525,11 +1540,50 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                 )
                 
                 final_response = ""
-                async for chunk in final_stream:
-                    if chunk.choices[0].delta.content:
-                        final_response += chunk.choices[0].delta.content
+                # Process the streamed response
+                if SENTENCE_STREAMING:
+                    sentence_buffer = ""
+                    for chunk in final_stream:
+                        if chunk.choices[0].delta.content:
+                            text = chunk.choices[0].delta.content
+                            sentence_buffer += text
+                            final_response += text
+                            
+                            # Process complete sentences
+                            sentences = re.split(r'(?<=[.!?])\s+', sentence_buffer)
+                            for sentence in sentences[:-1]:
+                                if sentence.strip():
+                                    try:
+                                        audio_data = await generate_tts_streaming(sentence, voice_id)
+                                        # Append to existing audio file
+                                        with open(output_path, "ab") as f:
+                                            f.write(audio_data)
+                                    except Exception as e:
+                                        print(f"⚠️ TTS error for tool response sentence: {e}")
+                            
+                            sentence_buffer = sentences[-1] if sentences else ""
+                    
+                    # Process final sentence buffer
+                    if sentence_buffer.strip():
+                        try:
+                            audio_data = await generate_tts_streaming(sentence_buffer, voice_id)
+                            with open(output_path, "ab") as f:
+                                f.write(audio_data)
+                        except Exception as e:
+                            print(f"⚠️ TTS error for final tool response sentence: {e}")
+                else:
+                    async for chunk in final_stream:
+                        if chunk.choices[0].delta.content:
+                            final_response += chunk.choices[0].delta.content
                 
-                return final_response.strip() if final_response else full_response.strip()
+                # Update conversation history with tool-based response
+                print(f"🎙️ AI response after tool call: {final_response.strip()[:100]}...")
+                return final_response.strip()
+            
+            # If no tool call, return the regular response
+            if full_response.strip():
+                # Don't add to history here - it's handled in process_speech
+                pass
             
             return full_response.strip()
             
@@ -1556,21 +1610,44 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                         with state_lock:
                             active_sessions[call_sid] = "ENDING"
                     
-                    messages.append(response_message)
+                    # Add assistant's message with tool call
+                    messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": tool_call.id,
+                            "type": "function", 
+                            "function": {
+                                "name": "check_remaining_time",
+                                "arguments": "{}"
+                            }
+                        }]
+                    })
+                    
+                    # Add tool response
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": tool_result
                     })
                     
+                    # Get final response based on tool result
+                    print(f"🤖 Getting AI response based on tool result: {tool_result}")
                     final_completion = await async_openai.chat.completions.create(
                         model=model,
                         messages=messages,
                         temperature=0.7
                     )
-                    return final_completion.choices[0].message.content.strip()
+                    final_reply = final_completion.choices[0].message.content.strip()
+                    print(f"🎙️ AI response after tool call: {final_reply[:100]}...")
+                    
+                    return final_reply
             
-            return response_message.content.strip()
+            # No tool call - return regular response
+            reply = response_message.content.strip()
+            # Don't add to history here - it's handled in process_speech
+            
+            return reply
             
     except Exception as e:
         print(f"💥 GPT streaming error: {e}")

@@ -71,7 +71,7 @@ SENTENCE_STREAMING = True
 MODELS = {
     "openai": {
         "streaming_gpt": os.getenv("OPENAI_STREAMING_MODEL", "gpt-4.1-nano"),
-        "standard_gpt": os.getenv("OPENAI_STANDARD_MODEL", "gpt-4.1-mini"),
+        "standard_gpt": os.getenv("OPENAI_STANDARD_MODEL", "gpt-4.1-nano"),
         "streaming_transcribe": os.getenv("OPENAI_STREAMING_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe"),
         "standard_transcribe": os.getenv("OPENAI_STANDARD_TRANSCRIBE_MODEL", "whisper-1")
     },
@@ -386,7 +386,8 @@ def get_time_check_tool():
 def handle_tool_call(call_sid: str) -> str:
     """Handle check_remaining_time tool call
     
-    Returns time remaining. If time is exhausted, marks session for immediate termination.
+    Returns time remaining in a format the AI can naturally incorporate into conversation.
+    If time is exhausted, marks session for immediate termination.
     """
     print(f"🔧 Tool call: check_remaining_time for {call_sid}")
     
@@ -407,19 +408,28 @@ def handle_tool_call(call_sid: str) -> str:
                 # Return special message that AI will use to say goodbye
                 return "TIME_EXPIRED: The user has exhausted their free minutes. Say a brief, friendly goodbye and mention they'll receive a text with more information."
             
-            # Format remaining time nicely
-            if remaining < 1:
-                time_message = f"You have less than a minute remaining in your free call."
+            # Format remaining time nicely for natural AI response
+            if remaining < 0.5:
+                time_message = "You have less than 30 seconds remaining in your free call."
+            elif remaining < 1:
+                time_message = f"You have less than a minute remaining in your free call (about {int(remaining * 60)} seconds)."
+            elif remaining < 1.5:
+                time_message = f"You have about 1 minute remaining in your free call."
             elif remaining < 2:
-                time_message = f"You have about {round(remaining, 1)} minute remaining in your free call."
-            else:
                 time_message = f"You have about {round(remaining, 1)} minutes remaining in your free call."
+            else:
+                # Round to nearest half minute for cleaner response
+                rounded_minutes = round(remaining * 2) / 2
+                if rounded_minutes == int(rounded_minutes):
+                    time_message = f"You have about {int(rounded_minutes)} minutes remaining in your free call."
+                else:
+                    time_message = f"You have about {rounded_minutes} minutes remaining in your free call."
             
             print(f"📢 Tool response: {time_message}")
             return time_message
     
     print(f"⚠️ Unable to check time for {call_sid}")
-    return "Unable to check remaining time."
+    return "I'm having trouble checking the time right now, but you started with 3 minutes of free call time."
 
 def ensure_static_files():
     """Ensure required static files exist"""
@@ -1191,7 +1201,7 @@ async def process_speech():
                 else:
                     # Add tool support to existing call
                     gpt_reply = sync_openai.chat.completions.create(
-                        model="gpt-3.5-turbo",
+                        model="gpt-4.1-nano",
                         messages=messages,
                         temperature=0.7,
                         max_tokens=150,
@@ -1207,20 +1217,36 @@ async def process_speech():
                         if tool_call.function.name == "check_remaining_time":
                             tool_result = handle_tool_call(call_sid)
                             
-                            messages.append(response_message)
+                            # Check if time expired
+                            if "TIME_EXPIRED" in tool_result:
+                                print(f"⏰ Tool detected time expired - AI will say goodbye")
+                                with state_lock:
+                                    active_sessions[call_sid] = "ENDING"
+                            
+                            # Append assistant's message with tool call
+                            messages.append({
+                                "role": "assistant",
+                                "content": response_message.content,
+                                "tool_calls": response_message.tool_calls
+                            })
+                            
+                            # Append tool result
                             messages.append({
                                 "role": "tool",
                                 "tool_call_id": tool_call.id,
                                 "content": tool_result
                             })
                             
+                            # Get final response that incorporates the tool result
+                            print(f"🤖 Getting final response with tool result: {tool_result}")
                             final_completion = sync_openai.chat.completions.create(
-                                model="gpt-3.5-turbo",
+                                model="gpt-4.1-nano",
                                 messages=messages,
                                 temperature=0.7,
                                 max_tokens=150
                             )
                             reply = final_completion.choices[0].message.content.strip()
+                            print(f"🎙️ Final AI response with time info: {reply[:100]}...")
                     else:
                         reply = response_message.content.strip()
             except Exception as e:
@@ -1434,22 +1460,26 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
             sentence_buffer = ""
             sentence_count = 0
             first_audio_saved = False
-            tool_calls = []
-            current_tool_call = None
+            final_tool_calls = {}  # Changed from current_tool_call to handle streaming properly
             
             async for chunk in stream:
-                # Handle tool calls
+                # Handle tool calls - accumulate them properly per OpenAI docs
                 if chunk.choices[0].delta.tool_calls:
-                    for tc_delta in chunk.choices[0].delta.tool_calls:
-                        if tc_delta.index == 0:
-                            if tc_delta.id:
-                                current_tool_call = {
-                                    "id": tc_delta.id,
-                                    "name": tc_delta.function.name if tc_delta.function.name else "",
+                    for tool_call_delta in chunk.choices[0].delta.tool_calls:
+                        index = tool_call_delta.index
+                        
+                        if index not in final_tool_calls:
+                            final_tool_calls[index] = {
+                                "id": tool_call_delta.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call_delta.function.name if tool_call_delta.function else None,
                                     "arguments": ""
                                 }
-                            if tc_delta.function and tc_delta.function.arguments:
-                                current_tool_call["arguments"] += tc_delta.function.arguments
+                            }
+                        
+                        if tool_call_delta.function and tool_call_delta.function.arguments:
+                            final_tool_calls[index]["function"]["arguments"] += tool_call_delta.function.arguments
                 
                 # Process content
                 if chunk.choices[0].delta.content:
@@ -1478,7 +1508,6 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                                     print(f"✅ First audio chunk saved - ready to play!")
                                 else:
                                     # Append subsequent sentences
-                                    # This is a simplified approach - you might need proper MP3 concatenation
                                     with open(output_path, "ab") as f:
                                         f.write(audio_data)
                                         
@@ -1487,8 +1516,8 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                     
                     sentence_buffer = sentences[-1] if sentences else ""
             
-            # Process final sentence
-            if sentence_buffer.strip():
+            # Process final sentence from initial stream
+            if sentence_buffer.strip() and not final_tool_calls:
                 try:
                     audio_data = await generate_tts_streaming(sentence_buffer, voice_id)
                     if not first_audio_saved:
@@ -1500,50 +1529,56 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                 except Exception as e:
                     print(f"⚠️ TTS error for final sentence: {e}")
             
-            # Handle tool call if present
-            if current_tool_call and current_tool_call.get("name") == "check_remaining_time":
-                tool_result = handle_tool_call(call_sid)
-                
-                # Check if time expired
-                if "TIME_EXPIRED" in tool_result:
-                    print(f"⏰ Tool detected time expired - AI will say goodbye")
-                    with state_lock:
-                        active_sessions[call_sid] = "ENDING"
-                
-                # Add assistant's message with tool call to messages
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": current_tool_call["id"],
-                        "type": "function",
-                        "function": {
-                            "name": "check_remaining_time",
-                            "arguments": "{}"
-                        }
-                    }]
-                })
-                
-                # Add tool response
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": current_tool_call["id"],
-                    "content": tool_result
-                })
-                
-                # Get final response based on tool result
-                final_stream = await async_openai.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    stream=True,
-                    temperature=0.7
-                )
-                
-                final_response = ""
-                # Process the streamed response
-                if SENTENCE_STREAMING:
+            # Handle tool calls if present
+            if final_tool_calls:
+                # Process the first tool call (usually only one for time check)
+                tool_call = final_tool_calls[0]
+                if tool_call["function"]["name"] == "check_remaining_time":
+                    print(f"🔧 Processing tool call in streaming mode")
+                    tool_result = handle_tool_call(call_sid)
+                    
+                    # Check if time expired
+                    if "TIME_EXPIRED" in tool_result:
+                        print(f"⏰ Tool detected time expired - AI will say goodbye")
+                        with state_lock:
+                            active_sessions[call_sid] = "ENDING"
+                    
+                    # Add assistant's message with tool call to messages (per OpenAI docs)
+                    messages.append({
+                        "role": "assistant",
+                        "content": full_response if full_response else None,  # Include any content before tool call
+                        "tool_calls": [{
+                            "id": tool_call["id"],
+                            "type": "function",
+                            "function": {
+                                "name": "check_remaining_time",
+                                "arguments": tool_call["function"]["arguments"]
+                            }
+                        }]
+                    })
+                    
+                    # Add tool response
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": tool_result
+                    })
+                    
+                    print(f"📊 Getting final response after tool call with result: {tool_result}")
+                    
+                    # Get final response based on tool result
+                    final_stream = await async_openai.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        stream=True,
+                        temperature=0.7
+                    )
+                    
+                    final_response = ""
                     sentence_buffer = ""
-                    for chunk in final_stream:
+                    
+                    # Process the final response that incorporates the tool result
+                    async for chunk in final_stream:  # FIXED: async for
                         if chunk.choices[0].delta.content:
                             text = chunk.choices[0].delta.content
                             sentence_buffer += text
@@ -1558,6 +1593,7 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                                         # Append to existing audio file
                                         with open(output_path, "ab") as f:
                                             f.write(audio_data)
+                                        print(f"🔊 Added tool response sentence to audio: {sentence[:50]}...")
                                     except Exception as e:
                                         print(f"⚠️ TTS error for tool response sentence: {e}")
                             
@@ -1569,22 +1605,14 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                             audio_data = await generate_tts_streaming(sentence_buffer, voice_id)
                             with open(output_path, "ab") as f:
                                 f.write(audio_data)
+                            print(f"🔊 Added final tool response sentence to audio")
                         except Exception as e:
                             print(f"⚠️ TTS error for final tool response sentence: {e}")
-                else:
-                    async for chunk in final_stream:
-                        if chunk.choices[0].delta.content:
-                            final_response += chunk.choices[0].delta.content
-                
-                # Update conversation history with tool-based response
-                print(f"🎙️ AI response after tool call: {final_response.strip()[:100]}...")
-                return final_response.strip()
+                    
+                    print(f"🎙️ AI final response with time info: {final_response.strip()[:100]}...")
+                    return final_response.strip()
             
             # If no tool call, return the regular response
-            if full_response.strip():
-                # Don't add to history here - it's handled in process_speech
-                pass
-            
             return full_response.strip()
             
         else:
@@ -1610,16 +1638,16 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                         with state_lock:
                             active_sessions[call_sid] = "ENDING"
                     
-                    # Add assistant's message with tool call
+                    # Add assistant's message with tool call (include original content if any)
                     messages.append({
                         "role": "assistant",
-                        "content": None,
+                        "content": response_message.content,
                         "tool_calls": [{
                             "id": tool_call.id,
                             "type": "function", 
                             "function": {
                                 "name": "check_remaining_time",
-                                "arguments": "{}"
+                                "arguments": tool_call.function.arguments
                             }
                         }]
                     })
@@ -1639,26 +1667,69 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                         temperature=0.7
                     )
                     final_reply = final_completion.choices[0].message.content.strip()
-                    print(f"🎙️ AI response after tool call: {final_reply[:100]}...")
+                    print(f"🎙️ AI final response with time info: {final_reply[:100]}...")
                     
                     return final_reply
             
             # No tool call - return regular response
-            reply = response_message.content.strip()
-            # Don't add to history here - it's handled in process_speech
-            
-            return reply
+            return response_message.content.strip()
             
     except Exception as e:
         print(f"💥 GPT streaming error: {e}")
-        # Fallback to non-streaming
-        completion = sync_openai.chat.completions.create(
-            model=MODELS["openai"]["standard_gpt"],
-            messages=messages
-        )
-        return completion.choices[0].message.content.strip()
-
-
+        import traceback
+        traceback.print_exc()
+        # Fallback to non-streaming with proper tool handling
+        try:
+            completion = sync_openai.chat.completions.create(
+                model=MODELS["openai"]["standard_gpt"],
+                messages=messages,
+                tools=[get_time_check_tool()],
+                tool_choice="auto"
+            )
+            
+            response_message = completion.choices[0].message
+            
+            # Handle tool calls in fallback
+            if response_message.tool_calls:
+                tool_call = response_message.tool_calls[0]
+                if tool_call.function.name == "check_remaining_time":
+                    tool_result = handle_tool_call(call_sid)
+                    
+                    # Check if time expired
+                    if "TIME_EXPIRED" in tool_result:
+                        print(f"⏰ Tool detected time expired in fallback - AI will say goodbye")
+                        with state_lock:
+                            active_sessions[call_sid] = "ENDING"
+                    
+                    # Properly append the assistant message with tool call
+                    messages.append({
+                        "role": "assistant",
+                        "content": response_message.content,
+                        "tool_calls": response_message.tool_calls
+                    })
+                    
+                    # Add tool result
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": tool_result
+                    })
+                    
+                    # Get final response
+                    final_completion = sync_openai.chat.completions.create(
+                        model=MODELS["openai"]["standard_gpt"],
+                        messages=messages,
+                        temperature=0.7
+                    )
+                    final_reply = final_completion.choices[0].message.content.strip()
+                    print(f"🎙️ Fallback AI response with time info: {final_reply[:100]}...")
+                    return final_reply
+            
+            return response_message.content.strip()
+            
+        except Exception as e2:
+            print(f"💥 Fallback also failed: {e2}")
+            return "I'm having trouble processing that. Could you please repeat?"
 async def generate_tts_streaming(text: str, voice_id: str) -> bytes:
     """Generate TTS using streaming ElevenLabs API with retry logic"""
     max_retries = 3

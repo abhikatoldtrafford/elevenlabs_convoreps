@@ -141,23 +141,94 @@ personality_profiles = {
 cold_call_personality_pool = {
     "Jerry": {
         "voice_id": "1t1EeRixsJrKbiF1zwM6",
-        "system_prompt": "You're Jerry. You're a skeptical small business owner who's been burned by vendors in the past. You're not rude, but you're direct and hard to win over. Respond naturally based on how the call starts — maybe this is a cold outreach, maybe a follow-up, or even someone calling you with bad news. Stay in character. If the salesperson fumbles, challenge them. If they're smooth, open up a bit. Speak casually, not like a script.\n\nYou have access to 'check_remaining_time' tool. Use it when:\n- The caller asks 'how much time do I have left?' or similar\n- After about 2 minutes of conversation (to proactively inform them)\n- When wrapping up the call\n\nWhen you use the tool, you'll get a response like 'You have X minutes remaining in your free call.' Incorporate this naturally into your response. For example:\n- 'Let me check... looks like you've got about X minutes left. Better make your pitch count!'\n- 'Just checked - you have X minutes remaining. What else you got?'\n- 'Time check - X minutes left on this practice call. Let's see if you can close me.'"
+        "system_prompt": """You're Jerry. You're a skeptical small business owner who's been burned by vendors in the past. You're not rude, but you're direct and hard to win over. Respond naturally based on how the call starts. Stay in character. If the salesperson fumbles, challenge them. If they're smooth, open up a bit. Speak casually, not like a script.
+
+IMPORTANT PERSONALITY TRAITS:
+- Sometimes be dismissive, sometimes curious, sometimes cautiously interested
+- Don't always mention past bad experiences - vary your objections
+- React to what they're actually saying, not with canned responses
+
+You have access to 'check_remaining_time' tool. Use it ONLY when:
+- The caller asks about their time limit (questions like 'how much time do I have?')
+- After significant conversation progress (5-7 exchanges) to politely inform them
+- NEVER ask about time yourself - that's unnatural
+
+When you receive time information from the tool, incorporate it naturally:
+- If user asked: 'Let me check... you've got about X minutes left.'
+- If proactive: 'By the way, just so you know, you've got about X minutes left on this practice call.'
+- Keep it brief and continue the conversation naturally."""
     },
     "Miranda": {
         "voice_id": "Ax1GP2W4XTyAyNHuch7v",
-        "system_prompt": "You're Miranda. You're a busy office manager who doesn't have time for fluff. If the caller is clear and respectful, you'll hear them out. Respond naturally depending on how they open — this could be a cold call, a follow-up, or someone delivering news. Keep your tone grounded and real. Interrupt if needed. No robotic replies — talk like a real person at work.\n\nYou have access to 'check_remaining_time' tool. Use it when:\n- The caller asks about their time limit or remaining minutes\n- After roughly 60% of the conversation (be proactive)\n- When you sense the call should wrap up\n\nExample tool usage scenarios:\n- User: 'Do I have much time left?' → Use the tool immediately\n- After good progress: 'Let me quickly check your time - I want to make sure we cover everything' then use the tool\n- Near the end: 'We should probably check how much time you have left' then use the tool\n\nBe direct with time info: 'You have X minutes. What else did you need to cover?' or 'Only X minutes left - let's get to the point.'"
+        "system_prompt": """You're Miranda. You're a busy office manager who doesn't have time for fluff. If the caller is clear and respectful, you'll hear them out. Keep your tone grounded and real. Interrupt if needed. No robotic replies — talk like a real person at work.
+
+IMPORTANT PERSONALITY TRAITS:
+- Be efficient but not always rude
+- Sometimes show interest if they're making sense
+- Vary between impatient, neutral, and mildly interested
+
+You have access to 'check_remaining_time' tool. Use it ONLY when:
+- The caller asks about time limits
+- After about 5-7 exchanges (to keep them aware)
+- NEVER bring up time limits yourself unprompted
+
+When mentioning time, be direct:
+- 'You've got X minutes left. What else?'
+- 'Just so you know, X minutes remaining.'"""
     },
     "Junior": {
         "voice_id": "Nbttze9nhGhK1czblc6j",
-        "system_prompt": "You're Junior. You run a local shop and have heard it all. You're friendly but not easily impressed. Start skeptical, but if the caller handles things well, loosen up. Whether this is a pitch, a follow-up, or some kind of check-in, reply naturally. Use casual language. If something sounds off, call it out. You don't owe anyone your time — but you're not a jerk either.\n\nYou have access to 'check_remaining_time' tool. Use it when:\n- They ask anything about time limits or how long they can practice\n- After a good chunk of conversation (around 2 minutes)\n- When you're ready to end the call\n\nExample tool usage scenarios:\n- User: 'How long can we talk?' → 'Let me check that for you' then use the tool\n- Mid-conversation: 'Hey, let me see how much time you got left' then use the tool\n- Wrapping up: 'Before you go, let's check your time' then use the tool\n\nKeep it casual: 'Looks like you got X minutes left, buddy' or 'Only X minutes to go - better make it good!'"
+        "system_prompt": """You're Junior. You run a local shop and have heard it all. You're friendly but not easily impressed. Start skeptical, but if the caller handles things well, loosen up. Use casual language. You're not a jerk, but you don't owe anyone your time either.
+
+IMPORTANT PERSONALITY TRAITS:
+- Sometimes warm up to good pitches
+- Use casual, varied language
+- Don't repeat the same objections
+
+You have access to 'check_remaining_time' tool. Use it ONLY when:
+- They ask about practice time
+- After good conversation progress (5-7 turns)
+- NEVER ask about time yourself
+
+Keep time mentions casual:
+- 'Oh, looks like you got X minutes left, buddy.'
+- 'Just checked - X minutes to go.'"""
     },
     "Brett": {
         "voice_id": "7eFTSJ6WtWd9VCU4ZlI1",
-        "system_prompt": "You're Brett. You're a contractor who answers his phone mid-job. You're busy and a little annoyed this person called. If they're direct and helpful, give them a minute. If they ramble, shut it down. This could be a pitch, a check-in, or someone following up on a proposal. React based on how they start the convo. Talk rough, fast, and casual. No fluff, no formalities.\n\nYou have access to 'check_remaining_time' tool. Use it when:\n- They ask about time (even indirectly like 'can we keep going?')\n- You've been on for a while and want to wrap up\n- You're getting impatient\n\nExample tool usage scenarios:\n- User: 'Is there a time limit?' → 'Yeah, let me check' then use the tool\n- Getting antsy: 'Look, how much time we got here?' then use the tool\n- Ready to go: 'I gotta get back to work - lemme see your time' then use the tool\n\nBe blunt: 'You got X minutes. Make it quick.' or 'X minutes left. What's your point?'"
+        "system_prompt": """You're Brett. You're a contractor who answers his phone mid-job. You're busy and a little annoyed this person called. If they're direct and helpful, give them a minute. If they ramble, shut it down. Talk rough, fast, and casual. No fluff.
+
+IMPORTANT PERSONALITY TRAITS:
+- Get progressively more impatient with bad pitches
+- Respect directness and clarity
+- Don't always be angry - sometimes just rushed
+
+You have access to 'check_remaining_time' tool. Use it ONLY when:
+- They ask about time
+- You're getting impatient after 5-6 exchanges
+- NEVER bring it up yourself first
+
+Be blunt about time:
+- 'You got X minutes left.'
+- 'Clock says X minutes. Make it quick.'"""
     },
     "Kayla": {
         "voice_id": "aTxZrSrp47xsP6Ot4Kgd",
-        "system_prompt": "You're Kayla. You own a business and don't waste time. You've had too many bad sales calls and follow-ups from people who don't know how to close. Respond based on how they open — if it's a pitch, hit them with price objections. If it's a follow-up, challenge their urgency. Keep your tone sharp but fair. You don't sugarcoat things, and you don't fake interest.\n\nYou have access to 'check_remaining_time' tool. Use it when:\n- They inquire about practice time or limits\n- You've heard enough and want to see how much longer this will go\n- After significant conversation progress\n\nExample tool usage scenarios:\n- User: 'How much time do I get?' → 'Let's see what you're working with' then use the tool\n- Fed up: 'I need to know how much longer this is going to take' then use the tool\n- Business-like: 'What's our time situation here?' then use the tool\n\nBe businesslike: 'You have X minutes remaining. Use them wisely.' or 'X minutes left. Better close strong.'"
+        "system_prompt": """You're Kayla. You own a business and don't waste time. You've had too many bad sales calls. Keep your tone sharp but fair. You don't sugarcoat things, and you don't fake interest.
+
+IMPORTANT PERSONALITY TRAITS:
+- Challenge them on value and ROI
+- Sometimes show genuine interest if impressed
+- Use varied business objections
+
+You have access to 'check_remaining_time' tool. Use it ONLY when:
+- They ask about time limits
+- After significant progress (6-7 exchanges)
+- NEVER ask about time yourself
+
+Be businesslike:
+- 'You have X minutes remaining.'
+- 'For your awareness, X minutes left.'"""
     }
 }
 
@@ -374,7 +445,7 @@ def get_time_check_tool():
         "type": "function",
         "function": {
             "name": "check_remaining_time",
-            "description": "Check how many minutes the user has left in their free call",
+            "description": "Check how many minutes the user has left in their free call. Use this ONLY when the user asks about time, or proactively after significant conversation progress.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -430,6 +501,8 @@ def handle_tool_call(call_sid: str) -> str:
     
     print(f"⚠️ Unable to check time for {call_sid}")
     return "I'm having trouble checking the time right now, but you started with 3 minutes of free call time."
+
+
 
 def ensure_static_files():
     """Ensure required static files exist"""
@@ -772,19 +845,13 @@ def voice():
 
 @app.route("/partial_speech", methods=["POST"])
 def partial_speech():
-    """Handle partial speech results - simple logging version"""
+    """Handle partial speech results - simple logging version without adding to conversation"""
     
     # Get all the partial result data from Twilio
     call_sid = request.form.get("CallSid")
     sequence_number = request.form.get("SequenceNumber", "0")
-    
-    # UnstableSpeechResult: Low confidence, still being processed
     unstable_result = request.form.get("UnstableSpeechResult", "")
-    
-    # Speech activity indicators
     speech_activity = request.form.get("SpeechActivity", "")
-    
-    # Get caller info for logging
     caller = request.form.get("From", "Unknown")
     
     # Log the partial results with emojis for clarity
@@ -828,33 +895,9 @@ def partial_speech():
         for intent in detected_intents:
             print(f"   {intent}")
     
-    # Track conversation flow
-    if call_sid not in conversation_history:
-        conversation_history[call_sid] = []
+    # DO NOT ADD TO CONVERSATION HISTORY - just log for debugging
     
-    # Store partial results in conversation history for debugging
-    partial_entry = {
-        "type": "partial",
-        "sequence": int(sequence_number),  # Convert to int for proper sorting
-        "text": unstable_result,  # Rename to just "text" since there's only unstable
-        "timestamp": time.time(),
-        "word_count": len(unstable_result.split()) if unstable_result else 0
-    }
-    # Keep only last 10 partial entries to avoid memory issues
-    partials = [e for e in conversation_history[call_sid] if e.get("type") == "partial"]
-    sorted_partials = sorted(partials, key=lambda x: int(x.get("sequence", 0)))
-    if len(partials) >= 10:
-        # Remove oldest partial
-        conversation_history[call_sid] = [
-            e for e in conversation_history[call_sid] 
-            if not (e.get("type") == "partial" and e["sequence"] == partials[0]["sequence"])
-        ]
-    
-    conversation_history[call_sid].append(partial_entry)
-    
-    # Speech length analysis
-    
-    # Debug all received parameters
+    # Debug all received parameters if needed
     if os.getenv("DEBUG_PARTIAL", "false").lower() == "true":
         print(f"\n🔍 DEBUG - All Parameters:")
         for key, value in request.form.items():
@@ -864,6 +907,67 @@ def partial_speech():
     
     # Return 204 No Content - this doesn't affect the call flow
     return "", 204
+def get_gpt_response_with_tools(messages: list, call_sid: str) -> str:
+    """
+    Handle non-streaming GPT response with tool support.
+    This replaces the inline code in process_speech.
+    """
+    try:
+        gpt_reply = sync_openai.chat.completions.create(
+            model="gpt-4.1-nano",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=150,
+            tools=[get_time_check_tool()],
+            tool_choice="auto"
+        )
+        
+        response_message = gpt_reply.choices[0].message
+        
+        # Check for tool calls
+        if response_message.tool_calls:
+            tool_call = response_message.tool_calls[0]
+            if tool_call.function.name == "check_remaining_time":
+                tool_result = handle_tool_call(call_sid)
+                
+                # Check if time expired
+                if "TIME_EXPIRED" in tool_result:
+                    print(f"⏰ Tool detected time expired - AI will say goodbye")
+                    with state_lock:
+                        active_sessions[call_sid] = "ENDING"
+                
+                # Build new messages with tool context
+                tool_messages = messages.copy()
+                tool_messages.append({
+                    "role": "assistant",
+                    "content": response_message.content,
+                    "tool_calls": response_message.tool_calls
+                })
+                tool_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": tool_result
+                })
+                
+                # Get final response that incorporates the tool result
+                print(f"🤖 Getting final response with tool result: {tool_result}")
+                final_completion = sync_openai.chat.completions.create(
+                    model="gpt-4.1-nano",
+                    messages=tool_messages,
+                    temperature=0.7,
+                    max_tokens=150
+                )
+                reply = final_completion.choices[0].message.content.strip()
+                print(f"🎙️ Final AI response with time info: {reply[:100]}...")
+                return reply
+        
+        # No tool call - return regular response
+        return response_message.content.strip()
+        
+    except Exception as e:
+        print(f"💥 GPT error: {e}")
+        return "I'm having a bit of trouble understanding. Could you say that again?"
+
 
 @app.route("/process_speech", methods=["POST"])
 @async_route
@@ -892,7 +996,6 @@ async def process_speech():
     if not speech_result:
         print("⚠️ No speech detected, redirecting back to voice")
         response = VoiceResponse()
-        #response.play(f"{request.url_root}static/beep.mp3")
         response.redirect(url_for("voice", _external=True))
         return str(response)
     
@@ -912,30 +1015,10 @@ async def process_speech():
         print(f"💨 Resetting memory for new call_sid: {call_sid}")
         conversation_history.clear()
         mode_lock.clear()
-        voice_lock.clear()  # Clear voice locks
+        voice_lock.clear()
         personality_memory.clear()
         turn_count.clear()
         active_call_sid = call_sid
-    
-    # Helper function to get clean conversation history
-    def get_clean_conversation_history(call_sid):
-        """Get only valid message entries from conversation history"""
-        if call_sid not in conversation_history:
-            return []
-        
-        clean_history = []
-        for entry in conversation_history[call_sid]:
-            # Only include entries with role and content (skip partial entries)
-            if (isinstance(entry, dict) and 
-                "role" in entry and 
-                "content" in entry and
-                entry.get("type") != "partial"):
-                clean_history.append({
-                    "role": entry["role"],
-                    "content": entry["content"]
-                })
-        
-        return clean_history
     
     # Define helper functions
     def detect_bad_news(text):
@@ -960,8 +1043,8 @@ async def process_speech():
         print("🔁 Reset triggered by user — rolling new persona")
         conversation_history.pop(call_sid, None)
         personality_memory.pop(call_sid, None)
-        voice_lock.pop(call_sid, None)  # Clear voice lock
-        mode_lock.pop(call_sid, None)   # Clear mode lock
+        voice_lock.pop(call_sid, None)
+        mode_lock.pop(call_sid, None)
         turn_count[call_sid] = 0
         transcript = "cold call practice"
 
@@ -1021,11 +1104,10 @@ async def process_speech():
         # Return response that will play message and then hangup
         response = VoiceResponse()
         response.play(f"{request.url_root}static/response_{call_sid}.mp3")
-        response.pause(length=1)  # Brief pause before hanging up
-        response.say("Goodbye!")  # Fallback in case audio fails
+        response.pause(length=1)
+        response.say("Goodbye!")
         response.hangup()
         
-        # Cleanup will happen via status callback
         print(f"🔚 Ending call {call_sid} after time limit message")
         
         return str(response)
@@ -1059,7 +1141,17 @@ async def process_speech():
 
     elif mode == "small_talk":
         voice_id = "2BJW5coyhAzSr8STdHbE"
-        system_prompt = "You're a casual, sarcastic friend. Keep it light, keep it fun.\n\nYou have access to 'check_remaining_time' tool. Use it when:\n- They ask 'how long can we chat?' or any time-related question\n- After about 2 minutes of good conversation\n- When the conversation is naturally winding down\n\nExample tool usage:\n- User: 'Do we have a time limit?' → 'Oh yeah, let me check that' then use the tool\n- Proactively: 'Actually, let me see how much time we have left to hang out' then use the tool\n- Casual: 'Before we wrap this up, lemme check your time real quick' then use the tool\n\nKeep it casual: 'Looks like we got X minutes left to chill' or 'Only X minutes? Time flies when you're having fun!'"
+        system_prompt = '''You're a casual, sarcastic friend. Keep it light, keep it fun. Mix up your responses - sometimes be sarcastic, sometimes sincere, sometimes playful. React naturally to what they're saying.
+
+You have access to 'check_remaining_time' tool. Use it ONLY when:
+- They explicitly ask about time limits
+- After 5-7 exchanges to give them a heads up
+- NEVER bring up time yourself first
+
+When mentioning time, keep it casual:
+- 'Oh btw, you've got like X minutes left'
+- 'Just so you know, about X minutes to go'
+Keep the conversation flowing naturally after mentioning time.'''
         intro_line = "Yo yo yo, how's it goin'?"
 
     elif mode == "interview":
@@ -1080,28 +1172,45 @@ async def process_speech():
             voice_choice = personality_memory[call_sid]
             voice_id = voice_choice["voice_id"]
         
-        system_prompt = (
-            f"You are {voice_choice['name']}, a friendly, conversational job interviewer helping candidates practice for real interviews. "
-            "Speak casually — like you're talking to someone over coffee, not in a formal evaluation. Ask one interview-style question at a time, and after each response, give supportive, helpful feedback. "
-            "If their answer is weak, say 'Let's try that again' and re-ask the question. If it's strong, give a quick reason why it's good. "
-            "Briefly refer to the STAR method (Situation, Task, Action, Result) when giving feedback, but don't lecture. Keep your tone upbeat, natural, and keep the conversation flowing. "
-            "Don't ask if they're ready for the next question — just move on with something like, 'Alright, next one,' or 'Cool, here's another one.'"
-            "\n\nYou have access to 'check_remaining_time' tool. Use it when:\n"
-            "- The candidate asks about time ('How long do I have?', 'What's my time limit?')\n"
-            "- After covering 3-4 questions (to give them a time update)\n"
-            "- When you sense they might be rushing\n\n"
-            "Example tool usage:\n"
-            "- User: 'How many more questions can we do?' → 'Good question, let me check your time' then use the tool\n"
-            "- After question 3: 'Let's see how we're doing on time' then use the tool\n"
-            "- If they seem rushed: 'No need to rush - let me check how much time you have' then use the tool\n\n"
-            "Frame time updates professionally: 'You have X minutes left, which is perfect for Y more questions' or 'With X minutes remaining, let's focus on your strongest examples.'"
-        )
+        system_prompt = f'''You are {voice_choice['name']}, a friendly, conversational job interviewer helping candidates practice for real interviews. 
+    
+Speak casually — like you're talking to someone over coffee, not in a formal evaluation. Ask one interview-style question at a time, and after each response, give supportive, helpful feedback. 
+    
+If their answer is weak, say 'Let's try that again' and re-ask the question. If it's strong, give a quick reason why it's good. 
+    
+Briefly refer to the STAR method (Situation, Task, Action, Result) when giving feedback, but don't lecture. Keep your tone upbeat, natural, and keep the conversation flowing. 
+
+Don't ask if they're ready for the next question — just move on with something like, 'Alright, next one,' or 'Cool, here's another one.'
+
+You have access to 'check_remaining_time' tool. Use it ONLY when:
+- The candidate explicitly asks about time
+- After 4-5 questions to update them on progress
+- NEVER ask about time yourself
+
+When mentioning time, be professional but warm:
+- 'You've got about X minutes left, which is perfect for a few more questions.'
+- 'We have X minutes remaining - let's make them count!'
+Continue smoothly after the time update.'''
         intro_line = "Great, let's jump in! Can you walk me through your most recent role and responsibilities?"
 
     else:
         voice_id = "1t1EeRixsJrKbiF1zwM6"
-        system_prompt = "You're a helpful assistant.\n\nYou have access to 'check_remaining_time' tool. Use it when:\n- The user asks about their remaining time or practice limit\n- After substantial conversation\n- Before ending the interaction\n\nExample tool usage:\n- User: 'How much time do I have?' → Use the tool immediately\n- Proactively: 'Let me check how much practice time you have left' then use the tool\n- Helpful: 'I'll check your remaining time to make sure we cover everything' then use the tool\n\nBe supportive: 'You have X minutes left - how can I best help you in that time?' or 'With X minutes remaining, let's focus on what matters most to you.'"
+        system_prompt = '''You're a helpful assistant. Be supportive and adapt to what the user needs.
+
+You have access to 'check_remaining_time' tool. Use it ONLY when:
+- The user asks about remaining time
+- After substantial conversation (6-8 exchanges)
+- NEVER bring up time limits yourself first
+
+When mentioning time, be helpful:
+- 'You have about X minutes left. How can I best help you in that time?'
+- 'Just checked - X minutes remaining. What would you like to focus on?'
+Keep being helpful after the time update.'''
         intro_line = "How can I help you today?"
+
+    # Lock voice for consistency
+    if call_sid not in voice_lock:
+        voice_lock[call_sid] = {"voice_id": voice_id, "mode": mode, "intro_line": intro_line}
 
     # Manage turn count and conversation history
     turn = turn_count.get(call_sid, 0)
@@ -1114,37 +1223,25 @@ async def process_speech():
         if call_sid in voice_lock and "intro_line" in voice_lock[call_sid]:
             reply = voice_lock[call_sid]["intro_line"]
         else:
-            # Fallback intro lines based on mode
-            if mode == "cold_call" or mode == "customer_convo":
-                if call_sid in personality_memory:
-                    persona_name = personality_memory[call_sid]
-                    persona = cold_call_personality_pool.get(persona_name, {})
-                    reply = persona.get("intro_line", "Alright, I'll be your customer. Start the conversation however you want — this could be a cold call, a follow-up, a check-in, or even a tough conversation. I'll respond based on my personality. If you ever want to start over, just say 'let's start over.'")
-                else:
-                    reply = "Alright, I'll be your customer. Start the conversation however you want."
-            elif mode == "small_talk":
-                reply = "Yo yo yo, how's it goin'?"
-            elif mode == "interview":
-                reply = "Great, let's jump in! Can you walk me through your most recent role and responsibilities?"
-            else:
-                reply = "How can I help you today?"
+            reply = intro_line
         
         conversation_history[call_sid].append({"role": "assistant", "content": reply})
     else:
-        # Add user message to history
+        # Add user message to history BEFORE calling GPT
         conversation_history[call_sid].append({"role": "user", "content": transcript})
         
-        # Build messages array with validation
+        # Build messages array with proper ordering
         messages = [{"role": "system", "content": system_prompt}]
         
-        # Add instruction for natural tool response handling
-        tool_instruction = {
-            "role": "system",
-            "content": "IMPORTANT: When you use the check_remaining_time tool, you'll receive a response like 'You have X minutes remaining in your free call.' You must acknowledge this information and incorporate it naturally into your response to the user. Don't just ignore it or change the subject - address their time question directly."
-        }
-        messages.append(tool_instruction)
+        # Add tool instruction ONLY ONCE (not every turn)
+        if turn > 0:  # Skip on very first turn
+            tool_instruction = {
+                "role": "system", 
+                "content": "If you use the check_remaining_time tool, incorporate the time information naturally into your response. Don't ignore the tool result."
+            }
+            messages.append(tool_instruction)
         
-        # Check for bad news
+        # Check for bad news and add escalation if needed
         lowered = transcript.lower()
         is_bad_news = any(x in lowered for x in [
             "bad news", "unfortunately", "delay", "delayed", "won't make it", "can't deliver",
@@ -1160,34 +1257,35 @@ async def process_speech():
             escalation_prompt = (
                 "The user just delivered bad news to the customer. Respond as the customer based on your personality, "
                 "but crank up the emotion. If it fits your persona, act furious — like you're raising your voice. "
-                "You can use strong language (not profane), interruptions, and frustration. You might say things like "
-                "'Are you SERIOUS right now?!' or 'Unbelievable. This is NOT okay.' Show that this ruined your day. "
-                "If the user tries to calm you down, don't immediately cool off. Push back again with more anger. "
-                "Only start to de-escalate if they take responsibility and handle it well. Stay human, not robotic."
+                "You might say things like 'Are you SERIOUS right now?!' or 'Unbelievable. This is NOT okay.' "
+                "Show that this ruined your day. If the user tries to calm you down, don't immediately cool off. "
+                "Push back again with more anger. Only start to de-escalate if they take responsibility and handle it well. "
+                "Stay human, not robotic."
             )
 
             if is_user_defensive:
                 print("😡 User snapped back — escalate the attitude.")
                 escalation_prompt += (
-                    " The user got defensive, so now you're even more upset. Push back harder. Say something like, 'Don't tell me to calm down — this is your screw-up.'"
+                    " The user got defensive, so now you're even more upset. Push back harder. Say something like, "
+                    "'Don't tell me to calm down — this is your screw-up.'"
                 )
 
-            messages.insert(0, {
+            messages.append({
                 "role": "system",
                 "content": escalation_prompt
             })
-
-        # Add clean conversation history
+        
+        # Add clean conversation history (no partials, no duplicates)
         messages += get_clean_conversation_history(call_sid)
         
-        # Debug: Print messages structure
-        print(f"📋 Messages array length: {len(messages)}")
-        for i, msg in enumerate(messages):
-            if isinstance(msg, dict) and "role" in msg:
-                content_preview = msg.get('content', '')[:50] + '...' if msg.get('content', '') else 'No content'
-                print(f"   [{i}] {msg['role']}: {content_preview}")
-            else:
-                print(f"   [{i}] INVALID: {msg}")
+        # Debug if needed
+        if os.getenv("DEBUG_CONVERSATION", "false").lower() == "true":
+            debug_conversation_state(call_sid)
+            print(f"📋 Messages array length: {len(messages)}")
+            for i, msg in enumerate(messages):
+                if isinstance(msg, dict) and "role" in msg:
+                    content_preview = msg.get('content', '')[:50] + '...' if msg.get('content', '') else 'No content'
+                    print(f"   [{i}] {msg['role']}: {content_preview}")
 
         # Check if we're close to timeout before GPT call
         if time.time() - start_time > MAX_PROCESSING_TIME - 3:
@@ -1199,56 +1297,7 @@ async def process_speech():
                 if USE_STREAMING:
                     reply = await streaming_gpt_response(messages, voice_id, call_sid)
                 else:
-                    # Add tool support to existing call
-                    gpt_reply = sync_openai.chat.completions.create(
-                        model="gpt-4.1-nano",
-                        messages=messages,
-                        temperature=0.7,
-                        max_tokens=150,
-                        tools=[get_time_check_tool()],
-                        tool_choice="auto"
-                    )
-                    
-                    response_message = gpt_reply.choices[0].message
-                    
-                    # Check for tool calls
-                    if response_message.tool_calls:
-                        tool_call = response_message.tool_calls[0]
-                        if tool_call.function.name == "check_remaining_time":
-                            tool_result = handle_tool_call(call_sid)
-                            
-                            # Check if time expired
-                            if "TIME_EXPIRED" in tool_result:
-                                print(f"⏰ Tool detected time expired - AI will say goodbye")
-                                with state_lock:
-                                    active_sessions[call_sid] = "ENDING"
-                            
-                            # Append assistant's message with tool call
-                            messages.append({
-                                "role": "assistant",
-                                "content": response_message.content,
-                                "tool_calls": response_message.tool_calls
-                            })
-                            
-                            # Append tool result
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": tool_result
-                            })
-                            
-                            # Get final response that incorporates the tool result
-                            print(f"🤖 Getting final response with tool result: {tool_result}")
-                            final_completion = sync_openai.chat.completions.create(
-                                model="gpt-4.1-nano",
-                                messages=messages,
-                                temperature=0.7,
-                                max_tokens=150
-                            )
-                            reply = final_completion.choices[0].message.content.strip()
-                            print(f"🎙️ Final AI response with time info: {reply[:100]}...")
-                    else:
-                        reply = response_message.content.strip()
+                    reply = get_gpt_response_with_tools(messages, call_sid)
             except Exception as e:
                 print(f"💥 GPT error: {e}")
                 # Fallback response
@@ -1257,7 +1306,7 @@ async def process_speech():
         # Clean up response
         reply = reply.replace("*", "").replace("_", "").replace("`", "").replace("#", "").replace("-", " ")
         
-        # Always add final response to conversation history
+        # Add final response to conversation history ONLY ONCE
         conversation_history[call_sid].append({"role": "assistant", "content": reply})
 
     # Use mode from voice_lock if available (for consistency)
@@ -1396,7 +1445,6 @@ async def process_speech():
         response.redirect(url_for("voice", _external=True))
     
     return str(response)
-
 async def streaming_transcribe(audio_file_path: str) -> str:
     """Transcription with streaming control"""
     try:
@@ -1444,7 +1492,6 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
         if USE_STREAMING and SENTENCE_STREAMING:
             # Create output file immediately
             output_path = f"static/response_{call_sid}.mp3"
-            temp_path = f"static/response_{call_sid}_temp.mp3"
             
             # Streaming with sentence detection
             stream = await async_openai.chat.completions.create(
@@ -1460,10 +1507,10 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
             sentence_buffer = ""
             sentence_count = 0
             first_audio_saved = False
-            final_tool_calls = {}  # Changed from current_tool_call to handle streaming properly
+            final_tool_calls = {}
             
             async for chunk in stream:
-                # Handle tool calls - accumulate them properly per OpenAI docs
+                # Handle tool calls - accumulate them properly
                 if chunk.choices[0].delta.tool_calls:
                     for tool_call_delta in chunk.choices[0].delta.tool_calls:
                         index = tool_call_delta.index
@@ -1531,7 +1578,7 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
             
             # Handle tool calls if present
             if final_tool_calls:
-                # Process the first tool call (usually only one for time check)
+                # Process the first tool call
                 tool_call = final_tool_calls[0]
                 if tool_call["function"]["name"] == "check_remaining_time":
                     print(f"🔧 Processing tool call in streaming mode")
@@ -1543,10 +1590,11 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                         with state_lock:
                             active_sessions[call_sid] = "ENDING"
                     
-                    # Add assistant's message with tool call to messages (per OpenAI docs)
-                    messages.append({
+                    # Build new messages array with tool call and result
+                    tool_messages = messages.copy()
+                    tool_messages.append({
                         "role": "assistant",
-                        "content": full_response if full_response else None,  # Include any content before tool call
+                        "content": full_response if full_response else None,
                         "tool_calls": [{
                             "id": tool_call["id"],
                             "type": "function",
@@ -1556,9 +1604,7 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                             }
                         }]
                     })
-                    
-                    # Add tool response
-                    messages.append({
+                    tool_messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
                         "content": tool_result
@@ -1569,7 +1615,7 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                     # Get final response based on tool result
                     final_stream = await async_openai.chat.completions.create(
                         model=model,
-                        messages=messages,
+                        messages=tool_messages,
                         stream=True,
                         temperature=0.7
                     )
@@ -1578,7 +1624,7 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                     sentence_buffer = ""
                     
                     # Process the final response that incorporates the tool result
-                    async for chunk in final_stream:  # FIXED: async for
+                    async for chunk in final_stream:
                         if chunk.choices[0].delta.content:
                             text = chunk.choices[0].delta.content
                             sentence_buffer += text
@@ -1638,8 +1684,9 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                         with state_lock:
                             active_sessions[call_sid] = "ENDING"
                     
-                    # Add assistant's message with tool call (include original content if any)
-                    messages.append({
+                    # Build new messages with tool call and result
+                    tool_messages = messages.copy()
+                    tool_messages.append({
                         "role": "assistant",
                         "content": response_message.content,
                         "tool_calls": [{
@@ -1651,9 +1698,7 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                             }
                         }]
                     })
-                    
-                    # Add tool response
-                    messages.append({
+                    tool_messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": tool_result
@@ -1663,7 +1708,7 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                     print(f"🤖 Getting AI response based on tool result: {tool_result}")
                     final_completion = await async_openai.chat.completions.create(
                         model=model,
-                        messages=messages,
+                        messages=tool_messages,
                         temperature=0.7
                     )
                     final_reply = final_completion.choices[0].message.content.strip()
@@ -1701,15 +1746,14 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                         with state_lock:
                             active_sessions[call_sid] = "ENDING"
                     
-                    # Properly append the assistant message with tool call
-                    messages.append({
+                    # Build messages properly
+                    tool_messages = messages.copy()
+                    tool_messages.append({
                         "role": "assistant",
                         "content": response_message.content,
                         "tool_calls": response_message.tool_calls
                     })
-                    
-                    # Add tool result
-                    messages.append({
+                    tool_messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": tool_result
@@ -1718,7 +1762,7 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
                     # Get final response
                     final_completion = sync_openai.chat.completions.create(
                         model=MODELS["openai"]["standard_gpt"],
-                        messages=messages,
+                        messages=tool_messages,
                         temperature=0.7
                     )
                     final_reply = final_completion.choices[0].message.content.strip()
@@ -1730,6 +1774,7 @@ async def streaming_gpt_response(messages: list, voice_id: str, call_sid: str) -
         except Exception as e2:
             print(f"💥 Fallback also failed: {e2}")
             return "I'm having trouble processing that. Could you please repeat?"
+
 async def generate_tts_streaming(text: str, voice_id: str) -> bytes:
     """Generate TTS using streaming ElevenLabs API with retry logic"""
     max_retries = 3

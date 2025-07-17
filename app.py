@@ -1,3 +1,14 @@
+"""
+ConvoReps - AI Voice Practice Platform
+Features:
+- Cold call, interview, and small talk practice
+- Voice consistency throughout calls (locked after mode selection)
+- Minute tracking with CSV storage
+- SMS notifications when time expires
+- ElevenLabs natural voice synthesis
+- Tool calling for time checking
+"""
+
 import os
 import io
 from io import BytesIO
@@ -102,6 +113,7 @@ twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 # In-memory state
 turn_count = {}
 mode_lock = {}
+voice_lock = {}  # ADD THIS to lock voice selection
 active_call_sid = None
 conversation_history = {}
 personality_memory = {}
@@ -439,7 +451,8 @@ def ensure_static_files():
     # Create greeting files if they don't exist
     greetings = {
         "first_time_greeting.mp3": "Welcome to ConvoReps! Tell me what you'd like to practice: cold calls, interviews, or just some small talk.",
-        "returning_user_greeting.mp3": "Welcome back to ConvoReps! What would you like to practice today?"
+        "returning_user_greeting.mp3": "Welcome back to ConvoReps! What would you like to practice today?",
+        "fallback.mp3": "Just a moment please."
     }
     
     for filename, text in greetings.items():
@@ -559,6 +572,7 @@ def cleanup_call_resources(call_sid: str):
             active_sessions.pop(call_sid, None)
             personality_memory.pop(call_sid, None)
             mode_lock.pop(call_sid, None)
+            voice_lock.pop(call_sid, None)  # Clean up voice lock
             interview_question_index.pop(call_sid, None)
             
             print(f"✅ Cleaned up all state for {call_sid}")
@@ -601,15 +615,60 @@ def voice():
         
         if minutes_left < MIN_CALL_DURATION:
             print(f"🚫 User {from_number} has insufficient minutes ({minutes_left:.2f} < {MIN_CALL_DURATION})")
-            response = VoiceResponse()
+            
+            # Generate ElevenLabs audio for the message
             if is_repeat_caller:
-                response.say(MESSAGE_SCRIPTS["voice_repeat_caller"])
+                message_text = MESSAGE_SCRIPTS["voice_repeat_caller"]
             else:
-                response.say("Your free minutes have been used. We just texted you a link to continue.")
+                message_text = "Your free minutes have been used. We just texted you a link to continue."
+            
+            # Use a friendly voice for the message
+            no_time_voice_id = "21m00Tcm4TlvDq8ikWAM"  # Rachel voice
+            
+            # Generate audio file
+            no_time_audio_path = f"static/no_time_{call_sid}.mp3"
+            try:
+                audio_gen = elevenlabs_client.text_to_speech.convert(
+                    voice_id=no_time_voice_id,
+                    text=message_text,
+                    model_id=MODELS["elevenlabs"]["voice_model"],
+                    output_format=MODELS["elevenlabs"]["output_format"]
+                )
+                raw_audio = b""
+                for chunk in audio_gen:
+                    if chunk:
+                        raw_audio += chunk
+                
+                with open(no_time_audio_path, "wb") as f:
+                    f.write(raw_audio)
+                print(f"✅ No-time message audio generated: {len(raw_audio)} bytes")
+            except Exception as e:
+                print(f"❌ Failed to generate no-time audio: {e}")
+                # Fallback to Twilio TTS if ElevenLabs fails
+                response = VoiceResponse()
+                response.say(message_text)
+                response.hangup()
+                send_convoreps_sms_link(from_number, is_first_call=not is_repeat_caller)
+                return str(response)
+            
+            # Play the ElevenLabs audio
+            response = VoiceResponse()
+            response.play(f"{request.url_root}static/no_time_{call_sid}.mp3")
+            response.pause(length=1)
             response.hangup()
             
             # Send SMS when user has no time left
             send_convoreps_sms_link(from_number, is_first_call=not is_repeat_caller)
+            
+            # Clean up audio file after delay
+            def cleanup_no_time_audio():
+                time.sleep(30)
+                try:
+                    os.remove(no_time_audio_path)
+                    print(f"🧹 Cleaned up no-time audio for {call_sid}")
+                except:
+                    pass
+            threading.Thread(target=cleanup_no_time_audio, daemon=True).start()
             
             return str(response)
     else:
@@ -840,6 +899,7 @@ async def process_speech():
         print(f"💨 Resetting memory for new call_sid: {call_sid}")
         conversation_history.clear()
         mode_lock.clear()
+        voice_lock.clear()  # Clear voice locks
         personality_memory.clear()
         turn_count.clear()
         active_call_sid = call_sid
@@ -887,6 +947,8 @@ async def process_speech():
         print("🔁 Reset triggered by user — rolling new persona")
         conversation_history.pop(call_sid, None)
         personality_memory.pop(call_sid, None)
+        voice_lock.pop(call_sid, None)  # Clear voice lock
+        mode_lock.pop(call_sid, None)   # Clear mode lock
         turn_count[call_sid] = 0
         transcript = "cold call practice"
 
@@ -894,22 +956,14 @@ async def process_speech():
     if call_sid and call_sid in active_sessions and not active_sessions.get(call_sid, True):
         print(f"⏰ User was speaking when time limit hit - delivering message now")
         
-        # First determine voice_id based on current mode/personality
-        mode = mode_lock.get(call_sid, "unknown")
-        
-        if mode == "cold_call" or mode == "customer_convo":
-            persona_name = personality_memory.get(call_sid, "Jerry")
-            if isinstance(persona_name, str) and persona_name in cold_call_personality_pool:
-                voice_id = cold_call_personality_pool[persona_name]["voice_id"]
-            else:
-                voice_id = "1t1EeRixsJrKbiF1zwM6"
-        elif mode == "small_talk":
-            voice_id = "2BJW5coyhAzSr8STdHbE"
-        elif mode == "interview":
-            voice_choice = personality_memory.get(call_sid, {"voice_id": "21m00Tcm4TlvDq8ikWAM"})
-            voice_id = voice_choice.get("voice_id", "21m00Tcm4TlvDq8ikWAM") if isinstance(voice_choice, dict) else "21m00Tcm4TlvDq8ikWAM"
+        # Get the locked voice for consistency
+        if call_sid in voice_lock:
+            voice_id = voice_lock[call_sid]["voice_id"]
+            print(f"🎤 Using locked voice {voice_id} for time limit message")
         else:
-            voice_id = "1t1EeRixsJrKbiF1zwM6"
+            # Fallback if somehow voice wasn't locked
+            voice_id = "21m00Tcm4TlvDq8ikWAM"  # Rachel as default
+            print(f"⚠️ No locked voice found, using default Rachel")
         
         reply = MESSAGE_SCRIPTS["voice_time_limit"]
         
@@ -1006,10 +1060,13 @@ async def process_speech():
         if call_sid not in personality_memory:
             voice_choice = random.choice(interview_voice_pool)
             personality_memory[call_sid] = voice_choice
+            voice_id = voice_choice["voice_id"]
+            print(f"🎭 Interview: Assigned new voice {voice_choice['name']} ({voice_id}) to {call_sid}")
         else:
+            # IMPORTANT: Reuse the same voice throughout the interview
             voice_choice = personality_memory[call_sid]
+            voice_id = voice_choice["voice_id"]
         
-        voice_id = voice_choice["voice_id"]
         system_prompt = (
             f"You are {voice_choice['name']}, a friendly, conversational job interviewer helping candidates practice for real interviews. "
             "Speak casually — like you're talking to someone over coffee, not in a formal evaluation. Ask one interview-style question at a time, and after each response, give supportive, helpful feedback. "
@@ -1040,7 +1097,25 @@ async def process_speech():
 
     # Generate response
     if turn == 0:
-        reply = intro_line
+        # Get intro line from voice_lock if available, otherwise use defaults
+        if call_sid in voice_lock and "intro_line" in voice_lock[call_sid]:
+            reply = voice_lock[call_sid]["intro_line"]
+        else:
+            # Fallback intro lines based on mode
+            if mode == "cold_call" or mode == "customer_convo":
+                if call_sid in personality_memory:
+                    persona_name = personality_memory[call_sid]
+                    persona = cold_call_personality_pool.get(persona_name, {})
+                    reply = persona.get("intro_line", "Alright, I'll be your customer. Start the conversation however you want — this could be a cold call, a follow-up, a check-in, or even a tough conversation. I'll respond based on my personality. If you ever want to start over, just say 'let's start over.'")
+                else:
+                    reply = "Alright, I'll be your customer. Start the conversation however you want."
+            elif mode == "small_talk":
+                reply = "Yo yo yo, how's it goin'?"
+            elif mode == "interview":
+                reply = "Great, let's jump in! Can you walk me through your most recent role and responsibilities?"
+            else:
+                reply = "How can I help you today?"
+        
         conversation_history[call_sid].append({"role": "assistant", "content": reply})
     else:
         # Add user message to history
@@ -1147,7 +1222,23 @@ async def process_speech():
         reply = reply.replace("*", "").replace("_", "").replace("`", "").replace("#", "").replace("-", " ")
         conversation_history[call_sid].append({"role": "assistant", "content": reply})
 
+    # Use mode from voice_lock if available (for consistency)
+    if call_sid in voice_lock and "mode" in voice_lock[call_sid]:
+        mode = voice_lock[call_sid]["mode"]
+    
     print(f"🔣 Generating voice with ID: {voice_id}")
+    
+    # Log which persona/character is speaking
+    if mode == "cold_call" or mode == "customer_convo":
+        persona_name = personality_memory.get(call_sid, "Unknown")
+        print(f"🎭 Speaking as: {persona_name}")
+    elif mode == "interview":
+        interviewer = personality_memory.get(call_sid, {})
+        if isinstance(interviewer, dict):
+            print(f"🎭 Speaking as: {interviewer.get('name', 'Unknown')} (Interviewer)")
+    elif mode == "small_talk":
+        print(f"🎭 Speaking as: Casual Friend")
+    
     print(f"🗣️ Reply: {reply[:100]}...")
     
     # Generate TTS with timeout protection
@@ -1592,14 +1683,21 @@ if __name__ == "__main__":
     print(f"   OpenAI Standard: {MODELS['openai']['standard_gpt']}")
     print(f"   Transcription: {MODELS['openai']['streaming_transcribe']} / {MODELS['openai']['standard_transcribe']}")
     print(f"   ElevenLabs: {MODELS['elevenlabs']['voice_model']}")
+    print(f"\n🎭 Voice Consistency:")
+    print(f"   Once a mode is selected, the same voice is used throughout the call")
+    print(f"   Cold Call: One of 5 personas (Jerry, Miranda, Junior, Brett, Kayla)")
+    print(f"   Interview: One of 3 interviewers (Rachel, Clyde, Stephen)")
+    print(f"   Small Talk: Casual friend voice")
     print("\n")
     
     print(f"🏁 Application started on port 5050")
     print(f"📊 Free minutes per user: {FREE_CALL_MINUTES}")
     print(f"⏱️ Minimum call duration: {MIN_CALL_DURATION} minutes")
-    print(f"\n📞 IMPORTANT: Configure your Twilio phone number webhook to:")
-    print(f"   - Voice URL: https://your-domain.com/voice")
-    print(f"   - Status Callback URL: https://your-domain.com/call_status")
-    print(f"   - Method: POST for both")
+    print(f"\n📞 IMPORTANT: Configure your Twilio phone number with:")
+    print(f"   Voice Configuration:")
+    print(f"   - A CALL COMES IN → Webhook: https://your-domain.com/voice (HTTP POST)")
+    print(f"   - CALL STATUS CHANGES → https://your-domain.com/call_status (HTTP POST)")
+    print(f"   - PRIMARY HANDLER FAILS → Leave empty")
+    print(f"\n   This ensures proper call tracking and cleanup!")
     
     app.run(host="0.0.0.0", port=5050)

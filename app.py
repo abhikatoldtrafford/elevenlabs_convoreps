@@ -106,6 +106,8 @@ USAGE_CSV_BACKUP_PATH = os.getenv("USAGE_CSV_BACKUP_PATH", "user_usage_backup.cs
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+WHITELIST_NUMBER = "+12095688861"  # Special number with unlimited minutes
+WHITELIST_MINUTES = 99999  # Effectively unlimited
 
 # Initialize Twilio client for SMS
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -490,9 +492,15 @@ def handle_tool_call(call_sid: str) -> str:
         from_number = active_streams.get(call_sid, {}).get('from_number')
         if from_number:
             usage_data = read_user_usage(from_number)
-            remaining = max(0, usage_data['minutes_left'] - elapsed_minutes)
+            is_repeat_caller = usage_data['total_calls'] > 0
+            minutes_left = usage_data['minutes_left']
             
-            print(f"⏱️ Time check: {elapsed_minutes:.2f} minutes elapsed, {remaining:.2f} remaining")
+            # Whitelist check - override minutes for special number
+            if from_number == WHITELIST_NUMBER:
+                minutes_left = WHITELIST_MINUTES
+                print(f"🌟 WHITELIST NUMBER DETECTED: {from_number} - Overriding to {WHITELIST_MINUTES} minutes")
+            
+            print(f"📊 User {from_number}: {minutes_left:.2f} minutes left, total calls: {usage_data['total_calls']}")
             
             if remaining <= MIN_CALL_DURATION:
                 print(f"🚨 Tool detected time exhausted for {call_sid}")
@@ -800,6 +808,8 @@ def voice():
             'minutes_left': minutes_left,
             'last_activity': time.time()
         }
+        if from_number == WHITELIST_NUMBER:
+            active_streams[call_sid]['minutes_left'] = WHITELIST_MINUTES
         active_sessions[call_sid] = True
         
         # Set up timer for time limit

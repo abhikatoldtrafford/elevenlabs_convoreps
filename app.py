@@ -106,7 +106,7 @@ USAGE_CSV_BACKUP_PATH = os.getenv("USAGE_CSV_BACKUP_PATH", "user_usage_backup.cs
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
-WHITELIST_NUMBER = "+16508826686"  # Special number with unlimited minutes
+WHITELIST_NUMBER = "+13368236243"  # Special number with unlimited minutes
 WHITELIST_MINUTES = 99999  # Effectively unlimited
 
 # Initialize Twilio client for SMS

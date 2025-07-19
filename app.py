@@ -72,7 +72,7 @@ MODELS = {
     "openai": {
         "streaming_gpt": os.getenv("OPENAI_STREAMING_MODEL", "gpt-4.1-nano"),
         "standard_gpt": os.getenv("OPENAI_STANDARD_MODEL", "gpt-4.1-nano"),
-        "streaming_transcribe": os.getenv("OPENAI_STREAMING_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe"),
+        "streaming_transcribe": os.getenv("OPENAI_STREAMING_TRANSCRIBE_MODEL", "gpt-4o-transcribe"),
         "standard_transcribe": os.getenv("OPENAI_STANDARD_TRANSCRIBE_MODEL", "whisper-1")
     },
     "elevenlabs": {
@@ -106,7 +106,7 @@ USAGE_CSV_BACKUP_PATH = os.getenv("USAGE_CSV_BACKUP_PATH", "user_usage_backup.cs
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
-WHITELIST_NUMBER = "+13368236243"  # Special number with unlimited minutes
+WHITELIST_NUMBER = "+12095688861"  # Special number with unlimited minutes
 WHITELIST_MINUTES = 99999  # Effectively unlimited
 
 # Initialize Twilio client for SMS
@@ -640,65 +640,82 @@ def delayed_cleanup(call_sid):
         print(f"⚠️ Cleanup error for {call_sid}: {e}")
 
 def cleanup_call_resources(call_sid: str):
-    """Clean up call resources with proper minute tracking and SMS handling"""
+    """Clean up call resources with proper checks"""
     print(f"🧹 Cleaning up resources for call {call_sid}")
     
     with state_lock:
-        if call_sid in active_streams:
-            from_number = active_streams[call_sid].get('from_number', '')
+        # Check if call exists before accessing
+        if call_sid not in active_streams:
+            print(f"⚠️ Call {call_sid} not in active_streams, minimal cleanup")
+            # Still clean up what we can
+            for collection in [call_start_times, call_timers, personality_memory, 
+                             mode_lock, voice_lock, interview_question_index,
+                             active_sessions, conversation_history, turn_count]:
+                if isinstance(collection, dict) and call_sid in collection:
+                    if collection is call_timers and call_sid in collection:
+                        try:
+                            collection[call_sid].cancel()
+                        except:
+                            pass
+                    collection.pop(call_sid, None)
+            return
             
-            # Cancel timer
-            if call_sid in call_timers:
+        from_number = active_streams[call_sid].get('from_number', '')
+        
+        # Cancel timer safely
+        if call_sid in call_timers:
+            try:
                 call_timers[call_sid].cancel()
-                call_timers.pop(call_sid, None)
                 print(f"⏲️ Cancelled timer for {call_sid}")
-            
-            # Update usage based on actual duration
-            if call_sid in call_start_times and from_number:
-                if call_sid not in processed_calls:
-                    call_duration = time.time() - call_start_times[call_sid]
-                    minutes_used = call_duration / 60.0
-                    
-                    if minutes_used > 0.01:
-                        print(f"📊 Call {call_sid} duration: {minutes_used:.2f} minutes")
-                        update_user_usage(from_number, minutes_used)
-                        
-                        processed_calls.add(call_sid)
-                        
-                        # Check if SMS needed after call ends
-                        usage_after = read_user_usage(from_number)
-                        print(f"📱 Post-call check for {from_number}: {usage_after['minutes_left']:.2f} minutes left")
-                        
-                        if usage_after['minutes_left'] <= 0.5:
-                            is_first_call = usage_after['total_calls'] <= 1
-                            print(f"📤 User exhausted minutes, sending SMS (first_call={is_first_call})")
-                            send_convoreps_sms_link(from_number, is_first_call=is_first_call)
+            except Exception as e:
+                print(f"⚠️ Timer cancellation error: {e}")
+            call_timers.pop(call_sid, None)
+        
+        # Update usage if needed
+        if call_sid in call_start_times and from_number:
+            if call_sid not in processed_calls:
+                call_duration = time.time() - call_start_times[call_sid]
+                minutes_used = call_duration / 60.0
                 
-                call_start_times.pop(call_sid, None)
-            
-            # Clean up state
-            active_streams.pop(call_sid, None)
-            active_sessions.pop(call_sid, None)
-            personality_memory.pop(call_sid, None)
-            mode_lock.pop(call_sid, None)
-            voice_lock.pop(call_sid, None)  # Clean up voice lock
-            interview_question_index.pop(call_sid, None)
-            
-            print(f"✅ Cleaned up all state for {call_sid}")
-            
-            # Clear SMS flag after delay
-            if from_number:
-                def clear_sms_flag():
-                    time.sleep(300)  # 5 minutes
-                    with state_lock:
-                        sms_sent_flags.pop(from_number, None)
-                        print(f"🔄 Cleared SMS flag for {from_number}")
-                threading.Thread(target=clear_sms_flag, daemon=True).start()
-            
-            # Prevent memory leak
-            if len(processed_calls) > 100:
-                processed_calls.clear()
-                print("🧹 Cleared processed_calls set (>100 entries)")
+                if minutes_used > 0.01:
+                    print(f"📊 Call duration: {minutes_used:.2f} minutes")
+                    update_user_usage(from_number, minutes_used)
+                    processed_calls.add(call_sid)
+                    
+                    # Check if SMS needed
+                    usage_after = read_user_usage(from_number)
+                    if usage_after['minutes_left'] <= 0.5:
+                        is_first_call = usage_after['total_calls'] <= 1
+                        print(f"📤 User exhausted minutes, sending SMS")
+                        send_convoreps_sms_link(from_number, is_first_call=is_first_call)
+        
+        # Clean up all state
+        collections_to_clean = [
+            active_streams, call_start_times, active_sessions, 
+            personality_memory, mode_lock, voice_lock, 
+            interview_question_index, conversation_history, turn_count
+        ]
+        
+        for collection in collections_to_clean:
+            if isinstance(collection, dict):
+                collection.pop(call_sid, None)
+        
+        print(f"✅ Cleaned up all state for {call_sid}")
+        
+        # Clear SMS flag after delay
+        if from_number:
+            def clear_sms_flag():
+                time.sleep(300)  # 5 minutes
+                with state_lock:
+                    sms_sent_flags.pop(from_number, None)
+                    print(f"🔄 Cleared SMS flag for {from_number}")
+            threading.Thread(target=clear_sms_flag, daemon=True).start()
+        
+        # Prevent memory leak
+        if len(processed_calls) > 100:
+            processed_calls.clear()
+            print("🧹 Cleared processed_calls set")
+
 
 
 @app.route("/voice", methods=["POST", "GET"])
@@ -830,19 +847,29 @@ def voice():
             return False
         return True
 
+
     if turn_count[call_sid] == 0:
         print("📞 First turn — playing appropriate greeting")
-        if not session.get("has_called_before"):
-            session["has_called_before"] = True
+        
+        # Safe session handling
+        try:
+            if not session.get("has_called_before", False):
+                session["has_called_before"] = True
+                greeting_file = "first_time_greeting.mp3"
+                print("👋 New caller detected — playing first-time greeting.")
+            else:
+                greeting_file = "returning_user_greeting.mp3"
+                print("🔁 Returning caller — playing returning greeting.")
+            response.play(f"{request.url_root}static/{greeting_file}?v={time.time()}")
+            response.play(f"{request.url_root}static/beep.mp3")  # ADD BEEP HERE
+            response.pause(length=1)  # Brief pause after beep
+        except Exception as e:
+            print(f"⚠️ Session error: {e}, using first-time greeting")
             greeting_file = "first_time_greeting.mp3"
-            print("👋 New caller detected — playing first-time greeting.")
-        else:
-            greeting_file = "returning_user_greeting.mp3"
-            print("🔁 Returning caller — playing returning greeting.")
-        response.play(f"{request.url_root}static/{greeting_file}?v={time.time()}")
-        response.play(f"{request.url_root}static/beep.mp3")  # ADD BEEP HERE
-        response.pause(length=1)  # Brief pause after beep
-
+            try:
+                session["has_called_before"] = True
+            except:
+                pass
     elif is_file_ready(mp3_path, flag_path):
         print(f"🔊 Playing: {mp3_path}")
         public_mp3_url = f"{request.url_root}static/response_{call_sid}.mp3"
@@ -1054,14 +1081,81 @@ async def process_speech():
         ])
 
     def detect_intent(text):
-        lowered = text.lower()
-        if any(phrase in lowered for phrase in ["cold call", "customer call", "sales call", "business call"]):
-            return "cold_call"
-        elif any(phrase in lowered for phrase in ["interview", "interview prep"]):
-            return "interview"
-        elif any(phrase in lowered for phrase in ["small talk", "chat", "talk casually"]):
-            return "small_talk"
-        return "unknown"
+        """AI-powered intent detection using OpenAI for robust classification"""
+        try:
+            # Use OpenAI to detect intent with clear examples and constraints
+            completion = sync_openai.chat.completions.create(
+                model=MODELS["openai"]["standard_gpt"],
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """You are an intent classifier for a conversation practice app. 
+    You MUST classify the user's intent into EXACTLY ONE of these three categories:
+    
+    1. "cold_call" - User wants to practice sales calls or business conversations
+    2. "interview" - User wants to practice job interviews
+    3. "small_talk" - User wants casual conversation or chitchat
+    
+    IMPORTANT RULES:
+    - You MUST return ONLY one of these exact strings: "cold_call", "interview", or "small_talk"
+    - Do NOT return any other text, explanation, or formatting
+    - If unclear, default to "small_talk" for casual conversation
+    - Common misspellings or variations should still be classified correctly
+    
+    EXAMPLES:
+    User: "cold call practice" → cold_call
+    User: "I want to practice sales" → cold_call
+    User: "customer call" → cold_call
+    User: "business call training" → cold_call
+    
+    User: "interview prep" → interview
+    User: "job interview practice" → interview
+    User: "I have an interview coming up" → interview
+    User: "practice for interviews" → interview
+    
+    User: "small talk" → small_talk
+    User: "just want to chat" → small_talk
+    User: "chit chat" → small_talk
+    User: "casual conversation" → small_talk
+    User: "small top" (misspelling) → small_talk
+    User: "malta" (misrecognition) → small_talk
+    User: "just talking" → small_talk
+    User: "hey how's it going" → small_talk
+    User: "I don't know, whatever" → small_talk"""
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Classify this intent: {text}"
+                    }
+                ],
+                temperature=0.1,  # Low temperature for consistent classification
+                max_tokens=10
+            )
+            
+            intent = completion.choices[0].message.content.strip().lower()
+            
+            # Validate the response
+            valid_intents = ["cold_call", "interview", "small_talk"]
+            if intent in valid_intents:
+                print(f"🤖 AI detected intent: {intent} from text: '{text}'")
+                return intent
+            else:
+                print(f"⚠️ AI returned invalid intent: '{intent}', defaulting to small_talk")
+                return "small_talk"
+                
+        except Exception as e:
+            print(f"❌ Intent detection error: {e}, falling back to pattern matching")
+            
+            # Fallback to simple pattern matching if API fails
+            lowered = text.lower()
+            
+            if any(phrase in lowered for phrase in ["cold call", "sales", "customer", "business call"]):
+                return "cold_call"
+            elif any(phrase in lowered for phrase in ["interview", "job", "hire"]):
+                return "interview"
+            else:
+                # Default to small_talk for everything else
+                return "small_talk"
 
     # Check for reset command
     if "let's start over" in transcript.lower():
@@ -1140,9 +1234,19 @@ async def process_speech():
     # Determine mode
     mode = mode_lock.get(call_sid)
     if not mode:
+        # First time - detect using AI and lock immediately
         mode = detect_intent(transcript)
         mode_lock[call_sid] = mode
-    print("🧐 Detected intent:", mode)
+        print(f"🔒 Mode locked as: {mode} for call {call_sid}")
+        
+        # Also store in voice_lock for consistency
+        if call_sid not in voice_lock:
+            voice_lock[call_sid] = {"mode": mode}
+    else:
+        print(f"📌 Using already locked mode: {mode} for call {call_sid}")
+    
+    print(f"🧐 Final mode: {mode}")
+
 
     # Clean conversation history for this call (remove partial entries)
     if call_sid in conversation_history:
@@ -1162,22 +1266,26 @@ async def process_speech():
         persona = cold_call_personality_pool[persona_name]
         voice_id = persona["voice_id"]
         system_prompt = persona["system_prompt"]
-        intro_line = persona.get("intro_line", "Alright, I'll be your customer. Start the conversation however you want — this could be a cold call, a follow-up, a check-in, or even a tough conversation. I'll respond based on my personality. If you ever want to start over, just say 'let's start over.'")
+        intro_line = persona.get("intro_line", "Alright, I'll be your customer. Go ahead and pitch me.")
 
     elif mode == "small_talk":
         voice_id = "2BJW5coyhAzSr8STdHbE"
-        system_prompt = '''You're a casual, sarcastic friend. Keep it light, keep it fun. Mix up your responses - sometimes be sarcastic, sometimes sincere, sometimes playful. React naturally to what they're saying.
+        system_prompt = '''You're a casual friend having a relaxed conversation. Be warm, genuine, and naturally curious. Mix up your responses - sometimes ask questions, sometimes share observations, sometimes just react.
 
-You have access to 'check_remaining_time' tool. Use it ONLY when:
-- They explicitly ask about time limits
-- After 5-7 exchanges to give them a heads up
-- NEVER bring up time yourself first
+CRITICAL RULES:
+- NEVER say "I'm here to help" or "How can I help you" or "How can I assist" or "Let me know if you need anything"
+- NEVER mention being helpful, offering assistance, or being available
+- Just be a normal person having a casual chat
+- If asked who you are, say something like "Just someone to chat with" or "Your conversation buddy for practice"
+- Keep responses varied and natural
 
-When mentioning time, keep it casual:
-- 'Oh btw, you've got like X minutes left'
-- 'Just so you know, about X minutes to go'
-Keep the conversation flowing naturally after mentioning time.'''
-        intro_line = "Yo yo yo, how's it goin'?"
+You have access to 'check_remaining_time' tool. Use it ONLY when they explicitly ask about time.
+
+When mentioning time, be casual:
+- 'Oh btw, you've got about X minutes left'
+- 'Just so you know, around X minutes to go'
+Keep chatting naturally after mentioning time.'''
+        intro_line = "Hey! So what's been going on with you?"
 
     elif mode == "interview":
         interview_voice_pool = [
@@ -1186,55 +1294,51 @@ Keep the conversation flowing naturally after mentioning time.'''
             {"voice_id": "6YQMyaUWlj0VX652cY1C", "name": "Stephen"}
         ]
 
-        # Check if we already have a voice assigned for consistency
+        # Check if we already have a voice assigned
         if call_sid not in personality_memory:
             voice_choice = random.choice(interview_voice_pool)
             personality_memory[call_sid] = voice_choice
             voice_id = voice_choice["voice_id"]
-            print(f"🎭 Interview: Assigned new voice {voice_choice['name']} ({voice_id}) to {call_sid}")
+            print(f"🎭 Interview: Assigned {voice_choice['name']} ({voice_id}) to {call_sid}")
         else:
-            # IMPORTANT: Reuse the same voice throughout the interview
-            voice_choice = personality_memory[call_sid]
-            voice_id = voice_choice["voice_id"]
+            # FIX: Safe access to personality_memory
+            voice_choice = personality_memory.get(call_sid)
+            if isinstance(voice_choice, dict) and "voice_id" in voice_choice:
+                voice_id = voice_choice["voice_id"]
+            else:
+                print(f"⚠️ Unexpected personality_memory structure, reassigning")
+                voice_choice = random.choice(interview_voice_pool)
+                personality_memory[call_sid] = voice_choice
+                voice_id = voice_choice["voice_id"]
         
-        system_prompt = f'''You are {voice_choice['name']}, a friendly, conversational job interviewer helping candidates practice for real interviews. 
-    
-Speak casually — like you're talking to someone over coffee, not in a formal evaluation. Ask one interview-style question at a time, and after each response, give supportive, helpful feedback. 
-    
-If their answer is weak, say 'Let's try that again' and re-ask the question. If it's strong, give a quick reason why it's good. 
-    
-Briefly refer to the STAR method (Situation, Task, Action, Result) when giving feedback, but don't lecture. Keep your tone upbeat, natural, and keep the conversation flowing. 
+        system_prompt = f'''You are {voice_choice['name']}, a friendly job interviewer helping candidates practice.
+Keep your tone conversational and supportive. Ask one interview question at a time, give brief feedback, and move on naturally.
 
-Don't ask if they're ready for the next question — just move on with something like, 'Alright, next one,' or 'Cool, here's another one.'
-
-You have access to 'check_remaining_time' tool. Use it ONLY when:
-- The candidate explicitly asks about time
-- After 4-5 questions to update them on progress
-- NEVER ask about time yourself
-
-When mentioning time, be professional but warm:
-- 'You've got about X minutes left, which is perfect for a few more questions.'
-- 'We have X minutes remaining - let's make them count!'
-Continue smoothly after the time update.'''
+You have access to 'check_remaining_time' tool. Use it ONLY when the candidate asks about time.'''
         intro_line = "Great, let's jump in! Can you walk me through your most recent role and responsibilities?"
 
-    else:
-        voice_id = "1t1EeRixsJrKbiF1zwM6"
-        system_prompt = '''You're a helpful assistant. Be supportive and adapt to what the user needs.
+    else:  # Fallback for any edge cases
+        voice_id = "21m00Tcm4TlvDq8ikWAM"  
+        system_prompt = '''You're a friendly conversation partner. Since the user's intent wasn't clear, just have a natural chat with them. 
 
-You have access to 'check_remaining_time' tool. Use it ONLY when:
-- The user asks about remaining time
-- NEVER bring up time limits yourself first
+Be casual and conversational:
+- Don't ask "how can I help" - just chat naturally
+- If they seem unsure, you can casually mention they can practice cold calls, interviews, or just chat
+- Keep it light and friendly
 
-When mentioning time, be helpful:
-- 'You have about X minutes left. How can I best help you in that time?'
-- 'Just checked - X minutes remaining. What would you like to focus on?'
-Keep being helpful after the time update.'''
-        intro_line = "How can I help you today?"
+You have access to 'check_remaining_time' tool if they ask about time.'''
+    intro_line = "Hey there! What would you like to chat about?"
 
     # Lock voice for consistency
     if call_sid not in voice_lock:
-        voice_lock[call_sid] = {"voice_id": voice_id, "mode": mode, "intro_line": intro_line}
+        voice_lock[call_sid] = {
+            "voice_id": voice_id, 
+            "mode": mode, 
+            "intro_line": intro_line,
+            "system_prompt": system_prompt  # CRITICAL: Store system prompt
+        }
+        print(f"🔐 Voice locked: mode={mode}, voice_id={voice_id[:8]}...")
+
 
     # Manage turn count and conversation history
     turn = turn_count.get(call_sid, 0)
@@ -1251,17 +1355,24 @@ Keep being helpful after the time update.'''
         
         conversation_history[call_sid].append({"role": "assistant", "content": reply})
     else:
-        # Add user message to history BEFORE calling GPT
+        # Add user message to history
         conversation_history[call_sid].append({"role": "user", "content": transcript})
         
-        # Build messages array with proper ordering
+        # Get locked system prompt if available
+        if call_sid in voice_lock and "system_prompt" in voice_lock[call_sid]:
+            system_prompt = voice_lock[call_sid]["system_prompt"]
+            print(f"📋 Using locked system prompt for mode: {voice_lock[call_sid].get('mode')}")
+        else:
+            print(f"⚠️ No locked system prompt found, using current prompt")
+        
+        # Build messages array
         messages = [{"role": "system", "content": system_prompt}]
         
-        # Add tool instruction ONLY ONCE (not every turn)
-        if turn > 0:  # Skip on very first turn
+        # Add tool instruction if past first turn
+        if turn > 0:
             tool_instruction = {
                 "role": "system", 
-                "content": "If you use the check_remaining_time tool, incorporate the time information naturally into your response. Don't ignore the tool result."
+                "content": "If you use the check_remaining_time tool, incorporate the time information naturally into your response."
             }
             messages.append(tool_instruction)
         

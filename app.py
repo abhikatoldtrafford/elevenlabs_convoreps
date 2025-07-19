@@ -491,7 +491,11 @@ def handle_tool_call(call_sid: str) -> str:
                 minutes_left = WHITELIST_MINUTES
                 print(f"🌟 WHITELIST NUMBER DETECTED: {from_number} - Overriding to {WHITELIST_MINUTES} minutes")
             
-            print(f"📊 User {from_number}: {minutes_left:.2f} minutes left, total calls: {usage_data['total_calls']}")
+            # Calculate remaining time for this call
+            remaining = minutes_left - elapsed_minutes
+            
+            print(f"📊 User {from_number}: {minutes_left:.2f} minutes left in account, {remaining:.2f} minutes left in current call")
+            print(f"   Total calls: {usage_data['total_calls']}, Elapsed: {elapsed_minutes:.2f} minutes")
             
             if remaining <= MIN_CALL_DURATION:
                 print(f"🚨 Tool detected time exhausted for {call_sid}")
@@ -523,9 +527,6 @@ def handle_tool_call(call_sid: str) -> str:
     
     print(f"⚠️ Unable to check time for {call_sid}")
     return "I'm having trouble checking the time right now, but you started with 3 minutes of free call time."
-
-
-
 def ensure_static_files():
     """Ensure required static files exist"""
     os.makedirs("static", exist_ok=True)

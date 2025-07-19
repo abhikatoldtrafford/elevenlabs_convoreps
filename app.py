@@ -97,7 +97,7 @@ except ValueError:
     STREAMING_TIMEOUT = 3.0
 
 # ConvoReps minute tracking configuration
-FREE_CALL_MINUTES = float(os.getenv("FREE_CALL_MINUTES", "3.0"))
+FREE_CALL_MINUTES = float(os.getenv("FREE_CALL_MINUTES", "300.0"))
 MIN_CALL_DURATION = float(os.getenv("MIN_CALL_DURATION", "0.5"))
 USAGE_CSV_PATH = os.getenv("USAGE_CSV_PATH", "user_usage.csv")
 USAGE_CSV_BACKUP_PATH = os.getenv("USAGE_CSV_BACKUP_PATH", "user_usage_backup.csv")
@@ -106,7 +106,7 @@ USAGE_CSV_BACKUP_PATH = os.getenv("USAGE_CSV_BACKUP_PATH", "user_usage_backup.cs
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
-WHITELIST_NUMBER = "+12095688861"  # Special number with unlimited minutes
+WHITELIST_NUMBER = "+16508826686"  # Special number with unlimited minutes
 WHITELIST_MINUTES = 99999  # Effectively unlimited
 
 # Initialize Twilio client for SMS
@@ -152,12 +152,10 @@ IMPORTANT PERSONALITY TRAITS:
 
 You have access to 'check_remaining_time' tool. Use it ONLY when:
 - The caller asks about their time limit (questions like 'how much time do I have?')
-- After significant conversation progress (5-7 exchanges) to politely inform them
 - NEVER ask about time yourself - that's unnatural
 
 When you receive time information from the tool, incorporate it naturally:
 - If user asked: 'Let me check... you've got about X minutes left.'
-- If proactive: 'By the way, just so you know, you've got about X minutes left on this practice call.'
 - Keep it brief and continue the conversation naturally."""
     },
     "Miranda": {
@@ -171,12 +169,10 @@ IMPORTANT PERSONALITY TRAITS:
 
 You have access to 'check_remaining_time' tool. Use it ONLY when:
 - The caller asks about time limits
-- After about 5-7 exchanges (to keep them aware)
 - NEVER bring up time limits yourself unprompted
 
 When mentioning time, be direct:
-- 'You've got X minutes left. What else?'
-- 'Just so you know, X minutes remaining.'"""
+- 'You've got X minutes left. What else?'"""
     },
     "Junior": {
         "voice_id": "Nbttze9nhGhK1czblc6j",
@@ -189,12 +185,11 @@ IMPORTANT PERSONALITY TRAITS:
 
 You have access to 'check_remaining_time' tool. Use it ONLY when:
 - They ask about practice time
-- After good conversation progress (5-7 turns)
 - NEVER ask about time yourself
 
 Keep time mentions casual:
 - 'Oh, looks like you got X minutes left, buddy.'
-- 'Just checked - X minutes to go.'"""
+"""
     },
     "Brett": {
         "voice_id": "7eFTSJ6WtWd9VCU4ZlI1",
@@ -207,12 +202,10 @@ IMPORTANT PERSONALITY TRAITS:
 
 You have access to 'check_remaining_time' tool. Use it ONLY when:
 - They ask about time
-- You're getting impatient after 5-6 exchanges
 - NEVER bring it up yourself first
 
 Be blunt about time:
-- 'You got X minutes left.'
-- 'Clock says X minutes. Make it quick.'"""
+- 'You got X minutes left.'"""
     },
     "Kayla": {
         "voice_id": "aTxZrSrp47xsP6Ot4Kgd",
@@ -225,12 +218,10 @@ IMPORTANT PERSONALITY TRAITS:
 
 You have access to 'check_remaining_time' tool. Use it ONLY when:
 - They ask about time limits
-- After significant progress (6-7 exchanges)
 - NEVER ask about time yourself
 
 Be businesslike:
-- 'You have X minutes remaining.'
-- 'For your awareness, X minutes left.'"""
+- 'You have X minutes remaining.'"""
     }
 }
 
@@ -1232,7 +1223,6 @@ Continue smoothly after the time update.'''
 
 You have access to 'check_remaining_time' tool. Use it ONLY when:
 - The user asks about remaining time
-- After substantial conversation (6-8 exchanges)
 - NEVER bring up time limits yourself first
 
 When mentioning time, be helpful:

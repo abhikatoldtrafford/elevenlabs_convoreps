@@ -1206,10 +1206,12 @@ async def process_speech():
 
     # Determine mode
     mode = mode_lock.get(call_sid)
-    if not mode:
+    if not mode or mode == "unknown":
         mode = detect_intent(transcript)
         mode_lock[call_sid] = mode
-    print("🧐 Detected intent:", mode)
+        print(f"🎯 Setting mode to: {mode}")
+    else:
+        print(f"🔒 Using locked mode: {mode}")
 
     # Clean conversation history for this call (remove partial entries)
     if call_sid in conversation_history:
@@ -1285,19 +1287,20 @@ When mentioning time, be professional but warm:
 Continue smoothly after the time update.'''
         intro_line = "Great, let's jump in! Can you walk me through your most recent role and responsibilities?"
 
-    else:
-        voice_id = "1t1EeRixsJrKbiF1zwM6"
-        system_prompt = '''You're a helpful assistant. Be supportive and adapt to what the user needs.
-
-You have access to 'check_remaining_time' tool. Use it ONLY when:
-- The user asks about remaining time
-- NEVER bring up time limits yourself first
-
-When mentioning time, be helpful:
-- 'You have about X minutes left. How can I best help you in that time?'
-- 'Just checked - X minutes remaining. What would you like to focus on?'
-Keep being helpful after the time update.'''
-        intro_line = "How can I help you today?"
+    else:  # Default to small talk instead of generic assistant
+        voice_id = "2BJW5coyhAzSr8STdHbE"
+        system_prompt = '''You're a casual, sarcastic friend. Keep it light, keep it fun. Mix up your responses - sometimes be sarcastic, sometimes sincere, sometimes playful. React naturally to what they're saying.
+    
+    You have access to 'check_remaining_time' tool. Use it ONLY when:
+    - They explicitly ask about time limits
+    - After 5-7 exchanges to give them a heads up
+    - NEVER bring up time yourself first
+    
+    When mentioning time, keep it casual:
+    - 'Oh btw, you've got like X minutes left'
+    - 'Just so you know, about X minutes to go'
+    Keep the conversation flowing naturally after mentioning time.'''
+    intro_line = "Hey! What's going on?"
 
     # Lock voice for consistency
     if call_sid not in voice_lock:

@@ -1300,7 +1300,7 @@ Continue smoothly after the time update.'''
     - 'Oh btw, you've got like X minutes left'
     - 'Just so you know, about X minutes to go'
     Keep the conversation flowing naturally after mentioning time.'''
-    intro_line = "Hey! What's going on?"
+        intro_line = "Hey! What's going on?"
 
     # Lock voice for consistency
     if call_sid not in voice_lock:

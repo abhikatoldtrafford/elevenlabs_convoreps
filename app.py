@@ -1160,11 +1160,35 @@ def ensure_static_files():
             with open(beep_path, "wb") as f:
                 f.write(b"")  # Empty MP3
     
+    # Check if loading.mp3 exists, if not create fallback
+    loading_path = "static/loading.mp3"
+    if not os.path.exists(loading_path):
+        try:
+            print("⚠️ loading.mp3 not found, generating fallback...")
+            audio_gen = elevenlabs_client.text_to_speech.convert(
+                voice_id="21m00Tcm4TlvDq8ikWAM",  # Rachel voice
+                text="One moment please",
+                model_id=MODELS["elevenlabs"]["voice_model"],
+                output_format=MODELS["elevenlabs"]["output_format"]
+            )
+            raw_audio = b""
+            for chunk in audio_gen:
+                if chunk:
+                    raw_audio += chunk
+            
+            with open(loading_path, "wb") as f:
+                f.write(raw_audio)
+            print("✅ Fallback loading.mp3 created")
+        except Exception as e:
+            print(f"❌ Could not create fallback loading.mp3: {e}")
+    else:
+        print("✅ loading.mp3 found")
+    
     # Create greeting files if they don't exist
     greetings = {
         "first_time_greeting.mp3": "Welcome to ConvoReps! Tell me what you'd like to practice: cold calls, interviews, or just some small talk.",
         "returning_user_greeting.mp3": "Welcome back to ConvoReps! What would you like to practice today?",
-        "fallback.mp3": "Just a moment please."
+        "fallback.mp3": "One moment please."
     }
     
     for filename, text in greetings.items():
@@ -1188,7 +1212,6 @@ def ensure_static_files():
                 print(f"✅ {filename} created")
             except Exception as e:
                 print(f"⚠️ Could not create {filename}: {e}")
-
 def error_handler(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -1466,9 +1489,13 @@ def voice():
         public_mp3_url = f"{request.url_root}static/response_{call_sid}.mp3"
         response.play(public_mp3_url)
     else:
-        print("⏳ Response not ready — waiting briefly")
-        #response.play(f"{request.url_root}static/beep.mp3") 
-        response.pause(length=2)
+        # Play loading sound while waiting for response (only after user has spoken)
+        if turn_count.get(call_sid, 0) > 0:
+            print("🎵 Playing loading sound while response generates...")
+            response.play(f"{request.url_root}static/loading.mp3")
+        else:
+            print("⏳ Response not ready — waiting briefly")
+            response.pause(length=.5)
 
     response.gather(
         input='speech',
